@@ -55,6 +55,9 @@ var (
 	kataConfig  = flag.String("kata-config", "", "Path to a kata configuration.toml (passed to the shim as KATA_CONF_FILE). Empty uses kata's default. atelet generates one pointing at runtime-fetched assets.")
 	kataDebug   = flag.Bool("kata-debug", false, "Verbose kata-agent debugging: raise the guest agent log level and forward the guest console (incl. agent logs) into the pod logs.")
 	showVersion = flag.Bool("version", false, "Print version and exit.")
+
+	nodePortRange = flag.String("node-port-range", "30000-32767", "Range of node ports to block egress to (e.g. 30000-32767).")
+	clusterCIDR   = flag.String("cluster-ipv4-cidr", "", "IPv4 CIDR of the cluster network to drop egress to.")
 )
 
 func main() {
@@ -134,6 +137,11 @@ func do(ctx context.Context) error {
 		return fmt.Errorf("while creating interior netns: %w", err)
 	}
 
+	nodePortStart, nodePortEnd, err := ateomnet.ParsePortRange(*nodePortRange)
+	if err != nil {
+		return err
+	}
+
 	// Forward the actor container's stdout/stderr to the worker pod's stdout as
 	// JSON with ate.dev/* labels (logging parity with ateom-gvisor). It shares
 	// logWriter with the runtime logger so the two streams to os.Stdout are
@@ -144,7 +152,7 @@ func do(ctx context.Context) error {
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.UnaryInterceptor(ateinterceptors.InternalServerUnaryInterceptor),
 	)
-	ateompb.RegisterAteomServer(svr, NewService(*podUID, *chBinary, *kataConfig, *kataDebug, interiorNetNS, actorLogger))
+	ateompb.RegisterAteomServer(svr, NewService(*podUID, *chBinary, *kataConfig, *kataDebug, interiorNetNS, actorLogger, nodePortStart, nodePortEnd, *clusterCIDR))
 	reflection.Register(svr)
 
 	slog.InfoContext(ctx, "ateom-microvm serving", slog.String("socket", sockPath))
@@ -208,12 +216,16 @@ type AteomService struct {
 	// pause+snapshot+teardown the same sandbox (and RestoreWorkload can track the
 	// CH it relaunched).
 	running map[string]*runningActor
+
+	nodePortStart uint16
+	nodePortEnd   uint16
+	clusterCIDR   string
 }
 
 var _ ateompb.AteomServer = (*AteomService)(nil)
 
 // NewService creates a new AteomService.
-func NewService(podUID, chBinary, kataConfig string, kataDebug bool, interiorNetNS netns.NsHandle, actorLogger *actorlog.ActorLogger) *AteomService {
+func NewService(podUID, chBinary, kataConfig string, kataDebug bool, interiorNetNS netns.NsHandle, actorLogger *actorlog.ActorLogger, nodePortStart, nodePortEnd uint16, clusterCIDR string) *AteomService {
 	return &AteomService{
 		podUID:        podUID,
 		chBinary:      chBinary,
@@ -222,5 +234,8 @@ func NewService(podUID, chBinary, kataConfig string, kataDebug bool, interiorNet
 		interiorNetNS: interiorNetNS,
 		actorLogger:   actorLogger,
 		running:       map[string]*runningActor{},
+		nodePortStart: nodePortStart,
+		nodePortEnd:   nodePortEnd,
+		clusterCIDR:   clusterCIDR,
 	}
 }

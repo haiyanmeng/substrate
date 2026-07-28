@@ -187,6 +187,9 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 		InteriorNetNS:      s.interiorNetNS,
 		HostVethHWAddr:     hostVethHWAddr,
 		SweepInteriorLinks: true,
+		NodePortStart:      s.nodePortStart,
+		NodePortEnd:        s.nodePortEnd,
+		ClusterCIDR:        s.clusterCIDR,
 	}); err != nil {
 		return fmt.Errorf("while setting up actor network: %w", err)
 	}

@@ -52,6 +52,9 @@ var (
 
 	showVersion = pflag.Bool("version", false, "Print version and exit.")
 
+	nodePortRange = pflag.String("node-port-range", "30000-32767", "Range of node ports to block egress to (e.g. 30000-32767).")
+	clusterCIDR   = pflag.String("cluster-ipv4-cidr", "", "IPv4 CIDR of the cluster network to drop egress to.")
+
 	reapLock sync.RWMutex
 )
 
@@ -128,8 +131,13 @@ func do(ctx context.Context) error {
 		return fmt.Errorf("while creating ateom-interior netns: %w", err)
 	}
 
+	nodePortStart, nodePortEnd, err := ateomnet.ParsePortRange(*nodePortRange)
+	if err != nil {
+		return err
+	}
+
 	actorLogger := actorlog.NewActorLogger(syncedWriter, metadata.OnGCE())
-	ateomService := NewService(interiorNetNS, actorLogger)
+	ateomService := NewService(interiorNetNS, actorLogger, nodePortStart, nodePortEnd, *clusterCIDR)
 
 	svr := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
@@ -156,15 +164,21 @@ type AteomService struct {
 
 	interiorNetNS netns.NsHandle
 	actorLogger   *actorlog.ActorLogger
+	nodePortStart uint16
+	nodePortEnd   uint16
+	clusterCIDR   string
 }
 
 var _ ateompb.AteomServer = (*AteomService)(nil)
 
 // NewService creates a new AteomService.
-func NewService(interiorNetNS netns.NsHandle, actorLogger *actorlog.ActorLogger) *AteomService {
+func NewService(interiorNetNS netns.NsHandle, actorLogger *actorlog.ActorLogger, nodePortStart, nodePortEnd uint16, clusterCIDR string) *AteomService {
 	svc := &AteomService{
 		interiorNetNS: interiorNetNS,
 		actorLogger:   actorLogger,
+		nodePortStart: nodePortStart,
+		nodePortEnd:   nodePortEnd,
+		clusterCIDR:   clusterCIDR,
 	}
 	return svc
 }
@@ -180,7 +194,13 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 	//   * Correct runsc version is downloaded and placed on disk.
 	//   * All OCI bundles are set up, including for "pause" container.
 
-	if err := ateomnet.SetupActorNetwork(ctx, ateomnet.NetworkConfig{InteriorNetNS: s.interiorNetNS, DumpNetInfo: true}); err != nil {
+	if err := ateomnet.SetupActorNetwork(ctx, ateomnet.NetworkConfig{
+		InteriorNetNS: s.interiorNetNS,
+		DumpNetInfo:   true,
+		NodePortStart: s.nodePortStart,
+		NodePortEnd:   s.nodePortEnd,
+		ClusterCIDR:   s.clusterCIDR,
+	}); err != nil {
 		return nil, fmt.Errorf("while setting up actor network: %w", err)
 	}
 	defer func() {
@@ -385,7 +405,13 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	//   * All OCI bundles are set up, including for "pause" container.
 	//   * Checkpoint downloaded and placed on disk
 
-	if err := ateomnet.SetupActorNetwork(ctx, ateomnet.NetworkConfig{InteriorNetNS: s.interiorNetNS, DumpNetInfo: true}); err != nil {
+	if err := ateomnet.SetupActorNetwork(ctx, ateomnet.NetworkConfig{
+		InteriorNetNS: s.interiorNetNS,
+		DumpNetInfo:   true,
+		NodePortStart: s.nodePortStart,
+		NodePortEnd:   s.nodePortEnd,
+		ClusterCIDR:   s.clusterCIDR,
+	}); err != nil {
 		return nil, fmt.Errorf("while setting up actor network: %w", err)
 	}
 	defer func() {

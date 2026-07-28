@@ -25,6 +25,8 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/binaryutil"
@@ -233,7 +235,7 @@ func EnableIPv4Forwarding() error {
 }
 
 // InstallActorNftablesRules configures the NAT and filtering rules for the actor.
-func InstallActorNftablesRules(podIP net.IP) error {
+func InstallActorNftablesRules(podIP net.IP, nodePortStart, nodePortEnd uint16, clusterCIDR string) error {
 	// Install a dedicated nftables table for the active actor. Keeping all
 	// rules in an ateom-owned table makes cleanup simple and avoids mutating
 	// Kubernetes or CNI-managed chains directly.
@@ -320,6 +322,64 @@ func InstallActorNftablesRules(podIP net.IP) error {
 		Priority: nftables.ChainPriorityFilter,
 		Policy:   &acceptPolicy,
 	})
+
+	c.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: forward,
+		Exprs: append(ipSourceNotEqual(ActorVethIP), &expr.Verdict{Kind: expr.VerdictDrop}),
+	})
+
+	c.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: forward,
+		Exprs: append(ipDestinationCIDREqual("127.0.0.0/8"), &expr.Verdict{Kind: expr.VerdictDrop}),
+	})
+
+	c.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: forward,
+		Exprs: append(ipDestinationCIDREqual("224.0.0.0/4"), &expr.Verdict{Kind: expr.VerdictDrop}),
+	})
+
+	c.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: forward,
+		Exprs: append(IPDestinationEqual("255.255.255.255"), &expr.Verdict{Kind: expr.VerdictDrop}),
+	})
+
+	c.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: forward,
+		Exprs: append(IPDestinationEqual("169.254.169.254"), &expr.Verdict{Kind: expr.VerdictDrop}),
+	})
+
+	if nodePortStart > 0 && nodePortEnd >= nodePortStart {
+		c.AddRule(&nftables.Rule{
+			Table: table,
+			Chain: forward,
+			Exprs: append(tcpDestinationPortRangeEqual(nodePortStart, nodePortEnd), &expr.Verdict{Kind: expr.VerdictDrop}),
+		})
+		c.AddRule(&nftables.Rule{
+			Table: table,
+			Chain: forward,
+			Exprs: append(udpDestinationPortRangeEqual(nodePortStart, nodePortEnd), &expr.Verdict{Kind: expr.VerdictDrop}),
+		})
+	}
+
+	c.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: forward,
+		Exprs: append(IPDestinationEqual(podIP.String()), &expr.Verdict{Kind: expr.VerdictDrop}),
+	})
+
+	if clusterCIDR != "" {
+		c.AddRule(&nftables.Rule{
+			Table: table,
+			Chain: forward,
+			Exprs: append(ipDestinationCIDREqual(clusterCIDR), &expr.Verdict{Kind: expr.VerdictDrop}),
+		})
+	}
+
 	c.AddRule(&nftables.Rule{
 		Table: table,
 		Chain: forward,
@@ -399,6 +459,103 @@ func TCPDestinationPortEqual(port uint16) []expr.Any {
 			Op:       expr.CmpOpEq,
 			Register: 1,
 			Data:     binaryutil.BigEndian.PutUint16(port),
+		},
+	}
+}
+
+func tcpDestinationPortRangeEqual(start, end uint16) []expr.Any {
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     []byte{unix.IPPROTO_TCP},
+		},
+		&expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseTransportHeader,
+			Offset:       2,
+			Len:          2,
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpGte,
+			Register: 1,
+			Data:     binaryutil.BigEndian.PutUint16(start),
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpLte,
+			Register: 1,
+			Data:     binaryutil.BigEndian.PutUint16(end),
+		},
+	}
+}
+
+func udpDestinationPortRangeEqual(start, end uint16) []expr.Any {
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     []byte{unix.IPPROTO_UDP},
+		},
+		&expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseTransportHeader,
+			Offset:       2,
+			Len:          2,
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpGte,
+			Register: 1,
+			Data:     binaryutil.BigEndian.PutUint16(start),
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpLte,
+			Register: 1,
+			Data:     binaryutil.BigEndian.PutUint16(end),
+		},
+	}
+}
+
+func ipSourceNotEqual(ip string) []expr.Any {
+	return []expr.Any{
+		&expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseNetworkHeader,
+			Offset:       12,
+			Len:          4,
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpNeq,
+			Register: 1,
+			Data:     net.ParseIP(ip).To4(),
+		},
+	}
+}
+
+func ipDestinationCIDREqual(cidr string) []expr.Any {
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		panic(fmt.Sprintf("invalid CIDR %q: %v", cidr, err))
+	}
+	return []expr.Any{
+		&expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseNetworkHeader,
+			Offset:       16,
+			Len:          4,
+		},
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask:           ipnet.Mask,
+			Xor:            []byte{0, 0, 0, 0},
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     ipnet.IP.To4(),
 		},
 	}
 }
@@ -499,6 +656,12 @@ type NetworkConfig struct {
 	// DumpNetInfo indicates whether to dump network information to the logs for debugging purposes.
 	// Used by: gVisor.
 	DumpNetInfo bool
+
+	// NodePortStart and NodePortEnd define the range of Kubernetes NodePorts to drop egress to.
+	NodePortStart uint16
+	NodePortEnd   uint16
+	// ClusterCIDR is the IPv4 CIDR of the cluster network to drop egress to.
+	ClusterCIDR string
 }
 
 // SetupActorNetwork builds a fresh point-to-point network between the worker
@@ -594,7 +757,7 @@ func SetupActorNetwork(ctx context.Context, cfg NetworkConfig) (retErr error) {
 	if err := EnableIPv4Forwarding(); err != nil {
 		return err
 	}
-	if err := InstallActorNftablesRules(podIP); err != nil {
+	if err := InstallActorNftablesRules(podIP, cfg.NodePortStart, cfg.NodePortEnd, cfg.ClusterCIDR); err != nil {
 		return err
 	}
 
@@ -610,4 +773,24 @@ func SetupActorNetwork(ctx context.Context, cfg NetworkConfig) (retErr error) {
 	}
 
 	return nil
+}
+
+// ParsePortRange parses a string like "30000-32767" into a start and end uint16.
+func ParsePortRange(portRange string) (uint16, uint16, error) {
+	if portRange == "" {
+		return 0, 0, nil
+	}
+	parts := strings.SplitN(portRange, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid port range format %q, expected 'start-end'", portRange)
+	}
+	start, err1 := strconv.ParseUint(parts[0], 10, 16)
+	end, err2 := strconv.ParseUint(parts[1], 10, 16)
+	if err1 != nil || err2 != nil {
+		return 0, 0, fmt.Errorf("invalid port range format %q: ports must be uint16", portRange)
+	}
+	if start > end {
+		return 0, 0, fmt.Errorf("invalid port range %q: start port must be <= end port", portRange)
+	}
+	return uint16(start), uint16(end), nil
 }
