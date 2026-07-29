@@ -124,34 +124,49 @@ Two distinct behaviours, and the second one is the finding that matters:
   and therefore skips certificate selection entirely. `disable_stateless_session_resumption`
   and `disable_stateful_session_resumption` sit on `DownstreamTlsContext`, *not*
   inside `common_tls_context`.
-- `node.id` and `node.cluster` are required, or the SDS subscription is rejected
-  with `TlsCertificateSdsApi: node 'id' and 'cluster' are required`.
+- **A node id and cluster are required**, or the SDS subscription is rejected with
+  `TlsCertificateSdsApi: node 'id' and 'cluster' are required`. They can come
+  from a `node:` block *or* from `--service-node`/`--service-cluster`, and the
+  file wins if both are present — so per-pod identity means **omitting the block
+  entirely**. Note `/config_dump` renders the bootstrap as parsed from disk, not
+  the effective node, so it cannot be used to check which one took effect.
 
 ## Deploying this for real
 
-`envoy-bootstrap-good.yaml` is the reference for the **downstream** half. Two
-things stand between it and production.
+**[`deploy/envoy-egress.yaml`](deploy/envoy-egress.yaml)** is the deployable
+config. Verified against Envoy 1.37.5: `--mode validate` clean with no
+deprecation warnings, and smoke-tested end to end — prefetch mints before first
+request, `example.com` is fetched through the MITM at HTTP 200 with the origin's
+real body, and the access log emits `sni=example.com` matching `authority`.
 
-**It would not ship as a file.** The router's Envoy is ADS-driven:
-`cmd/atenet/internal/router/envoyrunner.go:77` writes a bootstrap containing only
-`dynamic_resources` plus the `xds_cluster`, and listeners are built in Go and
-pushed. The block to port is the `DownstreamTlsContext` at
-`cmd/atenet/internal/router/xds.go:627`. So bumping the Envoy image to 1.37+ is
-necessary but not sufficient — `go-control-plane` also needs the
-`on_demand_secret` and `cert_mappers.sni` message types (`envoy@v1.37.0` has
-them, and it is already vendored).
+What it does about each gap in the PoC bootstraps:
 
-**The remaining gaps**, none of which the PoC addresses:
-
-| | |
+| Gap | Production config |
 |---|---|
-| SDS socket path | `pipe: {path: ./sdsmint.sock}` is relative to Envoy's cwd. Needs an absolute path on a shared `emptyDir`. |
-| Listen address | `127.0.0.1:18443` is loopback-only; an egress gateway needs the pod IP. That also makes the mode-0600 socket the only thing keeping leaf keys local. |
-| Node identity | `node.id`/`node.cluster` are hardcoded. `sdsmintd` keys per-stream subscription state off them, so they must be per-pod. |
-| Policy enforcement | Both bootstraps route `domains: ["*"]` straight through. Inspecting the request is the entire reason for terminating TLS; this is where ext_proc goes. |
-| Access logging | Absent. An egress MITM with no record of what was fetched is a hard sell. |
-| `default_value` | Non-SNI clients all get `default.mitm.example`, which fails their validation — closed, but confusingly. Rejecting non-SNI egress at the listener may be better. |
-| `dns_cache_config` | `max_hosts: 1024` / `max_pending_requests: 128` were picked to be unremarkable, not sized against real traffic. |
+| Connect timeout | `transport_socket_connect_timeout: 5s`. The one non-negotiable. |
+| Upstream | `dynamic_forward_proxy` with ALPN-negotiated `auto_config`. Avoids the cluster-level `upstream_http_protocol_options`, which is deprecated and slated for removal — it lives under `typed_extension_protocol_options` now. |
+| SDS socket | Absolute, `/var/run/sdsmint/sdsmint.sock`, on a shared `emptyDir`. |
+| Listen address | `0.0.0.0:8443`. Admin stays on loopback `9901`. |
+| Node identity | No `node:` block; supplied per-pod via `--service-node=$(POD_NAME).$(POD_NAMESPACE)`. |
+| Policy enforcement | `ext_proc` ahead of DNS resolution, `failure_mode_allow: false` so egress fails closed. |
+| Access logging | JSON to stdout, including `REQUESTED_SERVER_NAME` — the SNI the cert was minted for. |
+| Memory | `overload_manager` with a fixed-heap ceiling. An unbounded destination set means unbounded DNS entries *and* unbounded live secret subscriptions. |
+| Resilience | Circuit breakers on all three clusters, TLS 1.2 floor on both legs, connect-failure retries. |
+
+**It still would not ship as a bootstrap file for the router.** That Envoy is
+ADS-driven: `cmd/atenet/internal/router/envoyrunner.go:77` writes a bootstrap
+containing only `dynamic_resources` plus the `xds_cluster`, and listeners are
+built in Go and pushed. The block to port is the `DownstreamTlsContext` at
+`cmd/atenet/internal/router/xds.go:627`, so treat this file as the specification
+for what LDS should emit. Bumping the image to 1.37+ is necessary but not
+sufficient — `go-control-plane` also needs the `on_demand_secret` and
+`cert_mappers.sni` message types (`envoy@v1.37.0` has them, already vendored).
+
+**Four decisions the config cannot make for you**, all called out in its header:
+how traffic reaches the listener (it is a transparent MITM, not an HTTP CONNECT
+proxy); where the CA key lives (a KMS signer, not a file); who trusts the MITM
+CA, and how that bundle is protected; and whether `default_value` is the right
+answer for non-SNI clients versus rejecting them at the listener.
 
 ## Layout
 
@@ -163,9 +178,10 @@ poc/sdsmint/
   server.go        delta SDS: per-stream subscriptions, initial_resource_versions,
                    removed_resources for refusals, optional rotation timer
   cmd/sdsmintd/    the daemon; UDS by default, chmod 0600
-  testdata/        envoy-bootstrap.yaml      hermetic; NO connect timeout, by design
-                   -fwdproxy.yaml            real egress re-origination
-                   -good.yaml                the one to copy
+  deploy/          envoy-egress.yaml         PRODUCTION. the one to deploy.
+  testdata/        envoy-bootstrap.yaml      PoC; NO connect timeout, by design
+                   -fwdproxy.yaml            PoC; real egress re-origination
+                   -good.yaml                PoC; hermetic, + the connect timeout
   hack/run-poc.sh  the end-to-end harness
 ```
 

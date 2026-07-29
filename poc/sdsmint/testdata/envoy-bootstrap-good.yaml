@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# GOOD CONFIG -- this is the downstream TLS configuration to copy.
+# GOOD CONFIG -- the hermetic bootstrap with transport_socket_connect_timeout set.
+#
+# FOR DEPLOYMENT, USE ../deploy/envoy-egress.yaml INSTEAD. This file exists to
+# isolate one variable for the harness; that one is the real thing.
 #
 # The other two bootstraps in this directory are deliberately flawed. Both omit
 # transport_socket_connect_timeout so that run-poc.sh can demonstrate what
@@ -28,13 +31,13 @@
 # exist in 1.36 or earlier -- notably not in the v1.30-latest that
 # manifests/ate-install/atenet-router.yaml currently pins.
 #
-# Scope of "good": the downstream half. The upstream here is still a
-# direct_response so the file stays hermetic and usable in CI. A real egress
-# proxy needs the dynamic_forward_proxy upstream from
-# envoy-bootstrap-fwdproxy.yaml, plus the remaining items in README.md
-# ("Deploying this for real") -- an absolute SDS socket path, a non-loopback
-# listen address, per-pod node identity, access logging, and the policy filters
-# that are the entire reason for terminating TLS in the first place.
+# Scope of "good": the downstream half, and only the parts the harness needs.
+# The upstream is still a direct_response so the file stays hermetic and usable
+# in CI, and it hardcodes a node block, a loopback listen address and a relative
+# socket path -- none of which belong in a deployment.
+# ../deploy/envoy-egress.yaml is the same design with all of that fixed, plus
+# the dynamic_forward_proxy upstream, ext_proc, access logging, and an overload
+# manager. See README.md "Deploying this for real".
 #
 # Paths are relative to the working directory Envoy is started in, which
 # run-poc.sh sets to poc/sdsmint/__run.
