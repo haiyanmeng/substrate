@@ -91,8 +91,11 @@ Two distinct behaviours, and the second one is the finding that matters:
   any real deployment of this design.** Without it an SDS outage does not
   degrade egress — it wedges every actor that dials a host not already in cache.
 
-  The shipped bootstraps deliberately omit it so the harness can demonstrate the
-  default; both carry a comment saying so.
+  `envoy-bootstrap.yaml` and `-fwdproxy.yaml` deliberately omit it so the
+  harness can demonstrate the default; both carry a comment saying so.
+  **[`envoy-bootstrap-good.yaml`](testdata/envoy-bootstrap-good.yaml) is the
+  same config with the knob set** — that is the one to copy, and the harness
+  runs it as leg 2.
 
 ## Corrections to mint.md
 
@@ -124,6 +127,32 @@ Two distinct behaviours, and the second one is the finding that matters:
 - `node.id` and `node.cluster` are required, or the SDS subscription is rejected
   with `TlsCertificateSdsApi: node 'id' and 'cluster' are required`.
 
+## Deploying this for real
+
+`envoy-bootstrap-good.yaml` is the reference for the **downstream** half. Two
+things stand between it and production.
+
+**It would not ship as a file.** The router's Envoy is ADS-driven:
+`cmd/atenet/internal/router/envoyrunner.go:77` writes a bootstrap containing only
+`dynamic_resources` plus the `xds_cluster`, and listeners are built in Go and
+pushed. The block to port is the `DownstreamTlsContext` at
+`cmd/atenet/internal/router/xds.go:627`. So bumping the Envoy image to 1.37+ is
+necessary but not sufficient — `go-control-plane` also needs the
+`on_demand_secret` and `cert_mappers.sni` message types (`envoy@v1.37.0` has
+them, and it is already vendored).
+
+**The remaining gaps**, none of which the PoC addresses:
+
+| | |
+|---|---|
+| SDS socket path | `pipe: {path: ./sdsmint.sock}` is relative to Envoy's cwd. Needs an absolute path on a shared `emptyDir`. |
+| Listen address | `127.0.0.1:18443` is loopback-only; an egress gateway needs the pod IP. That also makes the mode-0600 socket the only thing keeping leaf keys local. |
+| Node identity | `node.id`/`node.cluster` are hardcoded. `sdsmintd` keys per-stream subscription state off them, so they must be per-pod. |
+| Policy enforcement | Both bootstraps route `domains: ["*"]` straight through. Inspecting the request is the entire reason for terminating TLS; this is where ext_proc goes. |
+| Access logging | Absent. An egress MITM with no record of what was fetched is a hard sell. |
+| `default_value` | Non-SNI clients all get `default.mitm.example`, which fails their validation — closed, but confusingly. Rejecting non-SNI egress at the listener may be better. |
+| `dns_cache_config` | `max_hosts: 1024` / `max_pending_requests: 128` were picked to be unremarkable, not sized against real traffic. |
+
 ## Layout
 
 ```
@@ -134,7 +163,9 @@ poc/sdsmint/
   server.go        delta SDS: per-stream subscriptions, initial_resource_versions,
                    removed_resources for refusals, optional rotation timer
   cmd/sdsmintd/    the daemon; UDS by default, chmod 0600
-  testdata/        envoy-bootstrap.yaml (hermetic), -fwdproxy.yaml (real egress)
+  testdata/        envoy-bootstrap.yaml      hermetic; NO connect timeout, by design
+                   -fwdproxy.yaml            real egress re-origination
+                   -good.yaml                the one to copy
   hack/run-poc.sh  the end-to-end harness
 ```
 

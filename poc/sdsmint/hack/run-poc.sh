@@ -393,20 +393,19 @@ else
   bad "expected the client to time out first, got: ${DOWN_OUT}"
 fi
 
-# The fix. transport_socket_connect_timeout is a filter-chain-level sibling of
-# transport_socket, so it cannot be merged in with --config-yaml (repeated
-# fields append rather than merge); generate the variant instead.
-awk '/^      transport_socket:$/ && !d {print "      transport_socket_connect_timeout: 5s"; d=1} {print}' \
-  "${POC_DIR}/testdata/envoy-bootstrap.yaml" >"${RUN_DIR}/envoy-bootstrap-timeout.yaml"
-
+# The fix, from the checked-in good config. It is a whole separate file rather
+# than an overlay because transport_socket_connect_timeout is a filter-chain-level
+# sibling of transport_socket, so --config-yaml cannot merge it in (repeated
+# fields append rather than merge).
+#
 # Bring SDS back for the restart: the listener prefetches at config load, so
 # Envoy needs a reachable server to initialise. Kill it again once it is up, so
 # leg 2 measures the same cold-name-with-SDS-down case as leg 1.
 stop_envoy
 start_sds 5m
-start_envoy envoy-bootstrap-timeout.yaml 2
+start_envoy envoy-bootstrap-good.yaml 2
 stop_sds
-note "leg 2: same run with transport_socket_connect_timeout: 5s"
+note "leg 2: envoy-bootstrap-good.yaml, which sets transport_socket_connect_timeout: 5s"
 # A name leg 1 never reached, so this is still a genuine cold fetch.
 cold_fetch 60 cold2.mitm.example
 elapsed_ms="${ELAPSED_MS}"

@@ -12,18 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Hermetic PoC bootstrap for mint.md's recommended design (Option C):
-# on_demand_secret certificate selector + sni certificate mapper, backed by the
-# sdsmintd minting SDS server over a unix socket.
+# GOOD CONFIG -- this is the downstream TLS configuration to copy.
 #
-# Requires Envoy 1.37 or newer. The two extensions used here do not exist in
-# 1.36 or earlier -- notably not in the v1.30-latest that
+# The other two bootstraps in this directory are deliberately flawed. Both omit
+# transport_socket_connect_timeout so that run-poc.sh can demonstrate what
+# happens without it: when sdsmintd is down, a first-contact SNI pauses the
+# handshake and Envoy NEVER gives up -- measured still waiting after the
+# client's full 20s budget, and after 3 minutes by hand. The client hangs and
+# never receives an error.
+#
+# This file is the same configuration with the knob set. run-poc.sh Experiment C
+# runs both and shows the same request failing in ~5s instead of hanging.
+#
+# Requires Envoy 1.37 or newer. on_demand_secret and cert_mappers.sni do not
+# exist in 1.36 or earlier -- notably not in the v1.30-latest that
 # manifests/ate-install/atenet-router.yaml currently pins.
 #
-# The upstream is a direct_response so that this file proves exactly one thing
-# -- that a leaf is minted per SNI on demand -- with no other moving parts. See
-# envoy-bootstrap-fwdproxy.yaml for the variant that really re-originates, and
-# envoy-bootstrap-good.yaml for the one to copy.
+# Scope of "good": the downstream half. The upstream here is still a
+# direct_response so the file stays hermetic and usable in CI. A real egress
+# proxy needs the dynamic_forward_proxy upstream from
+# envoy-bootstrap-fwdproxy.yaml, plus the remaining items in README.md
+# ("Deploying this for real") -- an absolute SDS socket path, a non-loopback
+# listen address, per-pod node identity, access logging, and the policy filters
+# that are the entire reason for terminating TLS in the first place.
 #
 # Paths are relative to the working directory Envoy is started in, which
 # run-poc.sh sets to poc/sdsmint/__run.
@@ -73,14 +84,17 @@ static_resources:
           - name: envoy.filters.http.router
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
-      # NOTE: transport_socket_connect_timeout is deliberately absent here so
-      # that run-poc.sh can demonstrate the default behaviour -- with SDS down,
-      # a cold SNI pauses the handshake forever (measured: still waiting after
-      # 20s, and after 3min by hand). Envoy never gives up on its own.
+      # THE KNOB. Without it an SDS outage does not degrade egress, it wedges
+      # every actor dialling a host Envoy has not already cached -- indefinitely,
+      # because certificate selection pauses the handshake and nothing times it
+      # out. Note this is a filter-chain-level sibling of transport_socket, not
+      # a field inside it; putting it in the wrong place is silently accepted as
+      # an unknown field in some tooling.
       #
-      # DO NOT COPY THIS FILE. Any real deployment MUST set the knob; see
-      # envoy-bootstrap-good.yaml, which is this config with it set, and which
-      # the harness runs as leg 2 to prove it bounds the stall.
+      # 5s is what the PoC measured against. Size it above the p99 mint latency
+      # (a P-256 sign plus a UDS round-trip, so single-digit ms) and below
+      # whatever the calling actor's own timeout is.
+      transport_socket_connect_timeout: 5s
       transport_socket:
         name: envoy.transport_sockets.tls
         typed_config:

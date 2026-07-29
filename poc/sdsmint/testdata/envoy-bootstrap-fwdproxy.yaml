@@ -73,9 +73,10 @@ static_resources:
           - name: envoy.filters.http.router
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
-      # See envoy-bootstrap.yaml: omitted so the PoC can show the unbounded
-      # default. Production must set it, or an SDS outage stalls every
-      # first-contact host indefinitely rather than failing fast.
+      # transport_socket_connect_timeout is omitted here too, so the PoC can
+      # show the unbounded default. Production must set it, or an SDS outage
+      # stalls every first-contact host indefinitely rather than failing fast.
+      # Copy the knob from envoy-bootstrap-good.yaml along with this upstream.
       transport_socket:
         name: envoy.transport_sockets.tls
         typed_config:
