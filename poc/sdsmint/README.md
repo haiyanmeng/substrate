@@ -31,6 +31,7 @@ go test ./poc/sdsmint/...          # unit tests, no Envoy needed
 ./poc/sdsmint/hack/run-poc.sh      # hermetic end-to-end: 14 assertions
 ./poc/sdsmint/hack/run-poc.sh --forward-proxy   # + real MITM of example.com: 16
 ./poc/sdsmint/hack/run-scale.sh    # scalability phases 0-7 (see below)
+./poc/sdsmint/hack/run-stress.sh   # one rate, held long enough to mean something
 ```
 
 The harness downloads `envoy-1.37.5-linux-x86_64` into `poc/sdsmint/__run/`
@@ -397,6 +398,146 @@ assumed, because a broken re-fetch would be invisible in the memory curve.
 | 5 | What does a rotation tick cost? | At 500 live names, 999 pushes reached the data plane, per-stream cost ≤ 1 ms, largest response 1,705 B, no NACKs, and concurrent handshakes were undisturbed (p99 3,588 µs). But one stream per secret means a tick is **N independent sign-and-push operations** — at 50k live names, 50k signatures per tick. |
 | 7 | What does an SDS restart cost? | Warm names kept serving with SDS fully down (200/200, p99 3,569 µs) — no per-connection dependency. On restart Envoy replayed **2,997 names across 2,997 separate requests**, first at +306 ms, settled by +20 s. With a real signer that burst is N mints, not N cache hits. |
 
+### Sustained load at 500/s
+
+Phase 3 holds each rate for five seconds. That is enough to find where things
+break and not enough to characterise a rate, so `hack/run-stress.sh` holds one
+rate long enough for the tail percentiles to mean something and repeats it,
+which is the only way to know whether a tail number is a measurement or a mood.
+
+```sh
+./poc/sdsmint/hack/run-stress.sh                      # 500/s for 30 s, 3 trials
+RATE=1000 DURATION=60 TRIALS=1 ./poc/sdsmint/hack/run-stress.sh
+```
+
+500/s of never-seen SNIs for 30 s — 15,000 connections per trial, eight trials,
+every connection a cold fetch forcing a real mint, the real signer throughout.
+Envoy and sdsmintd restart between trials so each starts from an empty live set
+instead of inheriting the last one's.
+
+| trial | p50 | p90 | p95 | p99 | max |
+|---|---:|---:|---:|---:|---:|
+| 1 | 7,020 µs | 29,372 | 41,120 | 64,981 | 101,392 |
+| 2 | 7,141 µs | 35,282 | 52,106 | 145,569 | 338,464 |
+| 3 | 8,461 µs | 75,088 | 138,107 | 205,401 | 246,379 |
+| 4 | 9,196 µs | 58,612 | 90,691 | 155,252 | 200,424 |
+| 5 | 8,041 µs | 40,763 | 66,494 | 122,665 | 184,903 |
+| 6 | 8,980 µs | 41,926 | 61,560 | 108,949 | 143,346 |
+| 7 | 7,738 µs | 38,535 | 58,207 | 121,544 | 173,194 |
+| 8 | 7,876 µs | 32,770 | 47,734 | 81,031 | 138,843 |
+
+Trials 1–3 and 4–8 are two separate invocations twenty minutes apart; every
+trial restarts both processes regardless.
+
+All eight served 15,000/15,000 with **zero failures and zero drops** at
+499.88–499.94/s achieved, client scheduling lag p99 4.0–4.8 ms — the offered
+rate really was delivered. Each reported `mints=+15000`: the harness diffs
+`mints_issued` against the connection count, so a run that quietly went warm
+would be caught rather than reported as a fast one.
+
+**The p50 holds. The p95 does not.**
+
+| | median | range |
+|---|---:|---:|
+| p50 | 7,959 µs | 7,020 – 9,196 (1.3×) |
+| p95 | 59,884 µs | 41,120 – 138,107 (3.4×) |
+| p99 | 122,105 µs | 64,981 – 205,401 (3.2×) |
+
+So: **p50 ≈ 8 ms, p95 ≈ 60 ms** with the tail figure carrying a factor of three
+either way. Quote the p50 as a number and the p95 as an order of magnitude.
+
+The eight trials also kill the obvious explanation for that spread. In the first
+invocation the tail degraded monotonically while the machine's load average rose
+2.4 → 7.8, which looked like a clean story about contention. The second
+invocation started quieter (1.36), ended at 6.45, and its tail improved
+monotonically — 90.7, 66.5, 61.6, 58.2, 47.7 ms — with the *worst* trial of the
+two runs occurring on the *least* loaded box. Neither trend is real. Both are
+what a three-times-noisy statistic looks like when you read five points of it in
+a row, and the honest summary is a range with no trend in it.
+
+Three things the runs say about where the latency lives, all stable across all
+eight:
+
+- **Signing is not the bottleneck.** `sign_avg` held at 601–635 µs, so 500/s is
+  0.30 cores of P-256 work against 14. The cost is Envoy pausing and resuming
+  handshakes and opening 500 new gRPC streams a second, not the CA.
+- **The client is expensive and shares the box** — 33.5–35.9 s of CPU over a
+  30 s run, ~1.1 cores. Against phase 0's static-certificate p50 of 2,208 µs at
+  a comparable rate, roughly 2 ms of the 8 ms p50 is client floor and ~6 ms is
+  the on-demand path.
+- **Memory tracked the live set exactly as the ramp predicted**: 944–947 MB
+  Envoy RSS for 15,200 live secrets, 62 KB apiece, reproducible to within 0.3%.
+  At 500 cold SNIs/s that is ~1.9 GB/minute of Envoy heap with `--idle` unset.
+
+One framing caveat: 100% cold SNIs is the pathological case, not a workload.
+Real egress traffic re-hits hosts, and a warm hit is 196 ns of minter time. This
+measures the worst thing the design can be asked to do, sustained.
+
+### The warm path at 500/s, and what the pause actually costs
+
+The section above is the pathological case: every connection cold. Real egress
+traffic re-hits hosts, so the other end of the range matters just as much, and
+it is the same run with one flag changed.
+
+```sh
+DISTINCT=50 TRIALS=8 ./poc/sdsmint/hack/run-stress.sh
+```
+
+`DISTINCT=N` fetches N names *before* the timer starts and then cycles the trial
+over them. Same rate, same duration, same processes, same client — the only
+difference is that no connection pauses for SDS. 50 names against 15,000
+connections is ~300 hits apiece, and every trial reported `mints=+0`, which is
+asserted rather than assumed: a warm trial that quietly minted would otherwise
+look like a fast one.
+
+| trial | p50 | p90 | p95 | p99 | max |
+|---|---:|---:|---:|---:|---:|
+| 1 | 2,128 µs | 2,747 | 3,051 | 3,976 | 25,177 |
+| 2 | 2,125 µs | 2,757 | 3,102 | 4,266 | 11,554 |
+| 3 | 2,208 µs | 2,861 | 3,186 | 4,161 | 19,016 |
+| 4 | 2,230 µs | 2,846 | 3,161 | 3,882 | 9,788 |
+| 5 | 2,233 µs | 2,816 | 3,126 | 3,756 | 8,367 |
+| 6 | 2,211 µs | 2,815 | 3,140 | 3,872 | 15,850 |
+| 7 | 2,244 µs | 2,877 | 3,188 | 3,982 | 13,049 |
+| 8 | 2,213 µs | 2,834 | 3,156 | 3,976 | 26,483 |
+
+All eight served 15,000/15,000, zero failures, zero drops, 499.96–499.98/s
+achieved, `cert_active=50` throughout.
+
+**The warm path is steady in a way the cold path is not.** p50 median 2,212 µs
+over a 2,125–2,244 range (1.06×); p95 median 3,148 µs over 3,051–3,188 (1.04×);
+p99 median 3,976 µs. Set that beside the cold run's 3.4× p95 spread and the
+conclusion is not "the tail is noisy" but something sharper:
+
+| | cold (8 trials) | warm (8 trials) | difference |
+|---|---:|---:|---:|
+| p50 | 7,959 µs | 2,212 µs | **~5.7 ms** |
+| p95 | 59,884 µs | 3,148 µs | **~57 ms** |
+| p99 | 122,105 µs | 3,976 µs | ~118 ms |
+
+That difference is the pause-fetch-resume cycle: Envoy stopping the handshake,
+opening a DELTA_GRPC stream for the name, the round trip to sdsmintd, the mint,
+and the resume. **Around 6 ms at p50 — and effectively all of the tail
+variance.** A warm handshake at 500/s has a p95 only 42% above its own median.
+Whatever makes the cold p95 swing between 41 ms and 138 ms lives entirely inside
+the fetch, not in TLS, not in Envoy's per-connection work, and not in the client.
+
+Signing is the smaller part of that 6 ms. `sign_avg` was 662–826 µs, so ~0.7 ms
+is the CA and ~5 ms is stream setup, the xDS round trip and the resume — at
+500 cold SNIs/s, 500 new gRPC streams a second. That is where to aim if this
+number ever needs to come down, and it agrees with phase 2, which measured a
+~4.3 ms cold penalty at 10/s with the signer removed from the path entirely.
+
+Two smaller things fall out of the same run. Envoy held **65 MB of RSS for 50
+live secrets against 946 MB for 15,200** — the working set, not the history, is
+what a bounded live set buys. And the client got cheaper too (30.6 s of CPU
+against 34–36 s, scheduling lag p99 1.9 ms against 4.0–4.8 ms), which is worth
+knowing before reading the cold tails as pure server behaviour.
+
+A separate 3-trial run at `DISTINCT=200` landed at p50 2,101 µs and p95 3,067 µs
+— within noise of the 50-name numbers, so between 50 and 200 hot names the size
+of the working set does not register.
+
 ### What this harness cannot tell you
 
 The load generator is the bottleneck, and it says so: **2,300 µs of client CPU
@@ -477,6 +618,8 @@ poc/sdsmint/
   hack/lib.sh      shared process lifecycle and admin-stat plumbing
   hack/run-poc.sh  the end-to-end harness
   hack/run-scale.sh  the nine scale phases
+  hack/run-stress.sh sustained single-rate load against the real signer,
+                     repeated so a tail number can be checked for spread
 ```
 
 Zero new Go dependencies — everything needed is already vendored, so `vendor/`

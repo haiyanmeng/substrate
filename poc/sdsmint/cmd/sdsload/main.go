@@ -472,6 +472,7 @@ func percentiles(d []time.Duration) map[string]int64 {
 	return map[string]int64{
 		"p50": at(0.50),
 		"p90": at(0.90),
+		"p95": at(0.95),
 		"p99": at(0.99),
 		"max": sorted[len(sorted)-1].Microseconds(),
 	}
