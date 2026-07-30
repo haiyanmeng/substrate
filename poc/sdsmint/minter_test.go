@@ -133,7 +133,7 @@ func TestMinterEvictsToCap(t *testing.T) {
 
 	impl := m.(*minter)
 	impl.mu.Lock()
-	size := len(impl.cache)
+	size := impl.cache.len()
 	impl.mu.Unlock()
 
 	if size > 4 {

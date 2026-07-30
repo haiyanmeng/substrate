@@ -50,24 +50,19 @@ type Minter interface {
 // TestRotationNeverServesAnExpiredLeaf is what fails if this inverts.
 const reuseFraction = 1.0 / 2.0
 
-type cacheEntry struct {
-	cert *MintedCert
-	// reuseUntil is when the cache stops handing this entry out. It is
-	// deliberately earlier than cert.NotAfter — see reuseFraction.
-	reuseUntil time.Time
-	lastUsed   time.Time
-}
-
 type minter struct {
 	ca       *CA
 	validate func(host string) error // allowlist — LIMITS CA ABUSE
 	ttl      time.Duration
-	reuse    time.Duration
-	cap      int
-	log      *slog.Logger
+	// reuse is how long a minted leaf may be served from cache: shorter than
+	// ttl, so that a cache hit never hands back a nearly-dead certificate and
+	// so that the rotation ticker always finds a stale entry. See
+	// reuseFraction.
+	reuse time.Duration
+	log   *slog.Logger
 
 	mu    sync.Mutex
-	cache map[string]*cacheEntry
+	cache *certCache
 }
 
 // MinterOptions configures NewMinter.
@@ -107,9 +102,8 @@ func NewMinter(ca *CA, opts MinterOptions) (Minter, error) {
 		validate: opts.Validate,
 		ttl:      opts.TTL,
 		reuse:    time.Duration(float64(opts.TTL) * reuseFraction),
-		cap:      opts.Cap,
 		log:      opts.Logger,
-		cache:    make(map[string]*cacheEntry),
+		cache:    newCertCache(opts.Cap),
 	}, nil
 }
 
@@ -127,13 +121,11 @@ func (m *minter) GetCertificate(ctx context.Context, host string) (*MintedCert, 
 	now := time.Now()
 
 	m.mu.Lock()
-	if e, ok := m.cache[host]; ok && now.Before(e.reuseUntil) {
-		e.lastUsed = now
-		cert := e.cert
-		m.mu.Unlock()
-		return cert, nil
-	}
+	cached, ok := m.cache.get(host, now)
 	m.mu.Unlock()
+	if ok {
+		return cached, nil
+	}
 
 	// Sign outside the lock: it generates a keypair, which is slow enough
 	// that holding the map lock across it would serialise every handshake.
@@ -145,8 +137,7 @@ func (m *minter) GetCertificate(ctx context.Context, host string) (*MintedCert, 
 	}
 
 	m.mu.Lock()
-	m.evictLocked(now)
-	m.cache[host] = &cacheEntry{cert: cert, reuseUntil: now.Add(m.reuse), lastUsed: now}
+	m.cache.put(host, cert, now, now.Add(m.reuse))
 	m.mu.Unlock()
 
 	m.log.InfoContext(ctx, "certificate issued",
@@ -155,30 +146,6 @@ func (m *minter) GetCertificate(ctx context.Context, host string) (*MintedCert, 
 		slog.Time("not_after", cert.NotAfter),
 	)
 	return cert, nil
-}
-
-// evictLocked drops entries past their reuse window, then the
-// least-recently-used ones until the cache is back under cap. Callers must
-// hold m.mu.
-func (m *minter) evictLocked(now time.Time) {
-	for host, e := range m.cache {
-		if !now.Before(e.reuseUntil) {
-			delete(m.cache, host)
-		}
-	}
-	for len(m.cache) >= m.cap {
-		var oldestHost string
-		var oldest time.Time
-		for host, e := range m.cache {
-			if oldestHost == "" || e.lastUsed.Before(oldest) {
-				oldestHost, oldest = host, e.lastUsed
-			}
-		}
-		if oldestHost == "" {
-			return
-		}
-		delete(m.cache, oldestHost)
-	}
 }
 
 // AllowGlobs builds a validate function accepting hosts that match any of the

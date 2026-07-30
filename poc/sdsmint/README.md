@@ -196,30 +196,38 @@ response carrying every live secret crosses Envoy's 4 MB default gRPC receive
 limit somewhere around **2,700 live names**. `rotateAll` batches unconditionally,
 so that is a real ceiling, not a soft one.
 
-### The cache gets slower as it gets bigger
+### The cache used to get slower as it got bigger
 
-| `--cache-cap` | miss, serial | miss, 14 goroutines | eviction alone |
+The first implementation was a plain map, and `--cache-cap` was a trap: raising
+it made the server *slower*. Eviction ran two full map scans per miss — one for
+entries past their deadline, one to find the LRU victim — both with the
+exclusive lock held.
+
+`cache.go` replaces the scans with a recency list (the victim is the tail) and
+a min-heap on the reuse deadline (dead entries are at the root). Both are O(1)
+plus O(log n) of heap work, and the numbers go flat:
+
+| `--cache-cap` | miss, serial | miss, 14 goroutines | insert alone |
 |---|---:|---:|---:|
-| 256 | 441 µs | 129 µs | 12 µs |
-| 1,000 | 448 µs | — | 47 µs |
-| 10,000 | 960 µs | 808 µs | 533 µs |
-| 100,000 | 13.3 ms | — | 12.1 ms |
+| 256 | 441 µs → **400 µs** | 129 µs → **61 µs** | 12.4 µs → **368 ns** |
+| 1,000 | 448 µs → **389 µs** | — | 47 µs → **371 ns** |
+| 10,000 | 960 µs → **376 µs** | 808 µs → **48 µs** | 533 µs → **403 ns** |
+| 100,000 | 13.3 ms → **331 µs** | — | 12.1 ms → **598 ns** |
 
-**Raising `--cache-cap` makes the server slower.** `evictLocked` runs two full
-map scans per miss — one for expired entries, one to find the LRU victim — and
-both hold the exclusive lock. At cap 100k a single miss costs 30× what it costs
-at cap 256, and 91% of that is the scan rather than the signing.
+A miss at cap 100k is **40× faster**, and the insert inside it 20,000×. What is
+left is essentially just the signing, which is why the serial column is now the
+same number at every cap.
 
-The parallel column is the sharper version of the same point. Signing happens
-*outside* the lock, so concurrent misses should scale; at cap 256 they do
-(441 → 129 µs, ~3.4×). At cap 10,000 they do not (960 → 808 µs, 1.2× on 14
-threads) because every miss now sits in the eviction scan holding `m.mu`. The
-lock, not the CA, is the throughput ceiling once the cache is large.
+The parallel column is the part that matters for a busy proxy. Signing happens
+*outside* the lock, so concurrent misses ought to scale — before, at cap 10,000,
+they did not at all (960 → 808 µs, 1.2× on 14 threads) because every miss sat
+in the eviction scan holding `m.mu`. Now the lock is held for a few hundred
+nanoseconds and misses scale ~7× on 14 threads regardless of cap.
 
-Nothing here is fixed yet — it is a measurement, and the shape of the fix is
-obvious enough (an intrusive LRU list plus an expiry heap turns both scans into
-O(1)) that it is not worth guessing at before there is a target cache size.
-**Until then, treat `--cache-cap` as a knob with a real cost and leave it low.**
+One deliberate limit: a put reclaims at most 64 dead entries. Draining a
+100k-entry cache that expired all at once costs 86 ms, which is not something
+to do with the lock held; the remainder comes back on subsequent puts, and
+making room never depends on it because eviction by recency is always O(1).
 
 ## Deploying this for real
 
@@ -264,11 +272,14 @@ answer for non-SNI clients versus rejecting them at the listener.
 poc/sdsmint/
   ca.go            CA, LoadCA, GenerateCA, Sign -> MintedCert. key is a
                    crypto.Signer so a KMS/HSM signer drops in unchanged.
-  minter.go        allowlist + bounded TTL cache + issuance audit log
+  minter.go        allowlist + issuance audit log, over the cache below
+  cache.go         bounded LRU with per-entry reuse deadlines; recency list
+                   plus expiry heap, so nothing is O(cache size) under the lock
   server.go        delta SDS: per-stream subscriptions, initial_resource_versions,
                    removed_resources for refusals, optional rotation timer
   cmd/sdsmintd/    the daemon; UDS by default, chmod 0600
   rotation_test.go the rotation-vs-cache clock invariant
+  cache_test.go    structural invariants of the three structures agreeing
   bench_test.go    cost decomposition and cache-cap scaling
   deploy/          envoy-egress.yaml         PRODUCTION. the one to deploy.
   testdata/        envoy-bootstrap.yaml      PoC; NO connect timeout, by design
@@ -301,8 +312,6 @@ version gate above is a finding to report, not a change made here.
   rather than per-name deadlines, and `rotateAll` puts them all in one response.
   Measured at 1.5 KB per secret, that response passes Envoy's 4 MB default gRPC
   receive limit at roughly 2,700 live names.
-- `evictLocked` is O(cache size) per miss, under the lock — see "What it costs".
-  It is why `--cache-cap` should stay small for now.
 - The stream's `versions` map never shrinks. Minter cache eviction does not
   propagate to it, so Envoy's live secret set only grows; names leave only when
   the allowlist refuses them. That interacts badly with the batching above.

@@ -273,17 +273,19 @@ func BenchmarkPackSecret(b *testing.B) {
 // ---------------------------------------------------------------------------
 // S1: does a bigger cache cost more?
 //
-// evictLocked scans the whole map for expired entries on every miss, and then
-// scans it again per eviction to find the LRU victim. Both run with m.mu held,
-// so the prediction is that miss throughput falls as cap rises. These
-// benchmarks either confirm that or kill the theory.
+// It used to. The map-only cache scanned everything twice per miss with the
+// lock held -- once for expired entries, once for the LRU victim -- so a miss
+// cost 441us at cap 256 and 13.3ms at cap 100k, and concurrent misses stopped
+// scaling by cap 10k. certCache replaced both scans with a recency list and an
+// expiry heap. These benchmarks are what measured the problem; they stay as
+// the regression guard, and the numbers across caps should now be flat.
 // ---------------------------------------------------------------------------
 
 var benchCaps = []int{256, 1000, 10_000, 100_000}
 
 // fillCache seeds n live entries directly, skipping the signing that would
-// otherwise dominate setup. The certificate is shared; only the map shape
-// matters for what the eviction scans cost.
+// otherwise dominate setup. The certificate is shared; only the shape of the
+// cache matters for what eviction costs.
 func fillCache(b *testing.B, m *minter, n int) {
 	b.Helper()
 	cert, err := m.ca.Sign("seed.example", time.Hour)
@@ -294,13 +296,11 @@ func fillCache(b *testing.B, m *minter, n int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i := 0; i < n; i++ {
-		m.cache[fmt.Sprintf("seed%d.example", i)] = &cacheEntry{
-			cert: cert,
-			// Spread lastUsed so the LRU scan has a real ordering to find
-			// rather than a tie it can settle on the first entry.
-			reuseUntil: now.Add(time.Hour),
-			lastUsed:   now.Add(-time.Duration(i) * time.Millisecond),
-		}
+		// Stagger the deadlines so the expiry heap is a real heap rather than
+		// n identical keys, and insert oldest-first so recency order is not
+		// degenerate either.
+		m.cache.put(fmt.Sprintf("seed%d.example", i), cert, now,
+			now.Add(time.Hour+time.Duration(i)*time.Millisecond))
 	}
 }
 
@@ -326,40 +326,81 @@ func BenchmarkMinterMissAtCap(b *testing.B) {
 	}
 }
 
-// BenchmarkEvictLocked strips the signing away and times only the map work a
-// miss does under the lock. This is where an O(n) term shows up clearly: the
-// end-to-end benchmark above can hide it behind a fixed ~microsecond sign.
-func BenchmarkEvictLocked(b *testing.B) {
+// BenchmarkCacheInsertAtCap strips the signing away and times only the work a
+// miss does under the lock: evict a victim, insert a replacement, maintain
+// both orderings. This is where an O(n) term shows up clearly -- the
+// end-to-end benchmark above can hide one behind a fixed ~375us sign.
+func BenchmarkCacheInsertAtCap(b *testing.B) {
 	for _, capacity := range benchCaps {
 		b.Run(fmt.Sprintf("cap=%d", capacity), func(b *testing.B) {
 			m := benchMinter(b, MinterOptions{Cap: capacity})
 			fillCache(b, m, capacity)
-			cert := m.cache["seed0.example"].cert
+			cert, err := m.ca.Sign("probe.example", time.Hour)
+			if err != nil {
+				b.Fatal(err)
+			}
 			now := time.Now()
+			// Pre-render the keys: fmt.Sprintf costs more than the insert
+			// being measured once the insert is O(1).
+			keys := make([]string, b.N)
+			for i := range keys {
+				keys[i] = fmt.Sprintf("insert%d.example", i)
+			}
 
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
+				// The cache is full, so every insert evicts. A distinct host
+				// each time keeps it that way.
 				m.mu.Lock()
-				m.evictLocked(now)
-				// Put the evicted slot back so the next iteration starts from
-				// a full cache again; otherwise only the first iteration
-				// pays for the LRU scan.
-				m.cache[fmt.Sprintf("refill%d.example", i)] = &cacheEntry{
-					cert:       cert,
-					reuseUntil: now.Add(time.Hour),
-					lastUsed:   now,
-				}
+				m.cache.put(keys[i], cert, now, now.Add(time.Hour))
 				m.mu.Unlock()
 			}
 		})
 	}
 }
 
+// BenchmarkCachePurgeExpired times giving memory back: a full cache whose
+// entries have all passed their reuse deadline, emptied in one call. The heap
+// makes this O(n log n) overall rather than O(n) per removal, and it is the
+// path an idle sdsmintd takes after a traffic burst.
+func BenchmarkCachePurgeExpired(b *testing.B) {
+	for _, capacity := range benchCaps {
+		b.Run(fmt.Sprintf("cap=%d", capacity), func(b *testing.B) {
+			m := benchMinter(b, MinterOptions{Cap: capacity})
+			cert, err := m.ca.Sign("probe.example", time.Hour)
+			if err != nil {
+				b.Fatal(err)
+			}
+			past := time.Now().Add(-time.Hour)
+			keys := make([]string, capacity)
+			for i := range keys {
+				keys[i] = fmt.Sprintf("dead%d.example", i)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				for j, k := range keys {
+					m.cache.put(k, cert, past, past.Add(time.Duration(j)*time.Millisecond))
+				}
+				b.StartTimer()
+
+				m.cache.purgeExpired(time.Now())
+				if m.cache.len() != 0 {
+					b.Fatalf("cache still holds %d entries", m.cache.len())
+				}
+			}
+			b.ReportMetric(float64(capacity), "entries/op")
+		})
+	}
+}
+
 // BenchmarkMinterMissParallel is the contention question S1 really cares
 // about: concurrent handshakes for distinct cold hosts. Signing happens
-// outside the lock, so the ceiling is set by how long each miss holds m.mu —
-// which is exactly the eviction scan.
+// outside the lock, so the ceiling is set by how long each miss holds m.mu.
+// That used to be the eviction scan, and cap=10000 barely scaled at all.
 func BenchmarkMinterMissParallel(b *testing.B) {
 	ctx := context.Background()
 	for _, capacity := range []int{256, 10_000} {
