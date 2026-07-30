@@ -23,11 +23,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	_ "net/http/pprof" // registers the profiling handlers on DefaultServeMux
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -70,6 +73,12 @@ func run() error {
 	cacheCap := flag.Int("cache-cap", 256, "maximum number of cached leaves")
 	rotate := flag.Bool("rotate", false, "proactively push a re-minted leaf at ~2/3 of TTL for every live subscription")
 	logLevel := flag.String("log-level", "info", "one of debug, info, warn, error")
+	metricsAddr := flag.String("metrics-addr", "", "TCP address to serve /metrics and /debug/pprof on; empty disables both")
+	nullMinter := flag.Bool("null-minter", false, "MEASUREMENT ONLY: serve pre-signed shared leaves instead of minting, so a load test measures Envoy rather than the signer")
+	nullHost := flag.String("null-host", "*.mitm.example", "wildcard name the --null-minter pool is pre-signed for")
+	nullPool := flag.Int("null-pool", 16, "how many leaves --null-minter pre-signs; more than one so rotation pushes carry a changed version")
+	nullCertTTL := flag.Duration("null-cert-ttl", 24*time.Hour, "lifetime of the --null-minter pool, deliberately independent of --ttl")
+	nullCertOut := flag.String("null-cert-out", "", "directory to write one --null-minter leaf to as leaf.pem/leaf-key.pem, for configuring a static-certificate control")
 	flag.Var(&allow, "allow", "hostname pattern that may be minted, e.g. '*.example.com'; repeatable and required")
 	flag.Parse()
 
@@ -94,14 +103,49 @@ func run() error {
 		return err
 	}
 
-	minter, err := sdsmint.NewMinter(ca, sdsmint.MinterOptions{
-		Validate: sdsmint.AllowGlobs(allow),
-		TTL:      *ttl,
-		Cap:      *cacheCap,
-		Logger:   logger,
-	})
-	if err != nil {
-		return fmt.Errorf("building minter: %w", err)
+	metrics := &sdsmint.Metrics{}
+
+	var minter sdsmint.Minter
+	if *nullMinter {
+		nm, err := sdsmint.NewNullMinter(ca, sdsmint.NullMinterOptions{
+			Validate: sdsmint.AllowGlobs(allow),
+			Host:     *nullHost,
+			TTL:      *nullCertTTL,
+			Pool:     *nullPool,
+			Logger:   logger,
+			Metrics:  metrics,
+		})
+		if err != nil {
+			return fmt.Errorf("building null minter: %w", err)
+		}
+		if *nullCertOut != "" {
+			if err := writeLeaf(*nullCertOut, nm.Sample()); err != nil {
+				return err
+			}
+			logger.Info("wrote a pre-signed leaf for the static-certificate control",
+				slog.String("dir", *nullCertOut))
+		}
+		minter = nm
+	} else {
+		if *nullCertOut != "" {
+			return errors.New("--null-cert-out only means anything with --null-minter")
+		}
+		minter, err = sdsmint.NewMinter(ca, sdsmint.MinterOptions{
+			Validate: sdsmint.AllowGlobs(allow),
+			TTL:      *ttl,
+			Cap:      *cacheCap,
+			Logger:   logger,
+			Metrics:  metrics,
+		})
+		if err != nil {
+			return fmt.Errorf("building minter: %w", err)
+		}
+	}
+
+	if *metricsAddr != "" {
+		if err := serveMetrics(logger, *metricsAddr, metrics); err != nil {
+			return err
+		}
 	}
 
 	lis, err := listen(*uds, *addr)
@@ -112,9 +156,10 @@ func run() error {
 
 	grpcServer := grpc.NewServer()
 	secretservice.RegisterSecretDiscoveryServiceServer(grpcServer, sdsmint.NewServer(minter, sdsmint.ServerOptions{
-		Logger: logger,
-		Rotate: *rotate,
-		TTL:    *ttl,
+		Logger:  logger,
+		Rotate:  *rotate,
+		TTL:     *ttl,
+		Metrics: metrics,
 	}))
 
 	logger.Info("sdsmintd listening",
@@ -123,6 +168,7 @@ func run() error {
 		slog.Any("allow", []string(allow)),
 		slog.Duration("ttl", *ttl),
 		slog.Bool("rotate", *rotate),
+		slog.Bool("null_minter", *nullMinter),
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -150,6 +196,78 @@ func run() error {
 
 	if err := grpcServer.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 		return fmt.Errorf("serving: %w", err)
+	}
+	return nil
+}
+
+// serveMetrics starts the observability listener and returns once it is bound,
+// so a harness that reads /metrics immediately after startup cannot race it.
+//
+// It is a separate TCP address rather than something on the SDS socket because
+// it is for the operator, not the proxy, and because pprof over the same pipe
+// that carries private keys is a bad idea.
+func serveMetrics(logger *slog.Logger, addr string, metrics *sdsmint.Metrics) error {
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listening for metrics on %s: %w", addr, err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(metrics.Snapshot()); err != nil {
+			logger.Warn("writing metrics", slog.String("error", err.Error()))
+		}
+	})
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "ok")
+	})
+	// net/http/pprof registers onto DefaultServeMux in its init, so route to
+	// that rather than re-registering each handler by hand.
+	mux.Handle("/debug/pprof/", http.DefaultServeMux)
+
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		if err := srv.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("metrics listener failed", slog.String("error", err.Error()))
+		}
+	}()
+	logger.Info("serving metrics", slog.String("address", lis.Addr().String()))
+	return nil
+}
+
+// writeLeaf drops a certificate and its key next to each other so an Envoy
+// bootstrap can reference them as a static tls_certificate.
+//
+// Both files are written to a temporary name and renamed into place. A reader
+// that catches leaf.pem between create and write sees an empty file, and Envoy
+// rejects that with "certificate chain not set" -- an error that says nothing
+// about the race that caused it. rename(2) is atomic, so a reader sees either
+// the old pair or the new one.
+func writeLeaf(dir string, cert *sdsmint.MintedCert) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating leaf directory: %w", err)
+	}
+	write := func(name string, data []byte, mode os.FileMode) error {
+		tmp := filepath.Join(dir, "."+name+".tmp")
+		if err := os.WriteFile(tmp, data, mode); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, filepath.Join(dir, name)); err != nil {
+			os.Remove(tmp)
+			return err
+		}
+		return nil
+	}
+	// The key first: leaf.pem appearing is what a watcher keys on, so it has to
+	// be the last thing to become visible.
+	if err := write("leaf-key.pem", cert.PrivateKeyPEM, 0o600); err != nil {
+		return fmt.Errorf("writing leaf key: %w", err)
+	}
+	if err := write("leaf.pem", cert.CertChainPEM, 0o644); err != nil {
+		return fmt.Errorf("writing leaf cert: %w", err)
 	}
 	return nil
 }

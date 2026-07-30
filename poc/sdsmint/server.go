@@ -29,6 +29,7 @@ import (
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	secretservice "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
@@ -60,8 +61,9 @@ const rotateFraction = 2.0 / 3.0
 type Server struct {
 	secretservice.UnimplementedSecretDiscoveryServiceServer
 
-	minter Minter
-	log    *slog.Logger
+	minter  Minter
+	log     *slog.Logger
+	metrics *Metrics
 	// rotate enables the proactive re-mint push. Off by default so the
 	// experiment in the harness can toggle it.
 	rotate bool
@@ -78,6 +80,9 @@ type ServerOptions struct {
 	Rotate bool
 	// TTL must match the minter's leaf TTL for rotation timing to be right.
 	TTL time.Duration
+	// Metrics, if non-nil, counts streams, subscriptions, response sizes and
+	// rotation cost. Pass the same instance the minter got.
+	Metrics *Metrics
 }
 
 // NewServer builds an SDS server over m.
@@ -88,7 +93,7 @@ func NewServer(m Minter, opts ServerOptions) *Server {
 	if opts.TTL <= 0 {
 		opts.TTL = 5 * time.Minute
 	}
-	return &Server{minter: m, log: opts.Logger, rotate: opts.Rotate, ttl: opts.TTL}
+	return &Server{minter: m, log: opts.Logger, metrics: opts.Metrics, rotate: opts.Rotate, ttl: opts.TTL}
 }
 
 func (s *Server) nextNonce() string {
@@ -128,6 +133,14 @@ func (s *Server) DeltaSecrets(stream secretservice.SecretDiscoveryService_DeltaS
 		versions: make(map[string]string),
 		sendCh:   make(chan *discovery.DeltaDiscoveryResponse, 8),
 	}
+
+	s.metrics.recordStreamOpen()
+	defer func() {
+		st.mu.Lock()
+		held := len(st.versions)
+		st.mu.Unlock()
+		s.metrics.recordStreamClose(held)
+	}()
 
 	// Sends are funnelled through one goroutine because gRPC forbids
 	// concurrent Send on a stream, and rotation pushes race with responses to
@@ -234,6 +247,7 @@ func (d *deltaStream) handle(ctx context.Context, req *discovery.DeltaDiscoveryR
 	// is not a new subscription, but it is worth surfacing loudly: it means
 	// Envoy rejected a certificate we minted.
 	if ed := req.GetErrorDetail(); ed != nil {
+		d.srv.metrics.recordNACK()
 		d.srv.log.ErrorContext(ctx, "envoy NACKed an SDS response",
 			slog.String("message", ed.GetMessage()),
 			slog.Int("code", int(ed.GetCode())),
@@ -244,18 +258,29 @@ func (d *deltaStream) handle(ctx context.Context, req *discovery.DeltaDiscoveryR
 
 	// On stream reconnect Envoy replays what it already holds. Seed our view
 	// so we do not re-push resources it has, and so unsubscribes are correct.
+	if replayed := req.GetInitialResourceVersions(); len(replayed) > 0 {
+		d.srv.metrics.recordResync(len(replayed))
+	}
+	adopted, dropped := 0, 0
 	d.mu.Lock()
 	for name, version := range req.GetInitialResourceVersions() {
 		if _, known := d.versions[name]; !known {
 			d.versions[name] = version
+			adopted++
 		}
 	}
 	for _, name := range req.GetResourceNamesUnsubscribe() {
-		delete(d.versions, name)
+		if _, known := d.versions[name]; known {
+			delete(d.versions, name)
+			dropped++
+		}
 	}
 	d.mu.Unlock()
+	d.srv.metrics.addLiveNames(adopted - dropped)
+	d.srv.metrics.recordUnsubscribe(len(req.GetResourceNamesUnsubscribe()))
 
 	subscribe := req.GetResourceNamesSubscribe()
+	d.srv.metrics.recordSubscribe(len(subscribe))
 	if len(subscribe) == 0 {
 		// A bare ACK, or an unsubscribe-only request. Nothing to send.
 		return nil
@@ -301,6 +326,7 @@ func (d *deltaStream) rotateAll(ctx context.Context) error {
 		return nil
 	}
 
+	start := time.Now()
 	var resources []*discovery.Resource
 	var removed []string
 	for _, name := range names {
@@ -317,9 +343,11 @@ func (d *deltaStream) rotateAll(ctx context.Context) error {
 		resources = append(resources, res)
 	}
 
+	d.srv.metrics.recordRotation(time.Since(start), len(resources))
 	d.srv.log.InfoContext(ctx, "rotating on-demand secrets",
 		slog.Int("pushed", len(resources)),
 		slog.Int("withdrawn", len(removed)),
+		slog.Duration("took", time.Since(start)),
 	)
 	return d.send(ctx, resources, removed)
 }
@@ -338,24 +366,40 @@ func (d *deltaStream) pack(name string, cert *MintedCert) (*discovery.Resource, 
 	version := cert.Serial
 
 	d.mu.Lock()
+	_, known := d.versions[name]
 	d.versions[name] = version
 	d.mu.Unlock()
+	if !known {
+		d.srv.metrics.addLiveNames(1)
+	}
 
 	return &discovery.Resource{Name: name, Version: version, Resource: body}, nil
 }
 
 func (d *deltaStream) send(ctx context.Context, resources []*discovery.Resource, removed []string) error {
+	withdrawn := 0
 	d.mu.Lock()
 	for _, name := range removed {
-		delete(d.versions, name)
+		if _, known := d.versions[name]; known {
+			delete(d.versions, name)
+			withdrawn++
+		}
 	}
 	d.mu.Unlock()
+	d.srv.metrics.addLiveNames(-withdrawn)
 
 	resp := &discovery.DeltaDiscoveryResponse{
 		TypeUrl:          SecretTypeURL,
 		Resources:        resources,
 		RemovedResources: removed,
 		Nonce:            d.srv.nextNonce(),
+	}
+	// Sized here rather than after Send because the send goroutine has no
+	// error path back to the caller. proto.Size walks the message, so it is
+	// only paid when counters are on -- but it is the only way to see a
+	// rotation response cross Envoy's 4MB gRPC receive limit before it fails.
+	if d.srv.metrics.enabled() {
+		d.srv.metrics.recordResponse(proto.Size(resp), len(resources), len(removed))
 	}
 	select {
 	case d.sendCh <- resp:

@@ -29,18 +29,16 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-readonly ENVOY_VERSION="1.37.5"
-readonly ENVOY_URL="https://github.com/envoyproxy/envoy/releases/download/v${ENVOY_VERSION}/envoy-${ENVOY_VERSION}-linux-x86_64"
-
-readonly LISTEN_PORT=18443
-readonly ADMIN_PORT=19000
-
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly POC_DIR="$(dirname "${SCRIPT_DIR}")"
 readonly REPO_ROOT="$(cd "${POC_DIR}/../.." && pwd)"
 # __run is matched by the "__*" rule in .gitignore, so everything the harness
 # generates stays out of version control.
 readonly RUN_DIR="${POC_DIR}/__run"
+
+# Ports, output helpers, process lifecycle, the Envoy download and version
+# gate, and stat_value.
+source "${SCRIPT_DIR}/lib.sh"
 
 FORWARD_PROXY=false
 KEEP=false
@@ -53,18 +51,6 @@ for arg in "$@"; do
   esac
 done
 
-PASS=0
-FAIL=0
-SDS_PID=""
-ENVOY_PID=""
-
-bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
-info()  { printf '\033[1;36m[step]\033[0m %s\n' "$*"; }
-note()  { printf '       %s\n' "$*"; }
-ok()    { PASS=$((PASS + 1)); printf '\033[1;32m  PASS\033[0m %s\n' "$*"; }
-bad()   { FAIL=$((FAIL + 1)); printf '\033[1;31m  FAIL\033[0m %s\n' "$*"; }
-finding() { printf '\033[1;35m  ????\033[0m %s\n' "$*"; }
-
 cleanup() {
   if [[ "${KEEP}" == true ]]; then
     bold "--keep set; leaving sdsmintd (pid ${SDS_PID:-none}) and envoy (pid ${ENVOY_PID:-none}) running."
@@ -75,42 +61,6 @@ cleanup() {
   stop_sds
 }
 trap cleanup EXIT
-
-# stop_pid terminates a child and refuses to block on it. A bare `wait` has no
-# timeout, so a child that mishandles SIGTERM wedges the whole harness; poll
-# instead and escalate to SIGKILL.
-stop_pid() {
-  local pid="$1" label="$2" i
-  [[ -n "${pid}" ]] || return 0
-  kill -0 "${pid}" 2>/dev/null || return 0
-  kill "${pid}" 2>/dev/null || true
-  for i in $(seq 1 50); do
-    kill -0 "${pid}" 2>/dev/null || { wait "${pid}" 2>/dev/null || true; return 0; }
-    sleep 0.1
-  done
-  echo "  WARN ${label} (pid ${pid}) ignored SIGTERM for 5s; sending SIGKILL" >&2
-  kill -9 "${pid}" 2>/dev/null || true
-  wait "${pid}" 2>/dev/null || true
-}
-
-stop_envoy() {
-  stop_pid "${ENVOY_PID}" envoy
-  ENVOY_PID=""
-}
-
-stop_sds() {
-  stop_pid "${SDS_PID}" sdsmintd
-  SDS_PID=""
-}
-
-# stat_value NAME prints the current value of an Envoy stat, or 0 if absent.
-stat_value() {
-  local raw
-  raw="$(curl -s --max-time 5 "127.0.0.1:${ADMIN_PORT}/stats" 2>/dev/null || true)"
-  local v
-  v="$(printf '%s\n' "${raw}" | awk -F': ' -v n="$1" '$1 == n {print $2}' | tail -1)"
-  if [[ "${v}" =~ ^[0-9]+$ ]]; then printf '%s\n' "${v}"; else printf '0\n'; fi
-}
 
 # leaf_field SNI OPENSSL_ARGS... prints one field of the certificate Envoy
 # serves for the given SNI, or nothing if the handshake fails. s_client exits
@@ -135,18 +85,6 @@ fetch() {
     "https://${sni}/" -o /dev/null -w '%{http_code}' 2>/dev/null || echo "000"
 }
 
-wait_for_admin() {
-  for _ in $(seq 1 60); do
-    if curl -s --max-time 1 "127.0.0.1:${ADMIN_PORT}/ready" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 0.25
-  done
-  echo "envoy admin never came up; see ${RUN_DIR}/envoy.log" >&2
-  tail -20 "${RUN_DIR}/envoy.log" >&2 || true
-  return 1
-}
-
 start_sds() {
   local ttl="$1"; shift
   "${RUN_DIR}/sdsmintd" \
@@ -169,14 +107,6 @@ start_sds() {
   return 1
 }
 
-start_envoy() {
-  local config="$1" concurrency="${2:-2}"
-  ( cd "${RUN_DIR}" && ./envoy -c "${config}" --concurrency "${concurrency}" \
-      --log-level warn >"${RUN_DIR}/envoy.log" 2>&1 ) &
-  ENVOY_PID=$!
-  wait_for_admin
-}
-
 ################################################################################
 bold "=== mint.md PoC: on-demand per-SNI certificate minting ==="
 mkdir -p "${RUN_DIR}"
@@ -185,19 +115,7 @@ info "Building sdsmintd"
 ( cd "${REPO_ROOT}" && go build -o "${RUN_DIR}/sdsmintd" ./poc/sdsmint/cmd/sdsmintd )
 
 info "Ensuring Envoy ${ENVOY_VERSION}"
-if [[ ! -x "${RUN_DIR}/envoy" ]]; then
-  note "downloading ${ENVOY_URL}"
-  curl -sSL --max-time 900 -o "${RUN_DIR}/envoy" "${ENVOY_URL}"
-  chmod +x "${RUN_DIR}/envoy"
-fi
-envoy_version="$("${RUN_DIR}/envoy" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-note "envoy ${envoy_version}"
-# The two extensions this design depends on first shipped in 1.37. On an older
-# build the config is rejected outright, so fail with a useful message instead.
-if ! printf '%s\n%s\n' "1.37.0" "${envoy_version}" | sort -V -C; then
-  echo "envoy ${envoy_version} is too old; on_demand_secret and cert_mappers.sni need 1.37+" >&2
-  exit 1
-fi
+ensure_envoy
 
 cp "${POC_DIR}"/testdata/envoy-bootstrap*.yaml "${RUN_DIR}/"
 rm -f "${RUN_DIR}/ca.pem" "${RUN_DIR}/ca-key.pem"

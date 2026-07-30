@@ -58,8 +58,9 @@ type minter struct {
 	// ttl, so that a cache hit never hands back a nearly-dead certificate and
 	// so that the rotation ticker always finds a stale entry. See
 	// reuseFraction.
-	reuse time.Duration
-	log   *slog.Logger
+	reuse   time.Duration
+	log     *slog.Logger
+	metrics *Metrics
 
 	mu    sync.Mutex
 	cache *certCache
@@ -78,6 +79,9 @@ type MinterOptions struct {
 	Cap int
 	// Logger receives one structured line per issuance (the audit log).
 	Logger *slog.Logger
+	// Metrics, if non-nil, counts issuance, cache hits and signing latency.
+	// Optional: the audit log is the durable record, this is for measurement.
+	Metrics *Metrics
 }
 
 // NewMinter builds a caching, allowlist-enforcing Minter over ca.
@@ -103,6 +107,7 @@ func NewMinter(ca *CA, opts MinterOptions) (Minter, error) {
 		ttl:      opts.TTL,
 		reuse:    time.Duration(float64(opts.TTL) * reuseFraction),
 		log:      opts.Logger,
+		metrics:  opts.Metrics,
 		cache:    newCertCache(opts.Cap),
 	}, nil
 }
@@ -111,6 +116,7 @@ func (m *minter) GetCertificate(ctx context.Context, host string) (*MintedCert, 
 	if err := m.validate(host); err != nil {
 		// Denials are audited too — a burst of them is the signal that
 		// something is probing the CA.
+		m.metrics.recordDenial()
 		m.log.WarnContext(ctx, "certificate request denied",
 			slog.String("host", host),
 			slog.String("reason", err.Error()),
@@ -124,6 +130,7 @@ func (m *minter) GetCertificate(ctx context.Context, host string) (*MintedCert, 
 	cached, ok := m.cache.get(host, now)
 	m.mu.Unlock()
 	if ok {
+		m.metrics.recordCacheHit()
 		return cached, nil
 	}
 
@@ -135,16 +142,25 @@ func (m *minter) GetCertificate(ctx context.Context, host string) (*MintedCert, 
 	if err != nil {
 		return nil, err
 	}
+	signed := time.Now()
+	m.metrics.recordMint(signed.Sub(now))
 
 	m.mu.Lock()
 	m.cache.put(host, cert, now, now.Add(m.reuse))
 	m.mu.Unlock()
 
-	m.log.InfoContext(ctx, "certificate issued",
-		slog.String("host", host),
-		slog.String("serial", cert.Serial),
-		slog.Time("not_after", cert.NotAfter),
-	)
+	// Guarded rather than left to the handler's own level check: the audit
+	// line costs several allocations to assemble, and at a thousand mints a
+	// second that assembly is itself a measurable share of the cost. Running
+	// with --log-level warn has to be genuinely free, or the load phases are
+	// measuring the logger.
+	if m.log.Enabled(ctx, slog.LevelInfo) {
+		m.log.InfoContext(ctx, "certificate issued",
+			slog.String("host", host),
+			slog.String("serial", cert.Serial),
+			slog.Time("not_after", cert.NotAfter),
+		)
+	}
 	return cert, nil
 }
 

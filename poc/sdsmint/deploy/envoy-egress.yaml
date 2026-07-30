@@ -276,12 +276,29 @@ static_resources:
         "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
         explicit_http_config:
           http2_protocol_options: {}
+    # max_requests IS THE LIMIT ON DISTINCT LIVE HOSTS. Measured, in
+    # hack/run-scale.sh phase 1: Envoy opens one DELTA_GRPC stream per
+    # on-demand secret name and keeps it open for as long as the secret is
+    # live. Streams are concurrent requests, so N live hostnames means N
+    # concurrent requests against this cluster -- not the handful the shape of
+    # this config suggests.
+    #
+    # Past the threshold the subscription overflows, no secret is ever
+    # delivered, and the handshake fails ~15s later with "initial fetch timed
+    # out for ...v3.Secret". Envoy's own default is 1024, and the harness hit
+    # that wall at exactly 1024 hosts. For an egress proxy fronting arbitrary
+    # destinations, 1024 distinct hosts is a Tuesday.
+    #
+    # Set this above the largest live host set the pod will ever see, and
+    # remember phase 1 also measured ~60KB of Envoy RSS per live secret: 50k
+    # hosts is roughly 3GB, so the memory limit binds before this number does.
+    # Size the two together.
     circuit_breakers:
       thresholds:
       - priority: DEFAULT
         max_connections: 16
-        max_pending_requests: 256
-        max_requests: 1024
+        max_pending_requests: 4096
+        max_requests: 65536
         max_retries: 3
     load_assignment:
       cluster_name: sds_mint

@@ -24,6 +24,7 @@ proves.
 go test ./poc/sdsmint/...          # unit tests, no Envoy needed
 ./poc/sdsmint/hack/run-poc.sh      # hermetic end-to-end: 14 assertions
 ./poc/sdsmint/hack/run-poc.sh --forward-proxy   # + real MITM of example.com: 16
+./poc/sdsmint/hack/run-scale.sh    # scalability phases 0-7 (see below)
 ```
 
 The harness downloads `envoy-1.37.5-linux-x86_64` into `poc/sdsmint/__run/`
@@ -191,10 +192,13 @@ So a key pool would buy at most 9%. Anyone optimising this should start by
 noting the cache hit is **1,900× cheaper than a miss** and go looking for misses
 instead.
 
-The 1.5 KB wire size is the number to multiply for rotation: a single rotation
+~~The 1.5 KB wire size is the number to multiply for rotation: a single rotation
 response carrying every live secret crosses Envoy's 4 MB default gRPC receive
-limit somewhere around **2,700 live names**. `rotateAll` batches unconditionally,
-so that is a real ceiling, not a soft one.
+limit somewhere around 2,700 live names.~~ **Wrong — measured and withdrawn.**
+That assumed one stream carrying many names. Envoy opens one stream *per
+secret*, so a response never carries more than one resource (largest observed:
+1,705 B) and the 4 MB ceiling is unreachable this way. The real ceiling is the
+stream count; see [How far it scales](#how-far-it-scales).
 
 ### The cache used to get slower as it got bigger
 
@@ -228,6 +232,87 @@ One deliberate limit: a put reclaims at most 64 dead entries. Draining a
 100k-entry cache that expired all at once costs 86 ms, which is not something
 to do with the lock held; the remainder comes back on subsequent puts, and
 making room never depends on it because eviction by recency is always O(1).
+
+## How far it scales
+
+The benchmarks above measure the signer. This section measures **Envoy**, which
+turns out to be where the limits are.
+
+```sh
+./poc/sdsmint/hack/run-scale.sh              # quick sweep, phases 0-7, ~12 min
+./poc/sdsmint/hack/run-scale.sh --full       # 50k names, 30 min idle watch
+./poc/sdsmint/hack/run-scale.sh --phases 1,6
+```
+
+Nine phases, each isolating one question. Phases 0–2 and 4–7 run
+`sdsmintd --null-minter`, which serves pre-signed wildcard leaves: a mint costs
+~375 µs and would swamp everything Envoy does, so the signer is removed from the
+measurement rather than measured through. Phase 3 is the exception — the signer
+is its subject. Phase 0 is a static-certificate control on an otherwise
+identical listener, so every number below is a *difference*, not an absolute.
+
+Numbers are the quick sweep on an Intel Core Ultra 7 165U, Envoy 1.37.5,
+`--concurrency 2`, 3,000 live names.
+
+### The two findings that change the design
+
+**1. Envoy opens one DELTA_GRPC stream per secret name, and holds it open.**
+3,120 live secrets produced 3,120 concurrent streams on the single SDS
+connection. This was not the assumed model — the server was written expecting
+one stream carrying many subscriptions — and most of the predictions in this
+repo followed from the wrong picture.
+
+The consequence is a hard, silent host limit. Streams are concurrent requests,
+so **the live host count is a concurrent-request count against the SDS
+cluster**, and Envoy's default circuit breaker is `max_requests: 1024`. Past it
+the subscription overflows, no secret is ever delivered, and the handshake fails
+~15 s later with `initial fetch timed out for ...v3.Secret`. The harness walked
+straight into this at exactly 1024 hosts, and — worse — the failure made the
+memory curve look *flatter*, i.e. it read as good news. `deploy/envoy-egress.yaml`
+pinned that same 1024 and has been corrected; `expect_all_served` now aborts any
+phase whose setup did not fully succeed.
+
+**2. ~60 KB of Envoy RSS per live secret, and none of it comes back.**
+Linear and stable across the ramp: 68.9 KB/secret at 200 live, 62.7 at 1,000,
+60.5 at 3,000. Over 120 s fully idle, RSS went 235 MB → 240 MB — *up* — with
+`cert_active` pinned at 3,000. Nothing is reclaimed, because nothing evicts: the
+per-stream version map only grows, and minter-side cache eviction does not
+propagate to the data plane.
+
+For an egress proxy fronting arbitrary destinations, memory is therefore a
+function of **every host ever contacted since the process started**, not of the
+working set. 10k hosts ≈ 600 MB; 50k ≈ 3 GB. That is a production blocker for
+long-lived pods, and the fix has to be server-side: withdraw idle names via
+`removed_resources` (the mechanism exists and is proven in `run-poc.sh`; nothing
+currently drives it).
+
+### The rest
+
+| Phase | Question | Answer |
+|---|---|---|
+| 2 | Does first contact slow down as the live set grows? | **No.** Cold-fetch p50 was 6,535 µs at 200 live and 6,629 µs at 3,000 — flat. Lookup is not the problem. |
+| 3 | Where does minting saturate? | Every offered rate to **500/s was fully served, zero failures**, at ~650 µs/sign. The tail is what moves: handshake p99 goes 8,967 µs → 28,860 µs (3.2×) from 50/s to 500/s while p50 barely changes. Capacity-plan against the p99 knee, not the throughput one. |
+| 4 | What does the selector cost on a cache hit? | **Nothing measurable.** p50 deltas vs the control were −2 µs at `--concurrency 1` and −130 µs at 4, i.e. below this harness's resolution. No sign of contention on the shared secret cache. |
+| 5 | What does a rotation tick cost? | At 500 live names, 999 pushes reached the data plane, per-stream cost ≤ 1 ms, largest response 1,705 B, no NACKs, and concurrent handshakes were undisturbed (p99 3,588 µs). But one stream per secret means a tick is **N independent sign-and-push operations** — at 50k live names, 50k signatures per tick. |
+| 7 | What does an SDS restart cost? | Warm names kept serving with SDS fully down (200/200, p99 3,569 µs) — no per-connection dependency. On restart Envoy replayed **2,997 names across 2,997 separate requests**, first at +306 ms, settled by +20 s. With a real signer that burst is N mints, not N cache hits. |
+
+### What this harness cannot tell you
+
+The load generator is the bottleneck, and it says so: **2,300 µs of client CPU
+per connection against a 2,266 µs handshake**. Every connection is a full
+handshake with resumption disabled on both sides, so the client pays a P-256
+verify each time. Two consequences, both of which the harness prints rather than
+hides:
+
+- Differences under ~1 ms between phases are client scheduling, not Envoy. This
+  is why phase 4 reports "below resolution" instead of quoting a negative
+  overhead as though it were a measurement.
+- Phase 3's "no knee up to 500/s" is a floor on Envoy's capacity, not a ceiling.
+  Finding the real one needs the client on a separate machine.
+
+Phase 8 (`dynamic_forward_proxy` with a real origin) is opt-in and excluded from
+the default set: real DNS and a real upstream add variance that would pollute
+every comparison above.
 
 ## Deploying this for real
 
@@ -277,7 +362,14 @@ poc/sdsmint/
                    plus expiry heap, so nothing is O(cache size) under the lock
   server.go        delta SDS: per-stream subscriptions, initial_resource_versions,
                    removed_resources for refusals, optional rotation timer
+  nullminter.go    MEASUREMENT ONLY: pre-signed shared leaves, so the scale
+                   phases measure Envoy instead of a P-256 signing loop
+  metrics.go       nil-safe atomic counters behind --metrics-addr, alongside
+                   net/http/pprof
   cmd/sdsmintd/    the daemon; UDS by default, chmod 0600
+  cmd/sdsload/     open-loop TLS load generator: one SNI per connection,
+                   handshake timed apart from request, arrivals on a fixed
+                   timeline so saturation cannot hide as coordinated omission
   rotation_test.go the rotation-vs-cache clock invariant
   cache_test.go    structural invariants of the three structures agreeing
   bench_test.go    cost decomposition and cache-cap scaling
@@ -285,7 +377,11 @@ poc/sdsmint/
   testdata/        envoy-bootstrap.yaml      PoC; NO connect timeout, by design
                    -fwdproxy.yaml            PoC; real egress re-origination
                    -good.yaml                PoC; hermetic, + the connect timeout
+                   -scale.yaml               measurement; raised circuit breakers
+                   -static.yaml              the phase 0 control
+  hack/lib.sh      shared process lifecycle and admin-stat plumbing
   hack/run-poc.sh  the end-to-end harness
+  hack/run-scale.sh  the nine scale phases
 ```
 
 Zero new Go dependencies — everything needed is already vendored, so `vendor/`
@@ -309,12 +405,20 @@ version gate above is a finding to report, not a change made here.
 - `sdsmintd`'s cache is per-process; a replicated deployment mints once per
   replica. Fine for the PoC, worth deciding on before it ships.
 - The rotation timer pushes to every live subscription on one shared ticker
-  rather than per-name deadlines, and `rotateAll` puts them all in one response.
-  Measured at 1.5 KB per secret, that response passes Envoy's 4 MB default gRPC
-  receive limit at roughly 2,700 live names.
-- The stream's `versions` map never shrinks. Minter cache eviction does not
-  propagate to it, so Envoy's live secret set only grows; names leave only when
-  the allowlist refuses them. That interacts badly with the batching above.
+  rather than per-name deadlines. Response size turned out not to be the
+  problem — Envoy's one-stream-per-secret model means one resource per message —
+  but the tick is N independent signatures, so at 50k live names it is 50k mints
+  in a burst on a shared ticker. Per-name deadlines would spread it.
+- **The stream's `versions` map never shrinks, and this is the blocker.** Minter
+  cache eviction does not propagate to the data plane, so Envoy's live secret set
+  only grows; names leave only when the allowlist refuses them. Measured at
+  ~60 KB of Envoy RSS per live secret with nothing reclaimed while idle, that
+  makes memory a function of every host ever contacted. Withdrawing idle names
+  via `removed_resources` is the fix; the mechanism is proven, nothing drives it.
+- An SDS restart reconnects every stream at once — 2,997 replays in one burst at
+  3,000 live names. With the real minter that is a mint storm at exactly the
+  moment the server is coldest. The cache survives a restart only if it is
+  warmed or persisted; today it is neither.
 - `GracefulStop` cannot be used unconditionally: an xDS stream never ends on its
   own, so the daemon falls back to a hard stop after a 2s grace period. Worth
   remembering for any other long-lived-stream service in the repo.
