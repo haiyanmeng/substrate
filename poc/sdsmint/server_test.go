@@ -254,10 +254,10 @@ func TestDeltaSecretsRotationPushesNewVersion(t *testing.T) {
 	first := stream.nextResponse(t)
 	firstVersion := first.GetResources()[0].GetVersion()
 
-	// The rotation ticker fires at 2/3 TTL = 200ms, but the minter's cache
-	// only expires at the full 300ms, so the first tick is a cache hit and
-	// re-sends the same version. Keep reading until the version actually
-	// changes.
+	// The rotation interval is floored at 1s, so with a 300ms TTL the first
+	// tick lands well after the cache stops reusing the leaf and re-mints.
+	// This test only cares that the version moves; the timing relationship
+	// itself is TestRotationNeverServesAnExpiredLeaf's job.
 	deadline := time.After(5 * time.Second)
 	for {
 		select {

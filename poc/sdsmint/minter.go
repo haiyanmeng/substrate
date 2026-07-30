@@ -38,16 +38,31 @@ type Minter interface {
 	GetCertificate(ctx context.Context, host string) (*MintedCert, error)
 }
 
+// reuseFraction is how much of a leaf's lifetime the cache will hand it out
+// for. A cached leaf handed out at the very end of its life is worse than a
+// cache miss: the caller gets a certificate that is about to stop verifying.
+//
+// It must stay strictly below server.go's rotateFraction. The rotation ticker
+// refreshes by calling GetCertificate, so if the cache were still willing to
+// serve the old leaf at rotation time the tick would be a no-op and the leaf
+// would not actually be replaced until it had already expired. Half against
+// two thirds leaves a comfortable margin; equality would be a race.
+// TestRotationNeverServesAnExpiredLeaf is what fails if this inverts.
+const reuseFraction = 1.0 / 2.0
+
 type cacheEntry struct {
-	cert     *MintedCert
-	expires  time.Time
-	lastUsed time.Time
+	cert *MintedCert
+	// reuseUntil is when the cache stops handing this entry out. It is
+	// deliberately earlier than cert.NotAfter — see reuseFraction.
+	reuseUntil time.Time
+	lastUsed   time.Time
 }
 
 type minter struct {
 	ca       *CA
 	validate func(host string) error // allowlist — LIMITS CA ABUSE
 	ttl      time.Duration
+	reuse    time.Duration
 	cap      int
 	log      *slog.Logger
 
@@ -91,6 +106,7 @@ func NewMinter(ca *CA, opts MinterOptions) (Minter, error) {
 		ca:       ca,
 		validate: opts.Validate,
 		ttl:      opts.TTL,
+		reuse:    time.Duration(float64(opts.TTL) * reuseFraction),
 		cap:      opts.Cap,
 		log:      opts.Logger,
 		cache:    make(map[string]*cacheEntry),
@@ -111,7 +127,7 @@ func (m *minter) GetCertificate(ctx context.Context, host string) (*MintedCert, 
 	now := time.Now()
 
 	m.mu.Lock()
-	if e, ok := m.cache[host]; ok && now.Before(e.expires) {
+	if e, ok := m.cache[host]; ok && now.Before(e.reuseUntil) {
 		e.lastUsed = now
 		cert := e.cert
 		m.mu.Unlock()
@@ -130,7 +146,7 @@ func (m *minter) GetCertificate(ctx context.Context, host string) (*MintedCert, 
 
 	m.mu.Lock()
 	m.evictLocked(now)
-	m.cache[host] = &cacheEntry{cert: cert, expires: now.Add(m.ttl), lastUsed: now}
+	m.cache[host] = &cacheEntry{cert: cert, reuseUntil: now.Add(m.reuse), lastUsed: now}
 	m.mu.Unlock()
 
 	m.log.InfoContext(ctx, "certificate issued",
@@ -141,11 +157,12 @@ func (m *minter) GetCertificate(ctx context.Context, host string) (*MintedCert, 
 	return cert, nil
 }
 
-// evictLocked drops expired entries, then the least-recently-used ones until
-// the cache is back under cap. Callers must hold m.mu.
+// evictLocked drops entries past their reuse window, then the
+// least-recently-used ones until the cache is back under cap. Callers must
+// hold m.mu.
 func (m *minter) evictLocked(now time.Time) {
 	for host, e := range m.cache {
-		if !now.Before(e.expires) {
+		if !now.Before(e.reuseUntil) {
 			delete(m.cache, host)
 		}
 	}
@@ -174,13 +191,19 @@ func (m *minter) evictLocked(now time.Time) {
 // a single star would span dots, and an operator writing "*.example.com" would
 // silently authorise the CA for every depth of subdomain.
 func AllowGlobs(patterns []string) func(string) error {
+	// Split once, at construction. This runs on every request ahead of the
+	// cache lookup, and splitting every pattern per call made the allowlist
+	// cost an order of magnitude more than the cache hit it guards.
+	split := make([][]string, len(patterns))
+	for i, p := range patterns {
+		split[i] = strings.Split(p, ".")
+	}
 	return func(host string) error {
 		if err := checkHostSyntax(host); err != nil {
 			return err
 		}
-		hostLabels := strings.Split(host, ".")
-		for _, p := range patterns {
-			if matchLabels(strings.Split(p, "."), hostLabels) {
+		for _, p := range split {
+			if matchLabels(p, host) {
 				return nil
 			}
 		}
@@ -188,24 +211,36 @@ func AllowGlobs(patterns []string) func(string) error {
 	}
 }
 
-// matchLabels compares a dot-split pattern against a dot-split hostname, where
-// a "*" pattern label matches any single non-empty host label.
-func matchLabels(pattern, host []string) bool {
-	if len(pattern) != len(host) {
-		return false
-	}
+// matchLabels compares a dot-split pattern against a hostname, where a "*"
+// pattern label matches any single non-empty host label.
+//
+// The host is walked label by label instead of being split, so a check
+// allocates nothing at all. That matters because this runs ahead of the cache
+// lookup on every request, hit or miss.
+func matchLabels(pattern []string, host string) bool {
 	for i, want := range pattern {
+		label := host
+		if j := strings.IndexByte(host, '.'); j >= 0 {
+			label, host = host[:j], host[j+1:]
+		} else if i != len(pattern)-1 {
+			// The host ran out of labels before the pattern did.
+			return false
+		} else {
+			host = ""
+		}
 		if want == "*" {
-			if host[i] == "" {
+			if label == "" {
 				return false
 			}
 			continue
 		}
-		if !strings.EqualFold(want, host[i]) {
+		if !strings.EqualFold(want, label) {
 			return false
 		}
 	}
-	return true
+	// Anything left means the host had more labels than the pattern, which
+	// must not match: "*.example.com" is one subdomain level, not any.
+	return host == ""
 }
 
 // checkHostSyntax rejects names that should never reach the signer, regardless

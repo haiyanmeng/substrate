@@ -48,6 +48,10 @@ const SecretTypeURL = "type.googleapis.com/envoy.extensions.transport_sockets.tl
 // push a replacement. Envoy has no TTL of its own for an on-demand secret, so
 // if we do not push, the leaf simply expires under a live subscription and
 // handshakes start failing. See README "Open question 1".
+//
+// Rotation refreshes through Minter.GetCertificate, so this only replaces
+// anything if the minter's cache has already stopped reusing the old leaf by
+// now: reuseFraction < rotateFraction < 1 is the invariant.
 const rotateFraction = 2.0 / 3.0
 
 // Server implements Envoy's Secret Discovery Service, minting a certificate

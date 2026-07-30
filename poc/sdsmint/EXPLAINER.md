@@ -148,8 +148,8 @@ forgetting a field. `sdsmintd` likewise refuses to start without at least one
 **`*` matches exactly one DNS label.** The first implementation used
 `path.Match`, where `*` spans dots — so `*.example.com` would have matched
 `a.b.evil.example.com`. An operator writing `*.example.com` does not expect to
-authorise unbounded subdomain depth, so `matchLabels` splits on dots and compares
-label-wise. `checkHostSyntax` separately rejects names that should never reach
+authorise unbounded subdomain depth, so `matchLabels` compares label-wise and
+requires the label counts to line up. `checkHostSyntax` separately rejects names that should never reach
 the signer at all: empty, >253 bytes, containing `*` or path separators or
 whitespace, leading/trailing dots, or empty labels.
 

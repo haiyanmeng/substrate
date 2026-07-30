@@ -47,7 +47,7 @@ Last full run: **16 passed, 0 failed** (Envoy 1.37.5, Linux x86-64).
 ### 1. How does an on-demand secret expire or rotate?
 
 **Rotation is push-driven. Envoy has no TTL of its own for an on-demand
-secret.** Measured: with `--rotate` and a 6s TTL, `cert_updated` went `2 -> 4`
+secret.** Measured: with `--rotate` and a 6s TTL, `cert_updated` went `2 -> 8`
 and the served serial changed under a held subscription. The leaf's own
 `notAfter` does not cause Envoy to re-fetch — nothing expires client-side.
 
@@ -59,6 +59,35 @@ Consequences for the design:
   the data plane's subscription for it.
 - This is why the doc's `DELTA_GRPC` choice is load-bearing rather than a
   stylistic preference — SotW has no way to withdraw a single name.
+- **Because Envoy never expires a secret itself, the rotation clock and the
+  minter's cache clock have to be designed together.** They were not, and the
+  result was a real bug — see below.
+
+#### The bug this turned up: rotation through a cache that had not expired
+
+Rotation refreshes by calling `Minter.GetCertificate`. The cache used to hand a
+leaf back for its full TTL, so the tick at ⅔T was a **cache hit**: it re-pushed
+the identical serial and changed nothing. The cache only let go at T, so the
+real re-mint happened at the *next* tick, 4/3·T — by which point the leaf Envoy
+was serving had been expired for T/3. At the 5m default that is **100 seconds
+per cycle of serving an expired certificate**, on every live subscription.
+
+Measured before the fix, at a 6s TTL: push at t+0 (valid to t+5.4s), push at
+t+4s carrying *the same serial*, replacement not until t+8s — **2.62s of
+expired leaf**. `TestDeltaSecretsRotationPushesNewVersion` did not catch it
+because it only asserted the serial eventually changes, which the late re-mint
+still satisfies.
+
+The fix is an ordering invariant, `reuseFraction < rotateFraction < 1`: the
+cache stops reusing a leaf at half its life, so the tick at ⅔ life always finds
+a stale entry and really re-mints. `TestRotationNeverServesAnExpiredLeaf` walks
+two full cycles and asserts no leaf is ever left in place past its `notAfter`;
+`TestRotationOutlivesCacheReuse` guards the constants cheaply.
+
+Worth knowing if you tune `--ttl` very low: **x509 encodes `notAfter` with
+one-second granularity**, so a leaf's real expiry is up to a second earlier than
+`--ttl` asked for. Irrelevant at 5m, but it eats a meaningful slice of the
+rotation margin below ~10s.
 
 ### 2. Is the secret cache per-worker or shared?
 
@@ -131,6 +160,67 @@ Two distinct behaviours, and the second one is the finding that matters:
   entirely**. Note `/config_dump` renders the bootstrap as parsed from disk, not
   the effective node, so it cannot be used to check which one took effect.
 
+## What it costs
+
+`go test ./poc/sdsmint/ -run XXX -bench . -benchmem` — numbers below are the
+mean of three rounds on an Intel Core Ultra 7 165U (14 threads), Linux x86-64.
+They are here to size a deployment, not to be a leaderboard; re-measure on the
+target hardware before believing any absolute figure.
+
+### Where a mint goes
+
+| | ns/op | allocs |
+|---|---:|---:|
+| `CA.Sign` (the whole thing) | 374,608 | 403 |
+| ├ fresh P-256 keypair | 32,263 | 16 |
+| ├ `x509.CreateCertificate` | 286,907 | 276 |
+| └ PKCS#8 + PEM encoding | 21,300 | 77 |
+| cache hit | 196 | 0 |
+| allowlist check, 32 patterns | ~940 | 0 |
+| pack a Secret into a delta `Resource` | 3,003 | 10 (**1.5 KB on the wire**) |
+
+**~2,700 mints/second/core, and the fresh keypair is not why.** Keygen is 9% of
+a mint. `x509.CreateCertificate` is 77%, and a CPU profile says **more than half
+of that is Go verifying the signature it just produced** — `signTBS` calls
+`checkSignature` unconditionally, so every mint pays one ECDSA sign *plus* one
+ECDSA verify, and the verify is the more expensive of the two. That is inside
+`crypto/x509` and not something this code can opt out of; the lever, if one is
+ever needed, is to not call `CreateCertificate` per leaf.
+
+So a key pool would buy at most 9%. Anyone optimising this should start by
+noting the cache hit is **1,900× cheaper than a miss** and go looking for misses
+instead.
+
+The 1.5 KB wire size is the number to multiply for rotation: a single rotation
+response carrying every live secret crosses Envoy's 4 MB default gRPC receive
+limit somewhere around **2,700 live names**. `rotateAll` batches unconditionally,
+so that is a real ceiling, not a soft one.
+
+### The cache gets slower as it gets bigger
+
+| `--cache-cap` | miss, serial | miss, 14 goroutines | eviction alone |
+|---|---:|---:|---:|
+| 256 | 441 µs | 129 µs | 12 µs |
+| 1,000 | 448 µs | — | 47 µs |
+| 10,000 | 960 µs | 808 µs | 533 µs |
+| 100,000 | 13.3 ms | — | 12.1 ms |
+
+**Raising `--cache-cap` makes the server slower.** `evictLocked` runs two full
+map scans per miss — one for expired entries, one to find the LRU victim — and
+both hold the exclusive lock. At cap 100k a single miss costs 30× what it costs
+at cap 256, and 91% of that is the scan rather than the signing.
+
+The parallel column is the sharper version of the same point. Signing happens
+*outside* the lock, so concurrent misses should scale; at cap 256 they do
+(441 → 129 µs, ~3.4×). At cap 10,000 they do not (960 → 808 µs, 1.2× on 14
+threads) because every miss now sits in the eviction scan holding `m.mu`. The
+lock, not the CA, is the throughput ceiling once the cache is large.
+
+Nothing here is fixed yet — it is a measurement, and the shape of the fix is
+obvious enough (an intrusive LRU list plus an expiry heap turns both scans into
+O(1)) that it is not worth guessing at before there is a target cache size.
+**Until then, treat `--cache-cap` as a knob with a real cost and leave it low.**
+
 ## Deploying this for real
 
 **[`deploy/envoy-egress.yaml`](deploy/envoy-egress.yaml)** is the deployable
@@ -178,6 +268,8 @@ poc/sdsmint/
   server.go        delta SDS: per-stream subscriptions, initial_resource_versions,
                    removed_resources for refusals, optional rotation timer
   cmd/sdsmintd/    the daemon; UDS by default, chmod 0600
+  rotation_test.go the rotation-vs-cache clock invariant
+  bench_test.go    cost decomposition and cache-cap scaling
   deploy/          envoy-egress.yaml         PRODUCTION. the one to deploy.
   testdata/        envoy-bootstrap.yaml      PoC; NO connect timeout, by design
                    -fwdproxy.yaml            PoC; real egress re-origination
@@ -206,7 +298,14 @@ version gate above is a finding to report, not a change made here.
 - `sdsmintd`'s cache is per-process; a replicated deployment mints once per
   replica. Fine for the PoC, worth deciding on before it ships.
 - The rotation timer pushes to every live subscription on one shared ticker
-  rather than per-name deadlines.
+  rather than per-name deadlines, and `rotateAll` puts them all in one response.
+  Measured at 1.5 KB per secret, that response passes Envoy's 4 MB default gRPC
+  receive limit at roughly 2,700 live names.
+- `evictLocked` is O(cache size) per miss, under the lock — see "What it costs".
+  It is why `--cache-cap` should stay small for now.
+- The stream's `versions` map never shrinks. Minter cache eviction does not
+  propagate to it, so Envoy's live secret set only grows; names leave only when
+  the allowlist refuses them. That interacts badly with the batching above.
 - `GracefulStop` cannot be used unconditionally: an xDS stream never ends on its
   own, so the daemon falls back to a hard stop after a 2s grace period. Worth
   remembering for any other long-lived-stream service in the repo.
