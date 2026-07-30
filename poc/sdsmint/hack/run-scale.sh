@@ -24,7 +24,7 @@
 #   3  saturation       ramp new-SNI arrival rate against the real signer
 #   4  warm path        per-connection cost of the selector on a cache hit
 #   5  rotation storm   cost of a rotation tick at N live names
-#   6  idle reclamation does memory ever come back?
+#   6  idle reclamation does memory come back, with and without --idle?
 #   7  reconnect        cost of Envoy replaying its live set after SDS restarts
 #   8  realism          one run through dynamic_forward_proxy (needs internet)
 #
@@ -73,12 +73,14 @@ if [[ "${FULL}" == true ]]; then
   RATES=(10 50 100 250 500 1000)
   ROTATE_NS=(1000 5000)
   IDLE_SECONDS=1800
+  IDLE_TIMEOUT=300s
   STEADY_COUNT=20000
 else
   N_STEPS=(200 1000 3000)
   RATES=(50 200 500)
   ROTATE_NS=(500)
   IDLE_SECONDS=120
+  IDLE_TIMEOUT=30s
   STEADY_COUNT=3000
 fi
 
@@ -581,42 +583,139 @@ fi
 if wants 6; then
   bold ""
   bold "--- Phase 6: idle reclamation ---"
-  note "The stream's version map never shrinks and minter eviction does not"
-  note "propagate, so the prediction is that nothing is ever released. If that"
-  note "holds it is a production blocker, not a tuning note."
+  note "Two arms over the same fill, differing only in --idle. The control is"
+  note "what this phase measured before withdrawal existed: Envoy has no expiry"
+  note "of its own for an on-demand secret and never says it is finished with a"
+  note "name, so a host contacted once is held for the life of the stream."
+  note "The second arm has the server withdraw names the proxy has stopped"
+  note "asking about. Whether Envoy actually gives the memory back is the"
+  note "measurement -- the docs say a removal cancels the subscription, which"
+  note "is not the same claim."
 
+  # idle_watch LABEL SECONDS samples the memory and live-set curve, leaving the
+  # last reading in IDLE_END_*. Both arms use it so the two curves are directly
+  # comparable rather than being two differently-shaped observations.
+  IDLE_END_RSS=0
+  IDLE_END_ALLOC=0
+  IDLE_END_ACTIVE=0
+  idle_watch() {
+    local label="$1" seconds="$2"
+    local interval=30
+    [[ "${seconds}" -lt 120 ]] && interval=15
+    local elapsed=0 rss alloc
+    while [[ "${elapsed}" -lt "${seconds}" ]]; do
+      sleep "${interval}"
+      elapsed=$((elapsed + interval))
+      read -r rss alloc <<<"$(envoy_mem)"
+      record "phase6 ${label} t+${elapsed}s rss=${rss}KB allocated=${alloc}B cert_active=$(stat_value listener.mitm.on_demand_secret.cert_active) sds_names_live=$(sds_metric names_live) withdrawn=$(sds_metric idle_withdrawals)"
+    done
+    read -r IDLE_END_RSS IDLE_END_ALLOC <<<"$(envoy_mem)"
+    IDLE_END_ACTIVE="$(stat_value listener.mitm.on_demand_secret.cert_active)"
+  }
+
+  n="${N_STEPS[-1]}"
+
+  # --- Arm A: no withdrawal (the behaviour before --idle existed) ----------
   stop_envoy
   stop_sds
   start_sds_null
   start_envoy envoy-scale.yaml 2
 
-  n="${N_STEPS[-1]}"
-  load "idle-fill" "${n}" 500
-  expect_all_served "phase6 fill to ${n}"
+  load "idle-hold-fill" "${n}" 500
+  expect_all_served "phase6 arm A fill to ${n}"
   sleep 2
-  peak_rss="$(rss_kb "${ENVOY_PID}")"
-  peak_alloc="$(stat_value server.memory_allocated)"
-  peak_active="$(stat_value listener.mitm.on_demand_secret.cert_active)"
-  record "phase6 peak live=${peak_active} rss=${peak_rss}KB allocated=${peak_alloc}B"
+  hold_peak_rss="$(rss_kb "${ENVOY_PID}")"
+  hold_peak_active="$(stat_value listener.mitm.on_demand_secret.cert_active)"
+  record "phase6 hold peak live=${hold_peak_active} rss=${hold_peak_rss}KB allocated=$(stat_value server.memory_allocated)B"
 
-  interval=30
-  [[ "${IDLE_SECONDS}" -lt 120 ]] && interval=15
-  elapsed=0
-  while [[ "${elapsed}" -lt "${IDLE_SECONDS}" ]]; do
-    sleep "${interval}"
-    elapsed=$((elapsed + interval))
-    read -r rss alloc <<<"$(envoy_mem)"
-    record "phase6 t+${elapsed}s rss=${rss}KB allocated=${alloc}B cert_active=$(stat_value listener.mitm.on_demand_secret.cert_active)"
-  done
+  idle_watch hold "${IDLE_SECONDS}"
+  hold_end_rss="${IDLE_END_RSS}"
+  hold_end_active="${IDLE_END_ACTIVE}"
+  record "phase6 hold end live=${hold_end_active} rss=${hold_end_rss}KB allocated=${IDLE_END_ALLOC}B"
 
-  read -r end_rss end_alloc <<<"$(envoy_mem)"
-  end_active="$(stat_value listener.mitm.on_demand_secret.cert_active)"
+  # --- Arm B: withdraw idle names ------------------------------------------
+  stop_envoy
+  stop_sds
+  start_sds_null --idle "${IDLE_TIMEOUT}"
+  start_envoy envoy-scale.yaml 2
+
+  fill_at="${SNI_CURSOR}"
+  load "idle-drop-fill" "${n}" 500
+  expect_all_served "phase6 arm B fill to ${n}"
+  sleep 2
+  drop_peak_rss="$(rss_kb "${ENVOY_PID}")"
+  drop_peak_alloc="$(stat_value server.memory_allocated)"
+  drop_peak_active="$(stat_value listener.mitm.on_demand_secret.cert_active)"
+  record "phase6 drop peak live=${drop_peak_active} rss=${drop_peak_rss}KB allocated=${drop_peak_alloc}B idle_timeout=${IDLE_TIMEOUT}"
+
+  idle_watch drop "${IDLE_SECONDS}"
+  drop_end_rss="${IDLE_END_RSS}"
+  drop_end_alloc="${IDLE_END_ALLOC}"
+  drop_end_active="${IDLE_END_ACTIVE}"
+  withdrawn="$(sds_metric idle_withdrawals)"
+  sweeps="$(sds_metric idle_sweeps)"
+  record "phase6 drop end live=${drop_end_active} rss=${drop_end_rss}KB allocated=${drop_end_alloc}B withdrawn=${withdrawn} over ${sweeps} sweeps"
+
+  # One sweep per name withdrawn is the one-stream-per-secret finding showing
+  # up from the other side: the sweep is per-stream, so a stream holding a
+  # single name can only ever withdraw that one.
+  if [[ "${withdrawn}" -gt 0 && "${sweeps}" -ge "${withdrawn}" ]]; then
+    finding "${withdrawn} names came back over ${sweeps} sweeps -- one per sweep, because each stream holds exactly one name"
+  fi
+
+  # --- Did the data plane act on the withdrawals? --------------------------
+  # cert_active is Envoy's own count, so it answers the protocol question
+  # independently of the allocator. RSS answers the one that matters for
+  # capacity planning, and the two can disagree: tcmalloc is under no
+  # obligation to hand pages back just because Envoy freed the objects.
+  if [[ "${drop_peak_active}" -gt 0 && "${drop_end_active}" -le $((drop_peak_active / 10)) ]]; then
+    ok "withdrawal reached the data plane: cert_active ${drop_peak_active} -> ${drop_end_active}"
+  elif [[ "${drop_end_active}" -lt "${drop_peak_active}" ]]; then
+    finding "withdrawal only partly reached the data plane: cert_active ${drop_peak_active} -> ${drop_end_active} after ${withdrawn} withdrawals"
+  else
+    bad "the server withdrew ${withdrawn} names and Envoy's cert_active did not move (${drop_peak_active} -> ${drop_end_active})"
+  fi
+
   # 5% is well inside the noise of an allocator that does not promptly return
   # pages; anything smaller would report reclamation that did not happen.
-  if [[ "${end_rss}" -lt $((peak_rss * 95 / 100)) ]]; then
-    finding "ANSWER: memory IS reclaimed while idle (${peak_rss}KB -> ${end_rss}KB over ${IDLE_SECONDS}s)"
+  hold_floor=$((hold_peak_rss * 95 / 100))
+  drop_floor=$((drop_peak_rss * 95 / 100))
+  if [[ "${hold_end_rss}" -lt "${hold_floor}" ]]; then
+    finding "the control arm reclaimed memory on its own (${hold_peak_rss}KB -> ${hold_end_rss}KB); the comparison below is not attributable to withdrawal"
   else
-    finding "ANSWER: nothing is reclaimed. ${peak_rss}KB -> ${end_rss}KB over ${IDLE_SECONDS}s with cert_active ${peak_active} -> ${end_active}. A host contacted once is held for the life of the stream."
+    finding "ANSWER (control): nothing is reclaimed without withdrawal. ${hold_peak_rss}KB -> ${hold_end_rss}KB over ${IDLE_SECONDS}s, cert_active ${hold_peak_active} -> ${hold_end_active}."
+  fi
+  # How much Envoy considers freed, and what that works out to per secret --
+  # the number to compare against phase 1's bytes-per-secret on the way up.
+  alloc_freed=$((drop_peak_alloc - drop_end_alloc))
+  per_secret_freed=0
+  if [[ "${withdrawn}" -gt 0 && "${alloc_freed}" -gt 0 ]]; then
+    per_secret_freed=$((alloc_freed / withdrawn))
+  fi
+
+  if [[ "${drop_end_rss}" -lt "${drop_floor}" ]]; then
+    finding "ANSWER (--idle ${IDLE_TIMEOUT}): memory IS returned, all the way to the OS. RSS ${drop_peak_rss}KB -> ${drop_end_rss}KB, allocated ${drop_peak_alloc}B -> ${drop_end_alloc}B (${per_secret_freed}B per secret), cert_active ${drop_peak_active} -> ${drop_end_active}."
+  elif [[ "${alloc_freed}" -gt $((drop_peak_alloc / 2)) ]]; then
+    finding "ANSWER (--idle ${IDLE_TIMEOUT}): Envoy DOES release the memory -- allocated ${drop_peak_alloc}B -> ${drop_end_alloc}B, ${per_secret_freed}B per withdrawn secret, cert_active ${drop_peak_active} -> ${drop_end_active}."
+    finding "  => but RSS stayed at ${drop_end_rss}KB (peak ${drop_peak_rss}KB): tcmalloc kept the pages. The heap is reusable by the next ${withdrawn} hosts, so this bounds GROWTH, not the pod's memory limit. Size the limit for the peak live set regardless."
+  else
+    finding "ANSWER (--idle ${IDLE_TIMEOUT}): the subscriptions went away (cert_active ${drop_peak_active} -> ${drop_end_active}) but the memory did not -- allocated ${drop_peak_alloc}B -> ${drop_end_alloc}B, RSS ${drop_peak_rss}KB -> ${drop_end_rss}KB. Withdrawal is cancelling the subscription without freeing what backed it."
+  fi
+
+  # --- The safety property -------------------------------------------------
+  # Withdrawal has to cost a re-fetch and nothing more. If a withdrawn host
+  # cannot be reached again, this is not reclamation, it is an outage with a
+  # schedule -- and it would be invisible in the memory curve above, which is
+  # exactly why it is asserted here rather than assumed.
+  load "idle-refetch" 40 20 --distinct "${n}" --sni-start "${fill_at}"
+  record "phase6 re-fetch after withdrawal: ok=${LOAD[ok]}/${LOAD[attempted]} failed=${LOAD[failed]} p50=${LOAD[handshake_us_p50]}us p99=${LOAD[handshake_us_p99]}us"
+  if [[ "${LOAD[failed]}" -eq 0 && "${LOAD[ok]}" -gt 0 ]]; then
+    ok "every withdrawn host was served again on the next connection"
+    if [[ -n "${COLD_P50[${N_STEPS[-1]}]:-}" ]]; then
+      finding "a withdrawn host costs one cold handshake to get back: ${LOAD[handshake_us_p50]}us here against ${COLD_P50[${N_STEPS[-1]}]}us for first contact in phase 2"
+    fi
+  else
+    bad "${LOAD[failed]} of ${LOAD[attempted]} connections to withdrawn hosts failed -- withdrawal is breaking hosts, not reclaiming them"
   fi
 fi
 

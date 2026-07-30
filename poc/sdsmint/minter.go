@@ -38,6 +38,23 @@ type Minter interface {
 	GetCertificate(ctx context.Context, host string) (*MintedCert, error)
 }
 
+// Forgetter is implemented by a Minter that can release a cached leaf on
+// request. The SDS server uses it when it withdraws a name from the data
+// plane, so the certificate is dropped on both sides rather than lingering in
+// the cache until capacity or its reuse deadline pushes it out.
+//
+// It is a separate optional interface rather than part of Minter because it is
+// a memory hint, not part of issuance: a minter with nothing to release (the
+// null minter's fixed pool, say) is perfectly correct without it. Callers must
+// type-assert.
+//
+// Forgetting is always safe. The worst case is a wasted signature: if another
+// subscriber still holds the name, its next rotation misses the cache and
+// mints again.
+type Forgetter interface {
+	Forget(host string) bool
+}
+
 // reuseFraction is how much of a leaf's lifetime the cache will hand it out
 // for. A cached leaf handed out at the very end of its life is worse than a
 // cache miss: the caller gets a certificate that is about to stop verifying.
@@ -162,6 +179,13 @@ func (m *minter) GetCertificate(ctx context.Context, host string) (*MintedCert, 
 		)
 	}
 	return cert, nil
+}
+
+// Forget implements Forgetter. It reports whether anything was actually held.
+func (m *minter) Forget(host string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cache.forget(host)
 }
 
 // AllowGlobs builds a validate function accepting hosts that match any of the

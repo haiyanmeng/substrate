@@ -57,7 +57,9 @@ Consequences for the design:
 - The minting server owns the rotation clock. `sdsmintd --rotate` re-mints and
   pushes at ~2/3 of TTL for every live subscription.
 - Eviction is server-driven too: a name returned in `removed_resources` cancels
-  the data plane's subscription for it.
+  the data plane's subscription for it. `sdsmintd --idle <duration>` is what
+  drives that — see "How far it scales", where it takes `cert_active` from 3,000
+  to 0 and Envoy's heap from 139 MB to 9.5 MB.
 - This is why the doc's `DELTA_GRPC` choice is load-bearing rather than a
   stylistic preference — SotW has no way to withdraw a single name.
 - **Because Envoy never expires a secret itself, the rotation clock and the
@@ -239,8 +241,8 @@ The benchmarks above measure the signer. This section measures **Envoy**, which
 turns out to be where the limits are.
 
 ```sh
-./poc/sdsmint/hack/run-scale.sh              # quick sweep, phases 0-7, ~12 min
-./poc/sdsmint/hack/run-scale.sh --full       # 50k names, 30 min idle watch
+./poc/sdsmint/hack/run-scale.sh              # quick sweep, phases 0-7, ~17 min
+./poc/sdsmint/hack/run-scale.sh --full       # 50k names, 2 x 30 min idle watch
 ./poc/sdsmint/hack/run-scale.sh --phases 1,6
 ```
 
@@ -253,6 +255,11 @@ identical listener, so every number below is a *difference*, not an absolute.
 
 Numbers are the quick sweep on an Intel Core Ultra 7 165U, Envoy 1.37.5,
 `--concurrency 2`, 3,000 live names.
+
+Latency figures are from an otherwise-idle machine. A sweep run with other work
+on the box reproduced every *shape* below but inflated the tails badly —
+phase 3's p99 at 500/s went to 285 ms against the 28.9 ms quoted here. Treat the
+absolute microseconds as one machine's numbers and the ratios as the finding.
 
 ### The two findings that change the design
 
@@ -272,19 +279,55 @@ memory curve look *flatter*, i.e. it read as good news. `deploy/envoy-egress.yam
 pinned that same 1024 and has been corrected; `expect_all_served` now aborts any
 phase whose setup did not fully succeed.
 
-**2. ~60 KB of Envoy RSS per live secret, and none of it comes back.**
+**2. ~60 KB of Envoy RSS per live secret, and nothing takes it back on its own.**
 Linear and stable across the ramp: 68.9 KB/secret at 200 live, 62.7 at 1,000,
-60.5 at 3,000. Over 120 s fully idle, RSS went 235 MB → 240 MB — *up* — with
-`cert_active` pinned at 3,000. Nothing is reclaimed, because nothing evicts: the
-per-stream version map only grows, and minter-side cache eviction does not
-propagate to the data plane.
+60.5 at 3,000. Left alone for 120 s, RSS went 234 MB → 238 MB — *up* — with
+`cert_active` pinned at 3,000 and `server.memory_allocated` climbing 139 MB →
+172 MB. Nothing is reclaimed because nothing evicts. Envoy has no expiry of its
+own for an on-demand secret, and it never says it is finished with a name.
 
-For an egress proxy fronting arbitrary destinations, memory is therefore a
+Untreated, memory for an egress proxy fronting arbitrary destinations is a
 function of **every host ever contacted since the process started**, not of the
-working set. 10k hosts ≈ 600 MB; 50k ≈ 3 GB. That is a production blocker for
-long-lived pods, and the fix has to be server-side: withdraw idle names via
-`removed_resources` (the mechanism exists and is proven in `run-poc.sh`; nothing
-currently drives it).
+working set: 10k hosts ≈ 600 MB, 50k ≈ 3 GB.
+
+**This is now fixed server-side.** `sdsmintd --idle <duration>` withdraws names
+the proxy has stopped asking for, via `removed_resources`. Phase 6 runs both
+arms over the same 3,000-name fill and the difference is unambiguous:
+
+| | control (`--idle` unset) | `--idle 30s` |
+|---|---|---|
+| `cert_active` | 3,000 → **3,000** | 3,000 → **0** (inside 60 s) |
+| `server.memory_allocated` | 139 MB → **172 MB** | 140 MB → **9.5 MB** |
+| Envoy RSS | 234 MB → 239 MB | 234 MB → 235 MB |
+| withdrawn | 0 | 3,000, over 3,000 sweeps |
+
+Three things in that table are worth reading carefully:
+
+- **Envoy really does act on a removal.** `cert_active` going to zero says the
+  data-plane subscription was cancelled, and 43.4 KB per withdrawn secret came
+  off `server.memory_allocated` — the same order as the ~60 KB/secret measured
+  going up.
+- **RSS did not follow.** tcmalloc kept the pages. So withdrawal bounds *growth*
+  — the freed heap is reused by the next N hosts instead of being added to — but
+  it does not shrink the process. **Size the pod's memory limit for the peak
+  live set either way.** This is exactly the disagreement the harness reports
+  both numbers for; had it only watched RSS it would have concluded the fix did
+  nothing.
+- **3,000 withdrawals took 3,000 sweeps**, one apiece. That is finding #1 seen
+  from the other side: the sweep is per-stream, and each stream holds exactly
+  one name.
+
+The three runs of this phase agreed to within 1% on every column.
+
+And the property that makes it safe rather than merely cheap: **all 40 re-fetches
+of withdrawn hosts succeeded**, at p50 6.2–6.4 ms across runs — the same range as
+phase 2's cold first contact, which is what it is. Withdrawing a host that turns out to still be wanted
+costs exactly one cold handshake, not an error. That matters because the server
+cannot actually observe idleness: once Envoy holds a secret it never mentions the
+name again however much traffic flows for it, so `--idle` is a bet that a name
+nobody has *asked* for recently is a name nobody needs. The bet is cheap to lose,
+which is what makes it takeable — and it is asserted in the harness rather than
+assumed, because a broken re-fetch would be invisible in the memory curve.
 
 ### The rest
 
@@ -361,7 +404,8 @@ poc/sdsmint/
   cache.go         bounded LRU with per-entry reuse deadlines; recency list
                    plus expiry heap, so nothing is O(cache size) under the lock
   server.go        delta SDS: per-stream subscriptions, initial_resource_versions,
-                   removed_resources for refusals, optional rotation timer
+                   removed_resources for refusals and for idle withdrawal,
+                   optional rotation timer
   nullminter.go    MEASUREMENT ONLY: pre-signed shared leaves, so the scale
                    phases measure Envoy instead of a P-256 signing loop
   metrics.go       nil-safe atomic counters behind --metrics-addr, alongside
@@ -371,6 +415,8 @@ poc/sdsmint/
                    handshake timed apart from request, arrivals on a fixed
                    timeline so saturation cannot hide as coordinated omission
   rotation_test.go the rotation-vs-cache clock invariant
+  idle_test.go     --idle: what withdraws a name, what keeps one alive, and that
+                   a withdrawn host is still reachable afterwards
   cache_test.go    structural invariants of the three structures agreeing
   bench_test.go    cost decomposition and cache-cap scaling
   deploy/          envoy-egress.yaml         PRODUCTION. the one to deploy.
@@ -409,12 +455,17 @@ version gate above is a finding to report, not a change made here.
   problem — Envoy's one-stream-per-secret model means one resource per message —
   but the tick is N independent signatures, so at 50k live names it is 50k mints
   in a burst on a shared ticker. Per-name deadlines would spread it.
-- **The stream's `versions` map never shrinks, and this is the blocker.** Minter
-  cache eviction does not propagate to the data plane, so Envoy's live secret set
-  only grows; names leave only when the allowlist refuses them. Measured at
-  ~60 KB of Envoy RSS per live secret with nothing reclaimed while idle, that
-  makes memory a function of every host ever contacted. Withdrawing idle names
-  via `removed_resources` is the fix; the mechanism is proven, nothing drives it.
+- `--idle` defaults to **off**, which is the unbounded-growth behaviour. That is
+  deliberate for a PoC — it keeps the control arm of phase 6 available and does
+  not change what `run-poc.sh` measures — but any real deployment should set it,
+  and a shipping version should probably invert the default.
+- Withdrawal frees Envoy's heap but not its RSS (tcmalloc keeps the pages), so
+  it bounds growth without lowering the peak. A pod still has to be sized for
+  the largest live host set it will see at once.
+- The idle sweep is a wall-clock timeout, not a use signal, because Envoy never
+  reports use of a secret it already holds. A host under continuous heavy
+  traffic is withdrawn on exactly the same schedule as one that has gone quiet;
+  it just pays a cold handshake and comes straight back.
 - An SDS restart reconnects every stream at once — 2,997 replays in one burst at
   3,000 live names. With the real minter that is a mint storm at exactly the
   moment the server is coldest. The cache survives a restart only if it is

@@ -49,12 +49,24 @@
 # Co-located sdsmintd, sharing an emptyDir at /var/run/sdsmint:
 #
 #   sdsmintd --uds /var/run/sdsmint/sdsmint.sock \
-#            --ca-cert ... --ca-key ... --ttl 5m \
+#            --ca-cert ... --ca-key ... --ttl 5m --idle 30m \
 #            --allow '*.example.com' --allow 'api.partner.net' ...
 #
 # sdsmintd refuses to start without at least one --allow. The allowlist is the
 # primary control against a MITM CA that can mint for anything; see
 # ../README.md "Security controls implemented".
+#
+# --idle is not optional in a long-lived pod, even though the flag defaults to
+# off. Envoy has no expiry of its own for an on-demand secret and never reports
+# that it is finished with one, so without it the live secret set only grows:
+# memory becomes a function of every host ever contacted, not of the working
+# set. Phase 6 measured 3,000 held names at 139MB of Envoy heap holding steady
+# for as long as the process ran, against 9.5MB once withdrawal was on.
+#
+# Pick a value well above the interval at which a host is normally re-contacted.
+# Getting it wrong is cheap: a withdrawn host that is still wanted pauses its
+# next handshake and re-fetches, measured at 6.5ms, the same as first contact.
+# It is not an error the actor sees.
 #
 # ---------------------------------------------------------------------------
 # What still has to be decided before this is safe
@@ -293,6 +305,10 @@ static_resources:
     # remember phase 1 also measured ~60KB of Envoy RSS per live secret: 50k
     # hosts is roughly 3GB, so the memory limit binds before this number does.
     # Size the two together.
+    #
+    # "Live" here means concurrently subscribed, which is what sdsmintd's --idle
+    # bounds. Without it, live means every host contacted since the pod started
+    # and both this number and the memory limit have to cover that instead.
     circuit_breakers:
       thresholds:
       - priority: DEFAULT

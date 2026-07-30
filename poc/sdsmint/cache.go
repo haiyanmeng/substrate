@@ -140,6 +140,18 @@ func (c *certCache) put(host string, cert *MintedCert, now, reuseUntil time.Time
 	heap.Push(&c.expiry, e)
 }
 
+// forget drops the entry for host if there is one. Unlike eviction it is not
+// driven by pressure: the SDS server calls it when it withdraws a name from
+// the data plane, so the leaf stops being held on both sides at once.
+func (c *certCache) forget(host string) bool {
+	e, ok := c.byHost[host]
+	if !ok {
+		return false
+	}
+	c.remove(e)
+	return true
+}
+
 // purgeExpired drops every entry whose reuse window has closed. The heap root
 // is always the nearest deadline, so this stops at the first live entry
 // instead of walking the whole cache.

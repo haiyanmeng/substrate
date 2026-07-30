@@ -55,6 +55,20 @@ const SecretTypeURL = "type.googleapis.com/envoy.extensions.transport_sockets.tl
 // now: reuseFraction < rotateFraction < 1 is the invariant.
 const rotateFraction = 2.0 / 3.0
 
+// maxWithdrawPerSweep bounds how many names one idle sweep pulls back.
+//
+// Removals are just strings, so the size limit is not the concern -- the
+// concern is the data plane. Every withdrawal is a name that goes cold, and a
+// sweep that withdraws the entire live set at once turns the next minute of
+// traffic into an all-cold-miss storm. Whatever is over budget is withdrawn by
+// the following tick, a fraction of an idle window later.
+const maxWithdrawPerSweep = 1024
+
+// idleSweepDivisor is how many times per idle window the sweep runs. A name is
+// therefore withdrawn within idleTimeout + idleTimeout/divisor of going quiet,
+// rather than up to a full window late.
+const idleSweepDivisor = 4
+
 // Server implements Envoy's Secret Discovery Service, minting a certificate
 // per requested resource name. Because the on-demand certificate selector maps
 // SNI to the secret name, "resource name" and "hostname" are the same thing.
@@ -68,6 +82,10 @@ type Server struct {
 	// experiment in the harness can toggle it.
 	rotate bool
 	ttl    time.Duration
+	// idleTimeout, if positive, is how long a name may sit without the client
+	// asking for it before the server withdraws it. Zero disables reclamation
+	// and the live set only grows.
+	idleTimeout time.Duration
 
 	nonce atomic.Uint64
 }
@@ -80,6 +98,19 @@ type ServerOptions struct {
 	Rotate bool
 	// TTL must match the minter's leaf TTL for rotation timing to be right.
 	TTL time.Duration
+	// IdleTimeout, if positive, withdraws a name the client has not asked for
+	// in that long. Zero -- the default -- means names are held for the life
+	// of the stream, which is what makes an on-demand deployment's live set
+	// monotonically increasing.
+	//
+	// There is no such thing as server-observable idleness here. Once Envoy
+	// holds a secret it never mentions the name again, however much traffic
+	// flows for it, so this cannot distinguish "nobody has used this host in
+	// an hour" from "this host is busy". Withdrawing a busy name is not an
+	// outage: the next connection to it pauses and re-fetches, exactly as it
+	// did the first time. The cost of a wrong guess is one cold handshake, and
+	// the setting trades that against holding every host forever.
+	IdleTimeout time.Duration
 	// Metrics, if non-nil, counts streams, subscriptions, response sizes and
 	// rotation cost. Pass the same instance the minter got.
 	Metrics *Metrics
@@ -93,7 +124,14 @@ func NewServer(m Minter, opts ServerOptions) *Server {
 	if opts.TTL <= 0 {
 		opts.TTL = 5 * time.Minute
 	}
-	return &Server{minter: m, log: opts.Logger, metrics: opts.Metrics, rotate: opts.Rotate, ttl: opts.TTL}
+	return &Server{
+		minter:      m,
+		log:         opts.Logger,
+		metrics:     opts.Metrics,
+		rotate:      opts.Rotate,
+		ttl:         opts.TTL,
+		idleTimeout: opts.IdleTimeout,
+	}
 }
 
 func (s *Server) nextNonce() string {
@@ -128,16 +166,16 @@ func (s *Server) DeltaSecrets(stream secretservice.SecretDiscoveryService_DeltaS
 	ctx := stream.Context()
 
 	st := &deltaStream{
-		srv:      s,
-		stream:   stream,
-		versions: make(map[string]string),
-		sendCh:   make(chan *discovery.DeltaDiscoveryResponse, 8),
+		srv:    s,
+		stream: stream,
+		names:  make(map[string]*nameEntry),
+		sendCh: make(chan *discovery.DeltaDiscoveryResponse, 8),
 	}
 
 	s.metrics.recordStreamOpen()
 	defer func() {
 		st.mu.Lock()
-		held := len(st.versions)
+		held := len(st.names)
 		st.mu.Unlock()
 		s.metrics.recordStreamClose(held)
 	}()
@@ -180,6 +218,25 @@ func (s *Server) DeltaSecrets(stream secretservice.SecretDiscoveryService_DeltaS
 		rotateC = rotateTicker.C
 	}
 
+	var idleTicker *time.Ticker
+	var idleC <-chan time.Time
+	if s.idleTimeout > 0 {
+		interval := s.idleTimeout / idleSweepDivisor
+		// The floor keeps a very short timeout -- which only a test would set
+		// -- from turning into a busy loop. The ceiling keeps a very long one
+		// from making the sweep so rare that the reclamation lag is dominated
+		// by the polling rather than the timeout.
+		if interval < 250*time.Millisecond {
+			interval = 250 * time.Millisecond
+		}
+		if interval > 30*time.Second {
+			interval = 30 * time.Second
+		}
+		idleTicker = time.NewTicker(interval)
+		defer idleTicker.Stop()
+		idleC = idleTicker.C
+	}
+
 	recvCh := make(chan *discovery.DeltaDiscoveryRequest)
 	recvErrCh := make(chan error, 1)
 	go func() {
@@ -213,6 +270,10 @@ func (s *Server) DeltaSecrets(stream secretservice.SecretDiscoveryService_DeltaS
 				return nil
 			}
 			return err
+		case <-idleC:
+			if err := st.withdrawIdle(ctx); err != nil {
+				return err
+			}
 		case <-rotateC:
 			if err := st.rotateAll(ctx); err != nil {
 				return err
@@ -232,10 +293,23 @@ type deltaStream struct {
 	sendCh chan *discovery.DeltaDiscoveryResponse
 
 	mu sync.Mutex
-	// versions tracks the resource version last accepted for each name the
-	// client is subscribed to. Delta xDS is stateful per stream; this is that
-	// state.
-	versions map[string]string
+	// names is the client's subscription set. Delta xDS is stateful per
+	// stream; this is that state.
+	names map[string]*nameEntry
+}
+
+// nameEntry is what the server knows about one live resource name.
+type nameEntry struct {
+	// version is the resource version the client last accepted.
+	version string
+	// touched is the last time the client showed interest in this name: a
+	// subscribe, or a replay in initial_resource_versions after a reconnect.
+	//
+	// Rotation deliberately does not update it. A rotation is the server
+	// talking to the client, not the client saying the name still matters, and
+	// refreshing it here would mean an idle name was kept alive forever by the
+	// very pushes that make it expensive.
+	touched time.Time
 }
 
 func (d *deltaStream) handle(ctx context.Context, req *discovery.DeltaDiscoveryRequest) error {
@@ -261,18 +335,30 @@ func (d *deltaStream) handle(ctx context.Context, req *discovery.DeltaDiscoveryR
 	if replayed := req.GetInitialResourceVersions(); len(replayed) > 0 {
 		d.srv.metrics.recordResync(len(replayed))
 	}
+	now := time.Now()
 	adopted, dropped := 0, 0
 	d.mu.Lock()
 	for name, version := range req.GetInitialResourceVersions() {
-		if _, known := d.versions[name]; !known {
-			d.versions[name] = version
-			adopted++
+		if e, known := d.names[name]; known {
+			e.touched = now
+			continue
 		}
+		d.names[name] = &nameEntry{version: version, touched: now}
+		adopted++
 	}
 	for _, name := range req.GetResourceNamesUnsubscribe() {
-		if _, known := d.versions[name]; known {
-			delete(d.versions, name)
+		if _, known := d.names[name]; known {
+			delete(d.names, name)
 			dropped++
+		}
+	}
+	// A subscribe is the only signal the client ever sends about a name it
+	// already holds, so it is the only thing that can keep one alive. Stamp
+	// them before minting, in one pass, because the mint loop below cannot
+	// hold this lock.
+	for _, name := range req.GetResourceNamesSubscribe() {
+		if e, known := d.names[name]; known {
+			e.touched = now
 		}
 	}
 	d.mu.Unlock()
@@ -315,9 +401,21 @@ func (d *deltaStream) handle(ctx context.Context, req *discovery.DeltaDiscoveryR
 // is the only way a secret gets refreshed: Envoy caches an on-demand secret
 // indefinitely until the server sends a new version or a removal.
 func (d *deltaStream) rotateAll(ctx context.Context) error {
+	// Names the idle sweep is about to withdraw are skipped. Signing a
+	// replacement for a certificate that is being dropped in the next few
+	// seconds is pure waste, and at scale it is the difference between a
+	// rotation tick costing the live set and costing the active set.
+	var cutoff time.Time
+	if d.srv.idleTimeout > 0 {
+		cutoff = time.Now().Add(-d.srv.idleTimeout)
+	}
+
 	d.mu.Lock()
-	names := make([]string, 0, len(d.versions))
-	for name := range d.versions {
+	names := make([]string, 0, len(d.names))
+	for name, e := range d.names {
+		if !cutoff.IsZero() && e.touched.Before(cutoff) {
+			continue
+		}
 		names = append(names, name)
 	}
 	d.mu.Unlock()
@@ -352,6 +450,67 @@ func (d *deltaStream) rotateAll(ctx context.Context) error {
 	return d.send(ctx, resources, removed)
 }
 
+// withdrawIdle returns names the client has stopped asking about to the client
+// as removals, which per the Envoy docs cancels the data-plane subscription
+// for each one.
+//
+// This is the only thing that ever shrinks the live set. Without it a proxy
+// that has seen a host once holds a certificate for it until the stream dies:
+// the subscription is not refcounted against traffic, has no expiry of its
+// own, and Envoy never volunteers that it is finished with a name. Measured at
+// ~60KB of Envoy RSS per live secret, "held forever" is the difference between
+// a bounded footprint and one that tracks the number of distinct hosts the
+// proxy has ever been asked for.
+//
+// What it costs: a withdrawn name that turns out to still be wanted pauses its
+// next handshake and re-fetches. That is the ordinary cold path, already
+// measured in phase 2, and it is bounded by the mint -- not an error the
+// client sees.
+func (d *deltaStream) withdrawIdle(ctx context.Context) error {
+	if d.srv.idleTimeout <= 0 {
+		return nil
+	}
+	cutoff := time.Now().Add(-d.srv.idleTimeout)
+
+	var expired []string
+	capped := false
+	d.mu.Lock()
+	for name, e := range d.names {
+		if !e.touched.Before(cutoff) {
+			continue
+		}
+		if len(expired) >= maxWithdrawPerSweep {
+			capped = true
+			break
+		}
+		expired = append(expired, name)
+	}
+	d.mu.Unlock()
+
+	if len(expired) == 0 {
+		return nil
+	}
+
+	d.srv.metrics.recordIdleWithdrawal(len(expired))
+	d.srv.log.InfoContext(ctx, "withdrawing idle secrets",
+		slog.Int("withdrawn", len(expired)),
+		slog.Duration("idle_for", d.srv.idleTimeout),
+		slog.Bool("capped", capped),
+	)
+
+	// Release the leaves on this side too, so reclamation is not one-sided.
+	// Optional because a minter with a fixed pool has nothing to give back.
+	if f, ok := d.srv.minter.(Forgetter); ok {
+		for _, name := range expired {
+			f.Forget(name)
+		}
+	}
+
+	// send does the bookkeeping: it drops these from d.names and takes them
+	// off the live gauge.
+	return d.send(ctx, nil, expired)
+}
+
 // pack wraps a minted cert as a versioned delta Resource and records the
 // version as subscribed.
 func (d *deltaStream) pack(name string, cert *MintedCert) (*discovery.Resource, error) {
@@ -366,8 +525,15 @@ func (d *deltaStream) pack(name string, cert *MintedCert) (*discovery.Resource, 
 	version := cert.Serial
 
 	d.mu.Lock()
-	_, known := d.versions[name]
-	d.versions[name] = version
+	e, known := d.names[name]
+	if !known {
+		// Only a subscribe reaches an unknown name -- rotation walks names
+		// that are already here -- so this is first contact, and now is the
+		// right touch time.
+		e = &nameEntry{touched: time.Now()}
+		d.names[name] = e
+	}
+	e.version = version
 	d.mu.Unlock()
 	if !known {
 		d.srv.metrics.addLiveNames(1)
@@ -380,8 +546,8 @@ func (d *deltaStream) send(ctx context.Context, resources []*discovery.Resource,
 	withdrawn := 0
 	d.mu.Lock()
 	for _, name := range removed {
-		if _, known := d.versions[name]; known {
-			delete(d.versions, name)
+		if _, known := d.names[name]; known {
+			delete(d.names, name)
 			withdrawn++
 		}
 	}

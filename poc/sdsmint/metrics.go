@@ -54,6 +54,11 @@ type Metrics struct {
 	resourcesSent    atomic.Int64
 	removalsSent     atomic.Int64
 
+	// idleSweeps counts sweeps that withdrew something, not sweeps that ran --
+	// a tick that found nothing idle is not an event worth a counter.
+	idleSweeps      atomic.Int64
+	idleWithdrawals atomic.Int64
+
 	rotations         atomic.Int64
 	rotationResources atomic.Int64
 	rotationNanos     atomic.Int64
@@ -156,6 +161,13 @@ func (m *Metrics) recordResponse(bytes, resources, removals int) {
 	m.removalsSent.Add(int64(removals))
 }
 
+func (m *Metrics) recordIdleWithdrawal(names int) {
+	if m != nil {
+		m.idleSweeps.Add(1)
+		m.idleWithdrawals.Add(int64(names))
+	}
+}
+
 func (m *Metrics) recordRotation(d time.Duration, resources int) {
 	if m == nil {
 		return
@@ -191,6 +203,8 @@ func (m *Metrics) Snapshot() map[string]int64 {
 		"response_bytes_max":   m.maxResponseBytes.Load(),
 		"resources_sent":       m.resourcesSent.Load(),
 		"removals_sent":        m.removalsSent.Load(),
+		"idle_sweeps":          m.idleSweeps.Load(),
+		"idle_withdrawals":     m.idleWithdrawals.Load(),
 		"rotations":            m.rotations.Load(),
 		"rotation_resources":   m.rotationResources.Load(),
 		"rotation_nanos_total": m.rotationNanos.Load(),

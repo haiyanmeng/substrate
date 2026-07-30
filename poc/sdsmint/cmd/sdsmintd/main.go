@@ -72,6 +72,7 @@ func run() error {
 	ttl := flag.Duration("ttl", 5*time.Minute, "leaf certificate lifetime")
 	cacheCap := flag.Int("cache-cap", 256, "maximum number of cached leaves")
 	rotate := flag.Bool("rotate", false, "proactively push a re-minted leaf at ~2/3 of TTL for every live subscription")
+	idle := flag.Duration("idle", 0, "withdraw a secret the proxy has not re-requested in this long, so the live set can shrink; 0 holds every name for the life of the stream")
 	logLevel := flag.String("log-level", "info", "one of debug, info, warn, error")
 	metricsAddr := flag.String("metrics-addr", "", "TCP address to serve /metrics and /debug/pprof on; empty disables both")
 	nullMinter := flag.Bool("null-minter", false, "MEASUREMENT ONLY: serve pre-signed shared leaves instead of minting, so a load test measures Envoy rather than the signer")
@@ -156,10 +157,11 @@ func run() error {
 
 	grpcServer := grpc.NewServer()
 	secretservice.RegisterSecretDiscoveryServiceServer(grpcServer, sdsmint.NewServer(minter, sdsmint.ServerOptions{
-		Logger:  logger,
-		Rotate:  *rotate,
-		TTL:     *ttl,
-		Metrics: metrics,
+		Logger:      logger,
+		Rotate:      *rotate,
+		TTL:         *ttl,
+		IdleTimeout: *idle,
+		Metrics:     metrics,
 	}))
 
 	logger.Info("sdsmintd listening",
@@ -168,6 +170,7 @@ func run() error {
 		slog.Any("allow", []string(allow)),
 		slog.Duration("ttl", *ttl),
 		slog.Bool("rotate", *rotate),
+		slog.Duration("idle", *idle),
 		slog.Bool("null_minter", *nullMinter),
 	)
 
