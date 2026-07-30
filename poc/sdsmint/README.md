@@ -189,7 +189,10 @@ target hardware before believing any absolute figure.
 | └ PKCS#8 + PEM encoding | 21,300 | 77 |
 | cache hit | 196 | 0 |
 | allowlist check, 32 patterns | ~940 | 0 |
-| pack a Secret into a delta `Resource` | 3,003 | 10 (**1.5 KB on the wire**) |
+| pack a Secret into a delta `Resource` † | 3,003 | 10 |
+
+† 1,529 B on the wire, reported by the benchmark as a custom `wire_bytes`
+metric. It is a serialised size, not an allocation figure.
 
 **~2,700 mints/second/core, and the fresh keypair is not why.** Keygen is 9% of
 a mint. `x509.CreateCertificate` is 77%, and a CPU profile says **more than half
@@ -202,6 +205,52 @@ ever needed, is to not call `CreateCertificate` per leaf.
 So a key pool would buy at most 9%. Anyone optimising this should start by
 noting the cache hit is **1,900× cheaper than a miss** and go looking for misses
 instead.
+
+#### Reading the table row by row
+
+`ns/op` and `allocs` are Go's `-benchmem` output — nanoseconds and *allocation
+count* per operation. `B/op` is omitted deliberately; this table is about time,
+and the allocation count is here only as a proxy for GC pressure.
+
+- **`CA.Sign`** is `BenchmarkSign`: one complete mint, end to end. 374.6 µs
+  inverts to ~2,670/sec on one core, which is where "~2,700 mints/second/core"
+  comes from. The three indented rows decompose it.
+- **Fresh P-256 keypair** is bare `ecdsa.GenerateKey`, nothing else. It is
+  isolated to settle one design question — every mint generates a fresh leaf key
+  so that no two hosts share one, and if that dominated, a pre-generated key pool
+  would be the obvious lever. At 8.6% it is not.
+- **`x509.CreateCertificate`** is timed with the leaf key and the template
+  already built outside the loop, so it is purely marshal-the-TBS plus sign.
+  76.6% of a mint, and see above for what is hiding inside it.
+- **PKCS#8 + PEM encoding** is everything after the signature: PEM the leaf DER,
+  append the PEM'd CA chain, marshal the leaf key to PKCS#8, PEM that. 5.7% —
+  cheap, but paid on every mint and it allocates, which is why it is listed
+  rather than folded away.
+- **Cache hit** is a repeat `GetCertificate` for a host already held. Zero
+  allocations because it returns the cached pointer rather than copying.
+  374,608/196 = **1,911×** cheaper than a miss.
+- **Allowlist check** is approximate because it is two sub-benchmarks: matching
+  the last of 32 patterns (890 ns, 0 allocs) and rejecting after scanning all 32
+  (996 ns, 1 alloc — the error). Zero allocations on the match path because
+  `matchLabels` walks labels in place instead of splitting into slices.
+- **Pack a Secret** is not part of minting at all. It is the per-push cost —
+  build the `Secret` proto, wrap it in an `Any`, marshal — paid once per live
+  subscription per rotation tick.
+
+**The box-drawing glyphs oversell the decomposition.** The three children sum to
+340,470 ns against a 374,608 ns parent, so **about 9% is unattributed**: that gap
+is the work `Sign` does that no sub-benchmark covers — `randomSerial()` (a
+`crypto/rand` read plus a `big.Int`), `time.Now()`, building the
+`x509.Certificate` template and its `pkix.Name`, the `parseIP` branch, and
+allocating the `MintedCert`. Read `├`/`└` as "the three parts worth isolating",
+not as a partition.
+
+**On a warm proxy, policy costs more than caching.** `GetCertificate` validates
+before it looks in the cache, so the allowlist is on every call, hit or miss. The
+196 ns cache-hit figure already contains a validate — against a *one-pattern*
+allowlist, which is what the benchmark minter is built with. Swap in 32 patterns
+and validation alone is ~890 ns, against under 200 ns for everything else on the
+warm path put together. The lookup is not what to tune; the pattern list is.
 
 ~~The 1.5 KB wire size is the number to multiply for rotation: a single rotation
 response carrying every live secret crosses Envoy's 4 MB default gRPC receive
@@ -387,15 +436,6 @@ What it does about each gap in the PoC bootstraps:
 | Access logging | JSON to stdout, including `REQUESTED_SERVER_NAME` — the SNI the cert was minted for. |
 | Memory | `overload_manager` with a fixed-heap ceiling. An unbounded destination set means unbounded DNS entries *and* unbounded live secret subscriptions. |
 | Resilience | Circuit breakers on all three clusters, TLS 1.2 floor on both legs, connect-failure retries. |
-
-**It still would not ship as a bootstrap file for the router.** That Envoy is
-ADS-driven: `cmd/atenet/internal/router/envoyrunner.go:77` writes a bootstrap
-containing only `dynamic_resources` plus the `xds_cluster`, and listeners are
-built in Go and pushed. The block to port is the `DownstreamTlsContext` at
-`cmd/atenet/internal/router/xds.go:627`, so treat this file as the specification
-for what LDS should emit. Bumping the image to 1.37+ is necessary but not
-sufficient — `go-control-plane` also needs the `on_demand_secret` and
-`cert_mappers.sni` message types (`envoy@v1.37.0` has them, already vendored).
 
 **Four decisions the config cannot make for you**, all called out in its header:
 how traffic reaches the listener (it is a transparent MITM, not an HTTP CONNECT
