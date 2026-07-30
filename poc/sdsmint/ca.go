@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package sdsmint implements the minting SDS server described in mint.md: an
-// Envoy Secret Discovery Service that mints a TLS leaf certificate on demand
-// for whatever hostname Envoy asks for, where the requested SDS resource name
-// is the SNI from the client hello.
+// Package sdsmint implements a minting SDS server: an Envoy Secret Discovery
+// Service that mints a TLS leaf certificate on demand for whatever hostname
+// Envoy asks for, where the requested SDS resource name is the SNI from the
+// client hello.
 //
 // The point of the design is that the MITM CA private key lives here, in a
 // dedicated service, rather than in every data-plane proxy. Only short-lived
@@ -45,8 +45,9 @@ const serialBits = 128
 type CA struct {
 	cert *x509.Certificate
 	// key is a crypto.Signer rather than a concrete key so that a KMS- or
-	// HSM-backed signer can be substituted without touching Sign. mint.md
-	// lists that substitution as the main hardening step for production.
+	// HSM-backed signer can be substituted without touching Sign. Getting the
+	// CA key out of a file is the main hardening step for production, and this
+	// is the seam that makes it a drop-in rather than a rewrite.
 	key      crypto.Signer
 	chainDER [][]byte // CA cert DER, appended to every leaf chain
 }
@@ -111,7 +112,7 @@ func parsePrivateKey(der []byte) (any, error) {
 //
 // permittedDNSDomains, if non-empty, sets an x509 name constraint on the CA so
 // that even a leaked leaf-signing path cannot impersonate hosts outside those
-// domains. mint.md calls this out as "name-constrained CA".
+// domains -- a name-constrained CA.
 func GenerateCA(commonName string, ttl time.Duration, permittedDNSDomains []string) (*CA, []byte, []byte, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

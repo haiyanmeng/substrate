@@ -153,12 +153,17 @@ func toSecret(name string, c *MintedCert) *tlsv3.Secret {
 	}
 }
 
-// DeltaSecrets is what DELTA_GRPC drives. Envoy opens one stream and adds a
-// subscription for each new SNI it sees, so this is a long-lived loop that
-// mints incrementally rather than serving a fixed snapshot.
+// DeltaSecrets is what DELTA_GRPC drives. It is a long-lived loop that mints
+// incrementally rather than serving a fixed snapshot.
 //
-// Note on failure signalling: mint.md's sketch says to "NACK names that fail
-// validation", but NACK is a *client* action in xDS — a server cannot NACK. The
+// Measured, and not what this was originally written to expect: Envoy opens a
+// separate stream per secret name and holds it open, so in practice each of
+// these loops carries exactly one subscription. The code does not rely on that
+// -- a stream with many names still works -- but it is why the live host count
+// is a concurrent-request count against the SDS cluster.
+//
+// Note on failure signalling: the intuitive design is to NACK a name that fails
+// validation, but NACK is a *client* action in xDS -- a server cannot NACK. The
 // server-side way to say "this name will not be issued" is to return it in
 // removed_resources, which per the Envoy docs also cancels the data-plane
 // subscription for that name. That is what we do.

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The real egress-MITM shape from mint.md: identical downstream config to
+# The real egress-MITM shape: identical downstream config to
 # envoy-bootstrap.yaml, but the upstream is a dynamic_forward_proxy so Envoy
 # actually re-originates TLS to whatever host the client asked for.
 #

@@ -1,7 +1,7 @@
 # How the sdsmint PoC works
 
-A walkthrough of the mechanism. For *results* — what the PoC proves and the
-measured answers to mint.md's open questions — see [README.md](README.md).
+A walkthrough of the mechanism. For *results* — what the PoC proves, the
+measured answers, and the benchmarks — see [README.md](README.md).
 
 ---
 
@@ -31,10 +31,11 @@ That's the easy part. The hard part is **which certificate, and when**:
 So: mint a leaf **per SNI, on demand**, from a signing key that lives somewhere
 other than the proxy.
 
-## 2. Why this design (Option C)
+## 2. Why this design
 
-mint.md weighed three approaches. The one implemented here uses two Envoy
-extensions that already ship in the box:
+The alternatives are to teach the proxy to sign for itself, or to write a custom
+C++ certificate provider. Neither is necessary: two Envoy extensions that
+already ship in the box compose into exactly the required behaviour.
 
 - **`on_demand_secret`** — a *certificate selector*. Instead of picking from a
   static list of certs configured on the listener, it pauses the handshake,
@@ -110,17 +111,17 @@ keypair every call, `CN = SAN = host`, `IsCA=false`, `KeyUsage=DigitalSignature`
 Two deliberate choices:
 
 - **`key` is typed `crypto.Signer`, not `*ecdsa.PrivateKey`.** A KMS- or
-  HSM-backed signer substitutes without touching `Sign`. mint.md names this as
-  the main production hardening step, and this is the seam that makes it a
-  drop-in rather than a rewrite.
+  HSM-backed signer substitutes without touching `Sign`. Getting the CA key out
+  of a file is the main production hardening step, and this is the seam that
+  makes it a drop-in rather than a rewrite.
 - **An IP literal in the SNI goes in `IPAddresses`, not `DNSNames`.** SNI isn't
   supposed to carry IP literals; some clients send them anyway, and a leaf with
   an IP in `DNSNames` is rejected.
 
 `GenerateCA` exists so the PoC can run without external key material. It supports
-`PermittedDNSDomains` (marked critical) — mint.md's "name-constrained CA", so that
-even a total compromise of this service can't impersonate hosts outside the
-constrained domains.
+`PermittedDNSDomains` (marked critical) — a name-constrained CA, so that even a
+total compromise of this service can't impersonate hosts outside the constrained
+domains.
 
 ### `minter.go` — policy and cache in front of the key
 
@@ -158,9 +159,10 @@ whitespace, leading/trailing dots, or empty labels.
 `DeltaSecrets` is the real implementation; the SotW methods exist for
 completeness (more on that below).
 
-**Per-stream state.** Delta xDS is stateful per stream. `deltaStream.versions`
-maps name → last-sent version, which is what makes incremental updates and
-correct unsubscribes possible.
+**Per-stream state.** Delta xDS is stateful per stream. `deltaStream.names` maps
+name → `{version, touched}`: the version the client last accepted, which is what
+makes incremental updates and correct unsubscribes possible, and the last time
+the client showed interest, which is what idle withdrawal keys off.
 
 **Version = certificate serial.** A re-mint always looks like a new version to
 Envoy; a cache hit always looks like the same one. No separate counter to keep
@@ -171,8 +173,8 @@ pushes race with responses to inbound requests. All sends funnel through
 `sendCh`, and the main loop is a single `select` over the receive channel, the
 rotation ticker, the send-error channel, and `ctx.Done()`.
 
-**Refusal is `removed_resources`, not a NACK.** mint.md's sketch says to "NACK
-names that fail validation" — but NACK is a *client* action in xDS; a server has
+**Refusal is `removed_resources`, not a NACK.** The intuitive design is to NACK
+a name that fails validation — but NACK is a *client* action in xDS; a server has
 no NACK to send. The server-side way to say "this name will not be issued" is to
 return it in `removed_resources`, which per the Envoy docs also cancels the data
 plane's subscription for that name. The paused handshake then fails, which is the
@@ -183,17 +185,37 @@ comment.
 Envoy rejected a certificate we minted — a real bug, not routine traffic.
 
 **`initial_resource_versions` is honoured.** On stream reconnect Envoy replays
-what it already holds, so we seed `versions` from it rather than re-pushing
-everything.
+what it already holds, so we adopt those names rather than re-pushing
+everything — and a replay counts as the client showing interest, so a name that
+survives a reconnect is not immediately withdrawn as idle.
 
 **Rotation.** With `--rotate`, a ticker at 2/3 of TTL re-mints every live
 subscription and pushes the replacements. This is not an optimisation — see §6.
 
+**Idle withdrawal.** With `--idle`, a second ticker at a quarter of that window
+withdraws names the client has not asked about in `--idle`, via
+`removed_resources`, and releases the leaf from the mint cache at the same time
+through an optional `Forgetter` interface — so reclamation is not one-sided.
+Two design points that are easy to get backwards:
+
+- **A rotation push does not count as activity.** It is the server talking to
+  the client, not the client saying the name still matters. If it refreshed the
+  timestamp, a server running with `--rotate` would never reclaim anything while
+  appearing to work. Conversely, `rotateAll` skips names the next sweep is about
+  to drop, so a rotation tick costs the *active* set rather than the *live* one.
+- **There is no server-observable idleness to key on.** Once Envoy holds an
+  on-demand secret it never mentions the name again, however much traffic flows
+  for it. So `--idle` is a wall-clock bet that a name nobody has *asked* for
+  recently is a name nobody needs. The bet is cheap to lose — the cost is
+  exactly one cold handshake — which is what makes it takeable, and the harness
+  asserts that rather than assuming it.
+
 ### `cmd/sdsmintd/main.go` — the daemon
 
-UDS by default (mint.md's "local-only channel" — leaf private keys transit this
-connection), `chmod 0600`, stale-socket cleanup on start. Flags for TTL, cache
-cap, rotation, log level, and the required repeatable `--allow`.
+UDS by default — a local-only channel, because leaf private keys transit this
+connection — `chmod 0600`, stale-socket cleanup on start. Flags for TTL, cache
+cap, rotation, idle withdrawal, log level, and the required repeatable
+`--allow`.
 
 One non-obvious thing, and it cost a debugging session: **`GracefulStop()` cannot
 be used unconditionally.** It waits for in-flight RPCs to finish, but an xDS
@@ -219,10 +241,20 @@ Envoy can't distinguish from a server that isn't done yet. With an open-ended
 host set, "resend everything on every change" also degrades badly. `buildSotW`
 notes the limitation in a comment where the refusal path silently `continue`s.
 
-## 6. Two things that surprised us
+## 6. Three things that surprised us
 
-Both are measured in the README; they're repeated here because they're
+All three are measured in the README; they're repeated here because they're
 consequences of the *design*, not incidental findings.
+
+**Envoy opens one DELTA_GRPC stream per secret name, and holds it open.** Not
+one stream carrying many subscriptions, which is what the server was originally
+written to expect. 3,120 live secrets produced 3,120 concurrent streams on the
+single SDS connection. Streams are concurrent requests, so **the live host count
+is a concurrent-request count against the SDS cluster** — and Envoy's default
+`max_requests` circuit breaker of 1024 becomes a silent ceiling on distinct
+hosts, past which no secret is ever delivered and handshakes fail ~15 s later
+with `initial fetch timed out`. Nearly every capacity prediction made from the
+other model was wrong in a way this one explains.
 
 **Envoy has no TTL for an on-demand secret.** It caches what it was given,
 indefinitely, until the server sends a new version or a removal. The leaf's own
@@ -260,11 +292,14 @@ fails.
 
 ## 8. How it's tested
 
-**Unit** (`go test ./poc/sdsmint/...`, 26 tests, race-enabled): CA round-trips
+**Unit** (`go test ./poc/sdsmint/...`, 54 tests, race-enabled): CA round-trips
 and leaf shape; cache hit/expiry/eviction/concurrency; allowlist semantics
 including the one-label wildcard. `server_test.go` drives the delta protocol
 through fake gRPC streams — subscribe, refuse, bare ACK, rotation, unsubscribe,
-`initial_resource_versions`, wrong type URL, inbound NACK.
+`initial_resource_versions`, wrong type URL, inbound NACK. `idle_test.go` covers
+withdrawal from both ends: what expires a name, what keeps one alive (a
+subscribe and a reconnect replay, but deliberately not a rotation push), and
+that a withdrawn host is served again on the next request.
 
 **End-to-end** (`hack/run-poc.sh`): a real Envoy 1.37.5 binary against a real
 `sdsmintd`. The harness asserts on Envoy's own admin stats
@@ -273,10 +308,17 @@ on `openssl s_client` output, so results are measured rather than inferred from
 "curl exited 0". It version-gates on 1.37 and fails with a clear message on older
 builds.
 
-The three experiments each target one of mint.md's open questions, and are
-designed so the answer is a *number*: `cert_requested +1` vs `+4` settles
-shared-vs-per-worker cache; a changed serial under a held subscription settles
-push-vs-TTL rotation; two timing legs settle the SDS-down failure mode.
+The three experiments each target one of the questions that could not be settled
+on paper, and are designed so the answer is a *number*: `cert_requested +1` vs
+`+4` settles shared-vs-per-worker cache; a changed serial under a held
+subscription settles push-vs-TTL rotation; two timing legs settle the SDS-down
+failure mode.
+
+**At scale** (`hack/run-scale.sh`): nine phases against a real Envoy, each
+isolating one question, with a static-certificate control so every number is a
+difference rather than an absolute. This is where the one-stream-per-secret
+model and the unbounded live set were found, and where `--idle` is measured
+against a control arm. See the README for the results.
 
 ## 9. What this is not
 
@@ -284,9 +326,10 @@ push-vs-TTL rotation; two timing legs settle the SDS-down failure mode.
   pins Envoy `v1.30-latest` and these extensions need 1.37+. That version gate is
   the finding; bumping it is a separate decision.
 - **Not a production SDS server.** The cache is per-process, so a replicated
-  deployment mints once per replica. Rotation is one shared ticker rather than
-  per-name deadlines. There's no mTLS on the SDS channel (UDS + 0600 instead), no
-  metrics, and no CA rotation story.
+  deployment mints once per replica, and it does not survive a restart — which
+  matters, because a restart replays every stream at once. Rotation and idle
+  withdrawal are shared tickers rather than per-name deadlines. There's no mTLS
+  on the SDS channel (UDS + 0600 instead) and no CA rotation story.
 - **Not a policy engine.** It proves the proxy can *see* the plaintext. What to
   do with it — allow, deny, log, rewrite — is the existing egress-policy question
   and is untouched here.

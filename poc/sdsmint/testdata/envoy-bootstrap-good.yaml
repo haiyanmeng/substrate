@@ -146,6 +146,6 @@ static_resources:
       - lb_endpoints:
         - endpoint:
             address:
-              # A unix socket keeps leaf private keys off the network, which is
-              # the "local-only channel" control from mint.md.
+              # A unix socket keeps leaf private keys off the network. That
+              # local-only channel is a required control, not a convenience.
               pipe: {path: ./sdsmint.sock}

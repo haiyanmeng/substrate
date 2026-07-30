@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# End-to-end harness for the mint.md PoC.
+# End-to-end harness for the on-demand per-SNI certificate minting PoC.
 #
 # Brings up a standalone Envoy configured with the on_demand_secret certificate
 # selector plus the sni certificate mapper, pointed at the sdsmintd minting SDS
@@ -108,7 +108,7 @@ start_sds() {
 }
 
 ################################################################################
-bold "=== mint.md PoC: on-demand per-SNI certificate minting ==="
+bold "=== PoC: on-demand per-SNI certificate minting ==="
 mkdir -p "${RUN_DIR}"
 
 info "Building sdsmintd"
@@ -195,9 +195,9 @@ else
   bad "no audit line for the refused host"
 fi
 
-# mint.md's sketch says to "NACK" a disallowed name, but a server cannot NACK in
-# xDS. We withdraw it instead, and the docs say a removal cancels the data-plane
-# subscription -- so cert_active must not have grown.
+# The intuitive design is to "NACK" a disallowed name, but a server cannot NACK
+# in xDS. We withdraw it instead, and the docs say a removal cancels the
+# data-plane subscription -- so cert_active must not have grown.
 active_after_block="$(stat_value listener.mitm.on_demand_secret.cert_active)"
 if [[ "${active_after_block}" -le "${active}" ]]; then
   ok "the withdrawn name left no live subscription (cert_active ${active} -> ${active_after_block})"
@@ -208,7 +208,7 @@ fi
 ################################################################################
 bold ""
 bold "--- Experiment A: is Envoy's secret cache shared or per-worker? ---"
-note "mint.md open question 2: memory footprint under a large live host set."
+note "Decides whether the footprint of a large live host set scales with hosts or with hosts x workers."
 
 stop_envoy
 start_envoy envoy-bootstrap.yaml 4
@@ -243,7 +243,7 @@ fi
 ################################################################################
 bold ""
 bold "--- Experiment B: how does a secret get rotated or expire? ---"
-note "mint.md open question 1: TTL or push-based invalidation?"
+note "Decides who owns the rotation clock: does Envoy expire a secret itself, or must the server push?"
 
 stop_envoy
 stop_sds
@@ -274,7 +274,7 @@ fi
 ################################################################################
 bold ""
 bold "--- Experiment C: what happens when the SDS server is down? ---"
-note "mint.md open question 3: handshake behaviour and client-visible impact."
+note "Decides the blast radius of an SDS outage: handshake behaviour and client-visible impact."
 
 # A name Envoy has already cached should keep working with SDS gone.
 stop_sds

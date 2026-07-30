@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command sdsmintd is the minting SDS server from mint.md: it answers Envoy's
-// on-demand SDS requests by issuing a TLS leaf for the requested name, which
-// the sni certificate mapper sets to the SNI of the connection being handled.
+// Command sdsmintd is the minting SDS server: it answers Envoy's on-demand SDS
+// requests by issuing a TLS leaf for the requested name, which the sni
+// certificate mapper sets to the SNI of the connection being handled.
 //
-// It listens on a unix domain socket by default. mint.md lists a local-only
-// channel as a required control, because leaf private keys transit this
-// connection.
+// It listens on a unix domain socket by default. A local-only channel is a
+// required control here, because leaf private keys transit this connection.
 package main
 
 import (

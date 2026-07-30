@@ -14,9 +14,9 @@
 
 # Production egress MITM gateway: on-demand per-SNI certificate minting.
 #
-# This is the deployable form of mint.md's Option C. The three files in
-# ../testdata are PoC scaffolding -- two of them deliberately broken to
-# demonstrate a failure mode. This one is meant to run.
+# This is the deployable form of the design. The files in ../testdata are PoC
+# scaffolding -- two of them deliberately broken to demonstrate a failure mode.
+# This one is meant to run.
 #
 # REQUIRES ENVOY 1.37 OR NEWER. on_demand_secret and cert_mappers.sni do not
 # exist in 1.36 or earlier, and the config is rejected outright on older
@@ -277,8 +277,8 @@ static_resources:
 
   clusters:
   # The minting SDS server, co-located. A unix socket keeps freshly minted leaf
-  # private keys off the network entirely -- mint.md's "local-only channel"
-  # control. sdsmintd chmods it 0600.
+  # private keys off the network entirely -- a local-only channel, which is a
+  # required control rather than a convenience. sdsmintd chmods it 0600.
   - name: sds_mint
     type: STATIC
     connect_timeout: 1s

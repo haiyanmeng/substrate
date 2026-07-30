@@ -1,18 +1,24 @@
 # sdsmint: a PoC for on-demand per-SNI certificate minting
 
-This is a working proof of concept for the design in [`mint.md`](../../mint.md):
-let a substrate actor dial an arbitrary HTTPS destination while the egress proxy
-still sees and polices the request, by having Envoy MITM the connection with a
-leaf certificate **minted per SNI, on demand**.
+An egress proxy cannot police an HTTPS request it cannot read. The usual answer
+is to MITM the connection — terminate the actor's TLS at the proxy, inspect and
+police the plaintext, re-originate to the real origin — but that requires
+presenting a certificate for whatever host the actor happens to dial, and for a
+substrate actor the destination set is open-ended. This PoC mints that leaf
+**per SNI, at handshake time**, from a CA key that lives outside the data plane.
 
-It implements the doc's recommended Option C — Envoy's shipped
-`on_demand_secret` certificate selector plus the `sni` certificate mapper,
-backed by a custom Go SDS server that does the signing. The MITM CA private key
-never enters the data plane.
+The mechanism is two Envoy extensions that already ship in the box, composed:
+`on_demand_secret`, a certificate selector that pauses the handshake and fetches
+a secret by name over SDS, and `cert_mappers.sni`, a certificate mapper that
+makes that name the connection's SNI. What is left to build is the SDS server —
+and because it is a separate process, **the MITM CA private key never enters the
+data plane**. Envoy only ever receives short-lived leaf keys, over a unix socket.
 
-The PoC's job was to de-risk the design: prove the config works on a real Envoy,
-and turn the doc's three open questions into measured answers. All three are
-answered below, along with three corrections to the doc.
+The PoC's job was to find out whether that works and what it costs: get the
+config running on a real Envoy, then measure the things nobody could answer on
+paper — how an on-demand secret expires, whether the secret cache is per-worker,
+what happens when SDS is down, and how far the whole arrangement scales. Those
+answers are below, along with the findings that changed the design.
 
 **[EXPLAINER.md](EXPLAINER.md) explains how it works** — the mechanism, the
 connection lifecycle, and a walkthrough of the code. This file covers what it
@@ -43,7 +49,7 @@ Last full run: **16 passed, 0 failed** (Envoy 1.37.5, Linux x86-64).
 | The hostname allowlist really blocks | A host outside `--allow` fails the handshake with `error:0A000410:SSL routines::ssl/tls alert handshake failure`, is audited server-side, and leaves **no live subscription** (`cert_active` unchanged). |
 | Full MITM re-origination works | Through the `dynamic_forward_proxy` bootstrap: real `example.com` content fetched, HTTP 200, while the client is served our leaf (`issuer=CN=sdsmint PoC MITM CA`). The upstream leg is still verified against the system trust store via `auto_sni` + `auto_san_validation`, so the MITM does not weaken origin authentication. |
 
-## Answers to mint.md's open questions
+## The questions that had to be measured
 
 ### 1. How does an on-demand secret expire or rotate?
 
@@ -60,8 +66,8 @@ Consequences for the design:
   the data plane's subscription for it. `sdsmintd --idle <duration>` is what
   drives that — see "How far it scales", where it takes `cert_active` from 3,000
   to 0 and Envoy's heap from 139 MB to 9.5 MB.
-- This is why the doc's `DELTA_GRPC` choice is load-bearing rather than a
-  stylistic preference — SotW has no way to withdraw a single name.
+- This is why `DELTA_GRPC` is load-bearing rather than a stylistic preference —
+  state-of-the-world SDS has no way to withdraw a single name.
 - **Because Envoy never expires a secret itself, the rotation clock and the
   minter's cache clock have to be designed together.** They were not, and the
   result was a real bug — see below.
@@ -99,8 +105,8 @@ rotation margin below ~10s.
 
 So the memory footprint of a large live host set scales with the number of
 *hosts*, not hosts × workers, and the signing load is one mint per host rather
-than one per host per worker. This is the good case for the design; it was the
-doc's main scaling worry.
+than one per host per worker. This is the good case, and it was the main scaling
+worry going in.
 
 ### 3. What happens when the SDS server is down?
 
@@ -129,24 +135,27 @@ Two distinct behaviours, and the second one is the finding that matters:
   same config with the knob set** — that is the one to copy, and the harness
   runs it as leg 2.
 
-## Corrections to mint.md
+## Three things to know before building this
 
-1. **"NACK names that fail validation" is backwards.** NACK is a *client* action
-   in xDS — a server cannot NACK. The correct way for the server to say "this
-   name will not be issued" is to return it in `removed_resources`. The PoC does
-   that, and Check 2 confirms it produces a clean handshake failure with no
-   lingering subscription.
-2. **The design needs Envoy 1.37+.** `on_demand_secret` and `cert_mappers.sni`
-   first shipped in 1.37 — `extensions_build_config.bzl` has 0 matches in
-   v1.35.13 and v1.36.9, 3 in v1.37.5. On anything older the config is rejected
-   outright. `manifests/ate-install/atenet-router.yaml:177` currently pins
+1. **A server cannot refuse a name by NACKing it.** The intuitive design is for
+   the minting server to NACK a name that fails the allowlist — but NACK is a
+   *client* action in xDS, and a server has no NACK to send. The correct way to
+   say "this name will not be issued" is to return it in `removed_resources`,
+   which per the Envoy docs also cancels the data plane's subscription for it.
+   The PoC does that, and Check 2 confirms it produces a clean handshake failure
+   with no lingering subscription.
+2. **This needs Envoy 1.37+.** `on_demand_secret` and `cert_mappers.sni` first
+   shipped in 1.37 — `extensions_build_config.bzl` has 0 matches in v1.35.13 and
+   v1.36.9, 3 in v1.37.5. On anything older the config is rejected outright.
+   `manifests/ate-install/atenet-router.yaml:177` currently pins
    `v1.30-latest`, so **the router's Envoy must be bumped before this design can
    ship**. The harness version-gates and fails with a clear message.
-3. **Open question #1 was already answerable from the docs**, and the PoC
+3. **Envoy's own documentation answers the expiry question**, and the PoC
    confirms it: *"A resource removal sent via the xDS response will cancel the
-   data plane subscription for the specific secret name."*
+   data plane subscription for the specific secret name."* There is no
+   client-side TTL to lean on; see question 1 above.
 
-## Two config requirements that are easy to miss
+## Three config details that fail silently
 
 - **`tls_inspector` is mandatory.** Without that listener filter Envoy never
   reads the ClientHello, so the `sni` mapper has nothing to map and every
@@ -435,16 +444,21 @@ is untouched. The two on-demand protos are only referenced from YAML.
 
 ## Security controls implemented
 
-From mint.md's list: hostname allowlist (`--allow`, and `sdsmintd` refuses to
-start without one), issuance audit log (one structured `slog` line per mint with
-host, serial, notAfter), short leaf TTLs (`--ttl`, default 5m), CA name
-constraints (`--ca-name-constraint`), local-only channel (unix socket, mode
-0600), and `crypto.Signer` indirection so the CA key can live in a KMS.
+A CA trusted by every actor is the most dangerous key in the system, so the
+controls against abusing it are part of the PoC rather than deferred: hostname
+allowlist (`--allow`, and `sdsmintd` refuses to start without one), issuance
+audit log (one structured `slog` line per mint with host, serial, notAfter),
+short leaf TTLs (`--ttl`, default 5m), CA name constraints
+(`--ca-name-constraint`, marked critical, so even a total compromise of this
+service cannot impersonate hosts outside the constrained domains), a local-only
+channel (unix socket, mode 0600 — leaf private keys transit it), and
+`crypto.Signer` indirection so the CA key can live in a KMS or HSM instead of a
+file.
 
 ## Non-goals
 
-This is not wired into `atenet-router` or any manifest, per the plan. The
-version gate above is a finding to report, not a change made here.
+This is deliberately not wired into `atenet-router` or any manifest. The version
+gate above is a finding to report, not a change to make here.
 
 ## Known rough edges
 
