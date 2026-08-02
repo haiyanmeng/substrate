@@ -59,6 +59,11 @@ The harness downloads `envoy-1.37.5-linux-x86_64` into `poc/sdsmint/__run/`
 and experiments below. `--forward-proxy` adds one leg that needs outbound
 internet. `--keep` leaves the processes up for poking at.
 
+[`SCALE-TESTING.md`](SCALE-TESTING.md) covers `run-scale.sh` in detail —
+prerequisites, what each phase isolates, `--full` versus the quick sweep, where
+the artefacts land, and the failure modes that are the machine rather than the
+code.
+
 Last full run: **16 passed, 0 failed** (Envoy 1.37.5, Linux x86-64).
 
 ## What it proves
