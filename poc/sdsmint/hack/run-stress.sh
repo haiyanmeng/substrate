@@ -104,8 +104,9 @@ load() {
 start_sds_real() {
   "${RUN_DIR}/sdsmintd" \
     --uds "${RUN_DIR}/sdsmint.sock" \
-    --ca-cert "${RUN_DIR}/ca.pem" \
-    --ca-key "${RUN_DIR}/ca-key.pem" \
+    --ca-pool "${RUN_DIR}/ca-pool.json" \
+    --ca-cert-out "${RUN_DIR}/ca.pem" \
+    --ca-name-constraint 'mitm.example' \
     --allow '*.mitm.example' \
     --cache-cap 200000 \
     --ttl 30m \
@@ -143,7 +144,7 @@ mkdir -p "${RUN_DIR}"
 
 ensure_envoy
 info "Building sdsmintd and sdsload"
-( cd "${REPO_ROOT}" && go build -o "${RUN_DIR}/sdsmintd" ./poc/sdsmint/cmd/sdsmintd )
+( cd "${REPO_ROOT}" && go build -o "${RUN_DIR}/sdsmintd" ./cmd/sdsmintd )
 ( cd "${REPO_ROOT}" && go build -o "${RUN_DIR}/sdsload" ./poc/sdsmint/cmd/sdsload )
 
 if [[ ! -s "${RUN_DIR}/ca.pem" ]]; then

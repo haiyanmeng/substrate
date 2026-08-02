@@ -12,11 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Production egress MITM gateway: on-demand per-SNI certificate minting.
+# GENERIC REFERENCE: egress MITM with on-demand per-SNI certificate minting.
 #
-# This is the deployable form of the design. The files in ../testdata are PoC
-# scaffolding -- two of them deliberately broken to demonstrate a failure mode.
-# This one is meant to run.
+# NOT THE SUBSTRATE GATEWAY. For that, see
+# manifests/ate-install/atenet-egress.yaml, which is the deployed topology and
+# the source of truth: mTLS HTTP CONNECT on the front door, an internal
+# listener behind it for the MITM leg, and sdsmintd as a native sidecar. The
+# two configs differ in how traffic *arrives* (see "What still has to be
+# decided" below) -- everything from the on_demand_secret selector inward is
+# the same, and this file is the more heavily commented of the two.
+#
+# Kept here because the reasoning below is generic: it applies to any topology
+# that MITMs egress with a minted leaf, not just substrate's. The files in
+# ../testdata are PoC scaffolding -- two of them deliberately broken to
+# demonstrate a failure mode. This one is meant to run.
 #
 # REQUIRES ENVOY 1.37 OR NEWER. on_demand_secret and cert_mappers.sni do not
 # exist in 1.36 or earlier, and the config is rejected outright on older
@@ -49,8 +58,49 @@
 # Co-located sdsmintd, sharing an emptyDir at /var/run/sdsmint:
 #
 #   sdsmintd --uds /var/run/sdsmint/sdsmint.sock \
-#            --ca-cert ... --ca-key ... --ttl 5m --idle 30m \
+#            --ca-pool /run/ca-state/mitm-pool.json \
+#            --ca-id mitm \
+#            --ca-intermediate-ttl 12h \
+#            --ttl 5m --idle 30m \
 #            --allow '*.example.com' --allow 'api.partner.net' ...
+#
+# --ca-pool takes an internal/localca pool JSON: the same format, the same
+# creation command, and the same projected-Secret mount that podcertcontroller
+# and ate-api-server already use for their CAs. Create the Secret with
+#
+#   kubectl-ate admin make-ca-pool \
+#     --ca-id=mitm --name=mitm-ca-pool --secret-namespace=<ns> \
+#     --key-type=ecdsa-p256 \
+#     --common-name='<org> egress MITM CA' \
+#     --permitted-dns-domain=example.com \
+#     --permitted-dns-domain=api.partner.net \
+#     --max-path-len=1
+#
+# and project it in exactly as pod-certificate-controller.yaml does:
+#
+#   volumes:
+#   - name: ca-state
+#     projected:
+#       sources:
+#       - secret:
+#           name: mitm-ca-pool
+#           items: [{key: pool, path: mitm-pool.json}]
+#
+# --permitted-dns-domain is not optional: sdsmintd refuses an unconstrained CA.
+# --max-path-len=1 is required only if you use --ca-intermediate-ttl, but there
+# is no reason not to set it -- the alternative default is an unlimited chain.
+# --key-type=ecdsa-p256 rather than substrate's usual Ed25519 because these
+# leaves are validated by whatever HTTP client an actor happens to run.
+#
+# Mount this Secret ONLY in the egress sidecar. Unlike substrate's other three
+# CAs, every actor trusts this one, so read access to the pool is equivalent to
+# the ability to impersonate every host inside the constraint.
+#
+# Keep the mount read-only. sdsmintd generates a throwaway CA when --ca-pool
+# does not exist, which is a convenience for the PoC and a disaster in
+# production: on a read-only projected volume a missing Secret fails the write
+# and the process exits, which is what you want. On an emptyDir it would
+# silently come up on a self-signed CA nobody trusts.
 #
 # sdsmintd refuses to start without at least one --allow. The allowlist is the
 # primary control against a MITM CA that can mint for anything; see
@@ -72,12 +122,36 @@
 # What still has to be decided before this is safe
 # ---------------------------------------------------------------------------
 #
-#  * How traffic arrives. This is a transparent MITM listener -- it expects
-#    actor traffic redirected to :8443, e.g. by iptables REDIRECT from an init
-#    container. It is NOT an HTTP CONNECT proxy.
-#  * Where the CA key lives. A file is the PoC answer. sdsmintd takes a
-#    crypto.Signer, so a KMS/HSM signer drops in and is strongly preferred:
-#    this key can mint a trusted leaf for any allowlisted name.
+#  * How traffic arrives. This file is a transparent MITM listener -- it
+#    expects actor traffic redirected to :8443, e.g. by iptables REDIRECT from
+#    an init container. It is NOT an HTTP CONNECT proxy, and so it is NOT the
+#    shape substrate uses: internal/atunnel dials the gateway explicitly and
+#    speaks HTTP/1.1 CONNECT over mTLS, which carries the actor's identity in
+#    X-Ate-* headers that a transparent redirect has nowhere to put.
+#    manifests/ate-install/atenet-egress.yaml wraps this same MITM listener in
+#    a CONNECT terminator to get that. Use this one only if you genuinely are
+#    redirecting traffic rather than proxying it.
+#  * Where the CA key lives. A pool Secret is the answer this config assumes,
+#    which is what the rest of substrate does and no worse. But it is a key
+#    that can mint a trusted leaf for any name inside its constraint, so two
+#    things are worth doing beyond that:
+#
+#      - --ca-intermediate-ttl. The root signs a short-lived intermediate held
+#        only in memory; leaves are signed by that. A stolen pod filesystem or
+#        a leaked heap yields an intermediate that expires on its own, not the
+#        root. Costs nothing on the signing path -- the intermediate is a local
+#        key, so a mint is still ~375us.
+#      - A KMS or HSM signer for the root. localca.CA.SigningKey is a
+#        crypto.Signer, so one substitutes without touching this code; substrate
+#        ships none, because picking one would mean picking a cloud. Note that a
+#        KMS signature is 10-50ms, so do this ONLY together with the
+#        intermediate above: the root then signs a handful of times a day
+#        instead of once per cache miss.
+#
+#    A CA with no name constraint is refused at startup. Overriding that with
+#    --ca-allow-unconstrained means the key can forge a certificate for any
+#    name on the internet that your actors will accept, which is a far larger
+#    exposure than where the file sits.
 #  * Who trusts the MITM CA. Every actor must have it in its trust store, and
 #    that bundle is now a very high-value target.
 #  * The egress_policy service below is the entire reason for terminating TLS.

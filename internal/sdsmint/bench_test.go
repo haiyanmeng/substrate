@@ -24,7 +24,7 @@ package sdsmint
 // makes the server slower rather than faster, which is the opposite of what
 // an operator would expect the flag to do.
 //
-//	go test ./poc/sdsmint/ -run XXX -bench . -benchmem
+//	go test ./internal/sdsmint/ -run XXX -bench . -benchmem
 
 import (
 	"context"
@@ -44,7 +44,10 @@ import (
 
 func benchCA(b *testing.B) *CA {
 	b.Helper()
-	ca, _, _, err := GenerateCA("sdsmint bench CA", time.Hour, nil)
+	// Unconstrained and root-signing on purpose: this is the configuration the
+	// numbers recorded in README.md were measured under, and a name constraint
+	// or a delegated intermediate would change what is being compared.
+	ca, _, err := GenerateCA("sdsmint bench CA", time.Hour, nil, Options{AllowUnconstrained: true})
 	if err != nil {
 		b.Fatalf("GenerateCA: %v", err)
 	}
@@ -106,6 +109,7 @@ func BenchmarkSignKeygen(b *testing.B) {
 // already in hand. This is the irreducible part.
 func BenchmarkSignCreateCertificate(b *testing.B) {
 	ca := benchCA(b)
+	iss := ca.current.Load()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		b.Fatal(err)
@@ -128,7 +132,7 @@ func BenchmarkSignCreateCertificate(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, key.Public(), ca.key); err != nil {
+		if _, err := x509.CreateCertificate(rand.Reader, tmpl, iss.cert, key.Public(), iss.key); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -139,6 +143,7 @@ func BenchmarkSignCreateCertificate(b *testing.B) {
 // but it is per-mint and it allocates.
 func BenchmarkSignEncode(b *testing.B) {
 	ca := benchCA(b)
+	iss := ca.current.Load()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		b.Fatal(err)
@@ -153,7 +158,7 @@ func BenchmarkSignEncode(b *testing.B) {
 		DNSNames:     []string{"a.example"},
 		NotBefore:    now.Add(-time.Minute),
 		NotAfter:     now.Add(5 * time.Minute),
-	}, ca.cert, key.Public(), ca.key)
+	}, iss.cert, key.Public(), iss.key)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -162,7 +167,7 @@ func BenchmarkSignEncode(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		chain := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
-		for _, der := range ca.chainDER {
+		for _, der := range iss.chainDER {
 			chain = append(chain, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
 		}
 		keyDER, err := x509.MarshalPKCS8PrivateKey(key)

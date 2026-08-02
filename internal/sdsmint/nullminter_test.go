@@ -26,6 +26,11 @@ import (
 
 func testNullMinter(t *testing.T, opts NullMinterOptions) *NullMinter {
 	t.Helper()
+	return testNullMinterWithCA(t, testCA(t), opts)
+}
+
+func testNullMinterWithCA(t *testing.T, ca *CA, opts NullMinterOptions) *NullMinter {
+	t.Helper()
 	if opts.Validate == nil {
 		opts.Validate = AllowGlobs([]string{"*.mitm.example"})
 	}
@@ -35,7 +40,7 @@ func testNullMinter(t *testing.T, opts NullMinterOptions) *NullMinter {
 	if opts.Logger == nil {
 		opts.Logger = quietLogger()
 	}
-	n, err := NewNullMinter(testCA(t), opts)
+	n, err := NewNullMinter(ca, opts)
 	if err != nil {
 		t.Fatalf("NewNullMinter: %v", err)
 	}
@@ -128,7 +133,16 @@ func TestNullMinterRequiresValidateAndHost(t *testing.T) {
 // rotation phases run a short rotation period against long-lived leaves,
 // because what is being measured is the push storm and not expiry.
 func TestNullMinterPoolTTLIsIndependent(t *testing.T) {
-	n := testNullMinter(t, NullMinterOptions{Pool: 1, TTL: 48 * time.Hour})
+	// The CA has to outlive the pool: Sign clamps a leaf to its issuer's
+	// NotAfter, so asking a one-hour CA for a 48-hour leaf yields a one-hour
+	// leaf. That clamp is correct -- a leaf outliving its issuer stops
+	// verifying partway through its stated life -- so the fixture grows rather
+	// than the assertion shrinking.
+	ca, _, err := GenerateCA("long-lived test CA", 72*time.Hour, []string{"example"}, Options{})
+	if err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
+	n := testNullMinterWithCA(t, ca, NullMinterOptions{Pool: 1, TTL: 48 * time.Hour})
 	if got := time.Until(n.Sample().NotAfter); got < 47*time.Hour {
 		t.Errorf("pre-signed leaf expires in %v; want the requested 48h", got)
 	}

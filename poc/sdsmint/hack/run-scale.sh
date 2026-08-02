@@ -121,10 +121,11 @@ sds_metric() {
 start_sds_null() {
   "${RUN_DIR}/sdsmintd" \
     --uds "${RUN_DIR}/sdsmint.sock" \
-    --ca-cert "${RUN_DIR}/ca.pem" \
-    --ca-key "${RUN_DIR}/ca-key.pem" \
+    --ca-pool "${RUN_DIR}/ca-pool.json" \
+    --ca-cert-out "${RUN_DIR}/ca.pem" \
+    --ca-name-constraint 'mitm.example,example.com' \
     --allow '*.mitm.example' \
-    --null-minter \
+    --unsafe-null-minter \
     --null-host '*.mitm.example' \
     --metrics-addr "127.0.0.1:${METRICS_PORT}" \
     --log-level warn \
@@ -140,8 +141,9 @@ start_sds_null() {
 start_sds_real() {
   "${RUN_DIR}/sdsmintd" \
     --uds "${RUN_DIR}/sdsmint.sock" \
-    --ca-cert "${RUN_DIR}/ca.pem" \
-    --ca-key "${RUN_DIR}/ca-key.pem" \
+    --ca-pool "${RUN_DIR}/ca-pool.json" \
+    --ca-cert-out "${RUN_DIR}/ca.pem" \
+    --ca-name-constraint 'mitm.example,example.com' \
     --allow '*.mitm.example' \
     --allow 'example.com' \
     --cache-cap 200000 \
@@ -274,13 +276,13 @@ note "open file limit: $(ulimit -n)   ephemeral ports: $(cat /proc/sys/net/ipv4/
 require_clean_ports
 
 info "Building sdsmintd and sdsload"
-( cd "${REPO_ROOT}" && go build -o "${RUN_DIR}/sdsmintd" ./poc/sdsmint/cmd/sdsmintd )
+( cd "${REPO_ROOT}" && go build -o "${RUN_DIR}/sdsmintd" ./cmd/sdsmintd )
 ( cd "${REPO_ROOT}" && go build -o "${RUN_DIR}/sdsload" ./poc/sdsmint/cmd/sdsload )
 
 info "Ensuring Envoy ${ENVOY_VERSION}"
 ensure_envoy
 cp "${POC_DIR}"/testdata/envoy-*.yaml "${RUN_DIR}/"
-rm -f "${RUN_DIR}/ca.pem" "${RUN_DIR}/ca-key.pem"
+rm -f "${RUN_DIR}/ca.pem" "${RUN_DIR}/ca-pool.json"
 
 # One CA and one pre-signed leaf for the whole run, so the control and the
 # on-demand arm serve certificates that are byte-identical.

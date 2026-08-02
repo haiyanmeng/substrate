@@ -21,6 +21,7 @@ resources:
   - ./atelet
   - ../atenet-dns.yaml
   - ../atenet-router.yaml
+  - ../atenet-egress.yaml
   - ../valkey.yaml
   - ../pod-certificate-controller.yaml
   - rustfs.yaml

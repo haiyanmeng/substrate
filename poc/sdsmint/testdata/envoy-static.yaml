@@ -22,7 +22,7 @@
 # later phases produce is the difference from this one. Without it, "a
 # handshake took 900us" is unattributable -- most of that is TLS, not SDS.
 #
-# The certificate is written by `sdsmintd --null-minter --null-cert-out`, so it
+# The certificate is written by `sdsmintd --unsafe-null-minter --null-cert-out`, so it
 # is literally one of the leaves the on-demand arm serves. That makes the
 # comparison change exactly one variable: the selector.
 #

@@ -106,22 +106,39 @@ Four files, roughly 200 lines of substance. Each layer adds one concern.
 keypair every call, `CN = SAN = host`, `IsCA=false`, `KeyUsage=DigitalSignature`,
 `EKU=ServerAuth`, `NotBefore` backdated a minute for clock skew. It returns
 `MintedCert{CertChainPEM, PrivateKeyPEM, NotAfter, Serial}` with the chain as
-`[leaf, CA]`.
+`[leaf, issuer...]` — `[leaf, CA]` normally, `[leaf, intermediate, root]` when
+signing is delegated.
 
-Two deliberate choices:
+Four deliberate choices:
 
 - **`key` is typed `crypto.Signer`, not `*ecdsa.PrivateKey`.** A KMS- or
-  HSM-backed signer substitutes without touching `Sign`. Getting the CA key out
-  of a file is the main production hardening step, and this is the seam that
-  makes it a drop-in rather than a rewrite.
+  HSM-backed signer substitutes without touching `Sign`. This is the seam that
+  makes getting the CA key out of a file a drop-in rather than a rewrite; the
+  same widening was made to `internal/localca.CA.SigningKey`, so it now applies
+  to all four of substrate's CAs rather than just this one.
+- **A CA with no name constraint is refused at startup.** Not warned about —
+  refused. `--ca-allow-unconstrained` overrides it and says in its help text
+  what that buys: a key that can forge a certificate for any name on the
+  internet. `GenerateCA` sets `PermittedDNSDomains` critical, so a client that
+  doesn't understand the constraint rejects the chain rather than ignoring the
+  limit it was handed.
+- **Leaf signing can be delegated to an in-memory intermediate.**
+  `Options.IntermediateLifetime` has the root issue a delegated signer,
+  re-issued at ~2/3 of its lifetime behind an `atomic.Pointer` so the `Sign` hot
+  path stays wait-free. It bounds a key compromise to the intermediate's
+  lifetime, and it is what makes a KMS root affordable — the root then signs a
+  couple of times a day instead of once per cache miss. It requires a root with
+  `pathLenConstraint >= 1`, which `NewCA` checks up front, because the
+  alternative is an opaque handshake failure much later.
 - **An IP literal in the SNI goes in `IPAddresses`, not `DNSNames`.** SNI isn't
   supposed to carry IP literals; some clients send them anyway, and a leaf with
   an IP in `DNSNames` is rejected.
 
-`GenerateCA` exists so the PoC can run without external key material. It supports
-`PermittedDNSDomains` (marked critical) — a name-constrained CA, so that even a
-total compromise of this service can't impersonate hosts outside the constrained
-domains.
+`FromPool` reads the CA out of an `internal/localca` pool — the format substrate
+already mounts its other CAs from. `GenerateCA` exists so the PoC can run
+without external key material; it defaults to P-256 rather than substrate's
+usual Ed25519, because these leaves are validated by whatever HTTP client an
+actor happens to run and Ed25519 in a chain needs OpenSSL 1.1.1+.
 
 ### `minter.go` — policy and cache in front of the key
 
@@ -292,7 +309,7 @@ fails.
 
 ## 8. How it's tested
 
-**Unit** (`go test ./poc/sdsmint/...`, 54 tests, race-enabled): CA round-trips
+**Unit** (`go test ./internal/sdsmint/...`, 54 tests, race-enabled): CA round-trips
 and leaf shape; cache hit/expiry/eviction/concurrency; allowlist semantics
 including the one-label wildcard. `server_test.go` drives the delta protocol
 through fake gRPC streams — subscribe, refuse, bare ACK, rotation, unsubscribe,

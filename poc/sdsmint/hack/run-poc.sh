@@ -89,8 +89,9 @@ start_sds() {
   local ttl="$1"; shift
   "${RUN_DIR}/sdsmintd" \
     --uds "${RUN_DIR}/sdsmint.sock" \
-    --ca-cert "${RUN_DIR}/ca.pem" \
-    --ca-key "${RUN_DIR}/ca-key.pem" \
+    --ca-pool "${RUN_DIR}/ca-pool.json" \
+    --ca-cert-out "${RUN_DIR}/ca.pem" \
+    --ca-name-constraint 'mitm.example,example.com' \
     --ttl "${ttl}" \
     --allow 'default.mitm.example' \
     --allow '*.mitm.example' \
@@ -112,13 +113,13 @@ bold "=== PoC: on-demand per-SNI certificate minting ==="
 mkdir -p "${RUN_DIR}"
 
 info "Building sdsmintd"
-( cd "${REPO_ROOT}" && go build -o "${RUN_DIR}/sdsmintd" ./poc/sdsmint/cmd/sdsmintd )
+( cd "${REPO_ROOT}" && go build -o "${RUN_DIR}/sdsmintd" ./cmd/sdsmintd )
 
 info "Ensuring Envoy ${ENVOY_VERSION}"
 ensure_envoy
 
 cp "${POC_DIR}"/testdata/envoy-bootstrap*.yaml "${RUN_DIR}/"
-rm -f "${RUN_DIR}/ca.pem" "${RUN_DIR}/ca-key.pem"
+rm -f "${RUN_DIR}/ca.pem" "${RUN_DIR}/ca-pool.json"
 
 ################################################################################
 info "Bringing up sdsmintd + Envoy (hermetic bootstrap)"

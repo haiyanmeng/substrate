@@ -24,10 +24,30 @@ answers are below, along with the findings that changed the design.
 connection lifecycle, and a walkthrough of the code. This file covers what it
 proves.
 
+## Where the code went
+
+The PoC answered its questions, so the Go code graduated out of `poc/` and now
+ships in an image. Everything below still holds — the measurements were taken
+against this code — but the files have moved:
+
+- `poc/sdsmint/*.go` → **`internal/sdsmint/`** (package name unchanged)
+- `poc/sdsmint/cmd/sdsmintd/` → **`cmd/sdsmintd/`**, built by `make build-images`
+- the deployed gateway → **`manifests/ate-install/atenet-egress.yaml`**
+
+What stayed here is the part that is still a PoC: this file and
+[EXPLAINER.md](EXPLAINER.md), the harnesses in `hack/`, the Envoy fixtures in
+`testdata/`, the generic reference config in `deploy/`, and `cmd/sdsload/`
+(measurement code, deliberately not in `ko build`).
+
+One caveat carried over from the move: `--null-minter` is now
+`--unsafe-null-minter`. It serves a pre-signed *shared* leaf so a load test
+measures Envoy rather than the signer, which was a harness affordance and is a
+production footgun now that the binary ships. It logs at Error level when set.
+
 ## Running it
 
 ```sh
-go test ./poc/sdsmint/...          # unit tests, no Envoy needed
+go test ./internal/sdsmint/...     # unit tests, no Envoy needed
 ./poc/sdsmint/hack/run-poc.sh      # hermetic end-to-end: 14 assertions
 ./poc/sdsmint/hack/run-poc.sh --forward-proxy   # + real MITM of example.com: 16
 ./poc/sdsmint/hack/run-scale.sh    # scalability phases 0-7 (see below)
@@ -175,7 +195,7 @@ Two distinct behaviours, and the second one is the finding that matters:
 
 ## What it costs
 
-`go test ./poc/sdsmint/ -run XXX -bench . -benchmem` — numbers below are the
+`go test ./internal/sdsmint/ -run XXX -bench . -benchmem` — numbers below are the
 mean of three rounds on an Intel Core Ultra 7 165U (14 threads), Linux x86-64.
 They are here to size a deployment, not to be a leaderboard; re-measure on the
 target hardware before believing any absolute figure.
@@ -306,7 +326,7 @@ turns out to be where the limits are.
 ```
 
 Nine phases, each isolating one question. Phases 0–2 and 4–7 run
-`sdsmintd --null-minter`, which serves pre-signed wildcard leaves: a mint costs
+`sdsmintd --unsafe-null-minter`, which serves pre-signed wildcard leaves: a mint costs
 ~375 µs and would swamp everything Envoy does, so the signer is removed from the
 measurement rather than measured through. Phase 3 is the exception — the signer
 is its subject. Phase 0 is a static-certificate control on an otherwise
@@ -556,40 +576,130 @@ Phase 8 (`dynamic_forward_proxy` with a real origin) is opt-in and excluded from
 the default set: real DNS and a real upstream add variance that would pollute
 every comparison above.
 
+### Measuring the deployed gateway: `sdsload --connect-via`
+
+Every number above was taken against a listener `sdsload` dialled directly.
+The deployed gateway is not reachable that way — its front door is mTLS
+CONNECT, and the MITM listener behind it has no socket at all. `--connect-via`
+drives it through that front door, using `internal/atunnel` rather than a
+hand-rolled CONNECT, because a load test that speaks a slightly different
+protocol measures something the actors never do.
+
+```sh
+sdsload --connect-via atenet-egress.ate-system.svc:443 \
+        --target 192.0.2.1:443 --sni example.com --count 1000
+```
+
+Run it from a pod that has a podidentity credential bundle; the defaults for
+`--connect-credential-bundle` and `--connect-trust-bundle` match the paths
+`cmd/ateom-gvisor` uses. `--connect-destination` defaults to `192.0.2.1:443`
+and has to be an IP — `atunnel` rejects hostnames, because in the real path the
+authority comes from `SO_ORIGINAL_DST`. It is not load-bearing: the gateway
+re-resolves from the inner SNI, so `--sni` is what decides where the traffic
+goes.
+
+**The dial number is not comparable to anything above.** In tunnel mode that
+bucket also contains the gateway's own TLS handshake and a CONNECT round trip,
+which is most of what is in it: a 50-connection run at 25/s against the shipped
+config measured **dial p50 4,668 µs** against a direct-dial baseline in the tens
+of microseconds. Handshake still means what it meant (p50 7,621 µs, in line with
+the cold-path numbers above, on a box also running Envoy, sdsmintd and the
+client). `--json-out` records `connect_via` for exactly this reason, so a saved
+tunnelled run cannot later be read as a direct-dial baseline.
+
+That run also confirms the gateway does through the tunnel what the harness
+proved directly: 50 cold SNIs produced `cert_requested +50`, so every connection
+minted its own leaf rather than sharing one; a name outside `--allow` failed all
+three attempts with `certificate request denied` server-side; and a client
+credential signed by a CA outside the podidentity trust bundle was refused at
+the front door before reaching the MITM leg at all.
+
 ## Deploying this for real
 
-**[`deploy/envoy-egress.yaml`](deploy/envoy-egress.yaml)** is the deployable
-config. Verified against Envoy 1.37.5: `--mode validate` clean with no
+**substrate deploys
+[`manifests/ate-install/atenet-egress.yaml`](../../manifests/ate-install/atenet-egress.yaml)**,
+not the file in `deploy/`. It differs in exactly one place — how traffic
+arrives. substrate's front door is mTLS HTTP/1.1 CONNECT, because that is what
+`internal/atunnel` speaks and it is the only way the actor's identity reaches
+the gateway; the MITM listener then hangs off it as an Envoy *internal*
+listener. Everything from `on_demand_secret` inward is the same config, and the
+combination was validated before the manifest was written (an internal listener
+was the one thing the PoC had never run `on_demand_secret` on).
+
+Two limitations of the deployed gateway, stated in its header and worth
+repeating: **it ships dormant** — nothing sets `EgressGatewayAddress`, so no
+actor routes to it, and `sdsload --connect-via` is how it gets exercised — and
+**there is no per-actor authorization**. `sdsmintd --allow` is a single
+cluster-wide allowlist. The mTLS check proves a caller is a substrate workload,
+not which actor it is; the `X-Ate-*` headers are metadata, not authentication.
+
+**[`deploy/envoy-egress.yaml`](deploy/envoy-egress.yaml)** stays as the generic
+reference for the transparent-redirect topology, and carries the longer
+commentary. Verified against Envoy 1.37.5: `--mode validate` clean with no
 deprecation warnings, and smoke-tested end to end — prefetch mints before first
 request, `example.com` is fetched through the MITM at HTTP 200 with the origin's
 real body, and the access log emits `sni=example.com` matching `authority`.
 
-What it does about each gap in the PoC bootstraps:
+What both do about each gap in the PoC bootstraps:
 
-| Gap | Production config |
-|---|---|
-| Connect timeout | `transport_socket_connect_timeout: 5s`. The one non-negotiable. |
-| Upstream | `dynamic_forward_proxy` with ALPN-negotiated `auto_config`. Avoids the cluster-level `upstream_http_protocol_options`, which is deprecated and slated for removal — it lives under `typed_extension_protocol_options` now. |
-| SDS socket | Absolute, `/var/run/sdsmint/sdsmint.sock`, on a shared `emptyDir`. |
-| Listen address | `0.0.0.0:8443`. Admin stays on loopback `9901`. |
-| Node identity | No `node:` block; supplied per-pod via `--service-node=$(POD_NAME).$(POD_NAMESPACE)`. |
-| Policy enforcement | `ext_proc` ahead of DNS resolution, `failure_mode_allow: false` so egress fails closed. |
-| Access logging | JSON to stdout, including `REQUESTED_SERVER_NAME` — the SNI the cert was minted for. |
-| Memory | `overload_manager` with a fixed-heap ceiling. An unbounded destination set means unbounded DNS entries *and* unbounded live secret subscriptions. |
-| Resilience | Circuit breakers on all three clusters, TLS 1.2 floor on both legs, connect-failure retries. |
+- **Connect timeout.** `transport_socket_connect_timeout: 5s` on the MITM
+  listener. The one non-negotiable — without it an SDS outage does not fail a
+  first-contact handshake, it pauses it forever.
+- **Upstream.** `dynamic_forward_proxy`, re-resolving from the request's own
+  authority so the name that was policed is the name that gets dialled. Both
+  configs spell the upstream protocol options under
+  `typed_extension_protocol_options`, because the cluster-level
+  `upstream_http_protocol_options` field is deprecated and slated for removal.
+- **SDS socket.** Absolute, `/var/run/sdsmint/sdsmint.sock`, on a shared
+  `emptyDir`. Nothing listens on TCP.
+- **Listen address.** `0.0.0.0:8443`. Admin stays on loopback `9901`, and
+  `sdsmintd --metrics-addr` on loopback `9091`.
+- **Access logging.** JSON to stdout. `atenet-egress.yaml` logs both legs,
+  because neither can see the whole picture: the CONNECT leg has the client
+  certificate and the `X-Ate-*` headers but only an IP for a destination, and
+  the MITM leg has `REQUESTED_SERVER_NAME` — the SNI the leaf was minted for —
+  but by then the peer certificate is Envoy's own.
+- **Memory.** `overload_manager` with a fixed-heap ceiling, plus a global
+  downstream connection limit. An unbounded destination set means unbounded DNS
+  entries *and* unbounded live secret subscriptions; `--idle` is what actually
+  bounds the second one, and this is the backstop.
+- **Resilience.** Circuit breakers on all three clusters, raised well above
+  Envoy's 1024 defaults on the two internal legs and kept tighter on the one
+  that faces the internet. On `sds_mint` the limit that matters is
+  `max_requests`, which caps concurrent DELTA_GRPC streams: hitting it refuses a
+  mint, which surfaces as a handshake failure indistinguishable from the
+  allowlist denying the name.
+
+Two rows where the two configs genuinely differ:
+
+- **Node identity.** `deploy/envoy-egress.yaml` omits the `node:` block and
+  expects `--service-node=$(POD_NAME).$(POD_NAMESPACE)`, because it assumes an
+  SDS server shared across pods. `atenet-egress.yaml` hardcodes it: sdsmintd is
+  a sidecar on a pod-local socket and keys subscription state per gRPC stream,
+  so two replicas sending the same id are talking to two different processes.
+- **Policy enforcement.** `deploy/envoy-egress.yaml` shows an `ext_proc` filter
+  ahead of DNS resolution with `failure_mode_allow: false`. `atenet-egress.yaml`
+  has none — the deployed gateway's only control is `sdsmintd --allow`, one
+  cluster-wide list. Per-actor policy is the follow-up, and it is the reason the
+  gateway ships dormant.
 
 **Four decisions the config cannot make for you**, all called out in its header:
-how traffic reaches the listener (it is a transparent MITM, not an HTTP CONNECT
-proxy); where the CA key lives (a KMS signer, not a file); who trusts the MITM
-CA, and how that bundle is protected; and whether `default_value` is the right
+how traffic reaches the listener (that file is a transparent MITM, not an HTTP
+CONNECT proxy — substrate answers this differently, see
+`manifests/ate-install/atenet-egress.yaml`); where the CA key lives (a `localca` pool Secret is the default; add
+`--ca-intermediate-ttl`, and a KMS signer for the root if you have one); who
+trusts the MITM CA, and how that bundle is protected; and whether
+`default_value` is the right
 answer for non-SNI clients versus rejecting them at the listener.
 
 ## Layout
 
 ```
-poc/sdsmint/
-  ca.go            CA, LoadCA, GenerateCA, Sign -> MintedCert. key is a
-                   crypto.Signer so a KMS/HSM signer drops in unchanged.
+internal/sdsmint/
+  ca.go            CA, FromPool, LoadCA, GenerateCA, Sign -> MintedCert. Key is
+                   a crypto.Signer so a KMS/HSM signer drops in unchanged;
+                   refuses a CA with no name constraint; optionally delegates
+                   leaf signing to a short-lived in-memory intermediate.
   minter.go        allowlist + issuance audit log, over the cache below
   cache.go         bounded LRU with per-entry reuse deadlines; recency list
                    plus expiry heap, so nothing is O(cache size) under the lock
@@ -600,16 +710,25 @@ poc/sdsmint/
                    phases measure Envoy instead of a P-256 signing loop
   metrics.go       nil-safe atomic counters behind --metrics-addr, alongside
                    net/http/pprof
-  cmd/sdsmintd/    the daemon; UDS by default, chmod 0600
-  cmd/sdsload/     open-loop TLS load generator: one SNI per connection,
-                   handshake timed apart from request, arrivals on a fixed
-                   timeline so saturation cannot hide as coordinated omission
   rotation_test.go the rotation-vs-cache clock invariant
   idle_test.go     --idle: what withdraws a name, what keeps one alive, and that
                    a withdrawn host is still reachable afterwards
   cache_test.go    structural invariants of the three structures agreeing
   bench_test.go    cost decomposition and cache-cap scaling
-  deploy/          envoy-egress.yaml         PRODUCTION. the one to deploy.
+
+cmd/sdsmintd/      the daemon; UDS by default, chmod 0600
+
+manifests/ate-install/
+  atenet-egress.yaml  the deployed gateway: mTLS CONNECT front door, internal
+                   listener for the MITM leg, sdsmintd as a native sidecar
+
+poc/sdsmint/
+  cmd/sdsload/     open-loop TLS load generator: one SNI per connection,
+                   handshake timed apart from request, arrivals on a fixed
+                   timeline so saturation cannot hide as coordinated omission.
+                   --connect-via drives the deployed gateway through its real
+                   CONNECT front door instead of dialling a listener directly
+  deploy/          envoy-egress.yaml         generic reference, transparent MITM
   testdata/        envoy-bootstrap.yaml      PoC; NO connect timeout, by design
                    -fwdproxy.yaml            PoC; real egress re-origination
                    -good.yaml                PoC; hermetic, + the connect timeout
@@ -631,12 +750,39 @@ A CA trusted by every actor is the most dangerous key in the system, so the
 controls against abusing it are part of the PoC rather than deferred: hostname
 allowlist (`--allow`, and `sdsmintd` refuses to start without one), issuance
 audit log (one structured `slog` line per mint with host, serial, notAfter),
-short leaf TTLs (`--ttl`, default 5m), CA name constraints
-(`--ca-name-constraint`, marked critical, so even a total compromise of this
-service cannot impersonate hosts outside the constrained domains), a local-only
-channel (unix socket, mode 0600 — leaf private keys transit it), and
-`crypto.Signer` indirection so the CA key can live in a KMS or HSM instead of a
-file.
+short leaf TTLs (`--ttl`, default 5m), and a local-only channel (unix socket,
+mode 0600 — leaf private keys transit it).
+
+The controls on the CA key itself are worth stating separately, because they are
+what bounds the damage when the allowlist and the audit log have both already
+failed:
+
+- **Name constraints are mandatory, not advisory.** `sdsmintd` refuses to start
+  on a CA carrying no critical `dNSName` constraint. Starting anyway takes an
+  explicit `--ca-allow-unconstrained`, whose help text says what it means: the
+  key can forge a certificate for any name on the internet. A constrained CA
+  that leaks is the difference between forging one vendor's API and forging
+  anyone's bank — worth more than any amount of care about where the key file
+  sits. `--ca-name-constraint` applies when generating; `kubectl-ate admin
+  make-ca-pool --permitted-dns-domain` is the equivalent for a real pool.
+- **The key is held the way substrate holds its other three CAs.** `--ca-pool`
+  takes an `internal/localca` pool JSON, the format `podcertcontroller` and
+  `ate-api-server` already mount from a projected Secret. No new custody
+  mechanism, no new thing to get wrong.
+- **A short-lived intermediate, held only in memory.** `--ca-intermediate-ttl`
+  has the root sign a delegated signer at ~2/3 of its lifetime and leaves signed
+  by that. It bounds a filesystem or heap compromise to the intermediate's
+  lifetime rather than the root's, and costs nothing measurable: the
+  intermediate is a local key, so a mint stays at the 374.6 µs measured above.
+  It needs a root with `pathLenConstraint >= 1`; `sdsmintd` says so by name
+  rather than letting the chain fail later inside a TLS handshake.
+- **`crypto.Signer` throughout**, now including `localca.CA.SigningKey`, so a
+  KMS or HSM signer substitutes for the root without touching any of this code.
+  Substrate ships no such signer — picking one would mean picking a cloud — so
+  this is the seam, not the implementation. Pair it with the intermediate: a KMS
+  signature is 10–50 ms against 374.6 µs local, a 30–100× regression on every
+  cache miss if the root signs leaves directly, but a non-event if it signs an
+  intermediate twice a day.
 
 ## Non-goals
 
