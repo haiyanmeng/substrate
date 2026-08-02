@@ -614,6 +614,40 @@ three attempts with `certificate request denied` server-side; and a client
 credential signed by a CA outside the podidentity trust bundle was refused at
 the front door before reaching the MITM leg at all.
 
+### The same run against a real cluster
+
+The paragraph above is a local run of the shipped config. The same six checks
+were then run against the gateway actually deployed on GKE — real
+`podCertificate` projections on both ends, the CA read from the cluster's
+`egress-mitm-ca-pool` Secret, `sdsload` as a Job in `ate-system`, and the client
+on a different node from the gateway. All six passed:
+
+- 50 cold SNIs at 25/s: `ok=50`, `failed=0`, `dropped=0`.
+- **dial p50 2,582 µs / p99 2,962 µs**; **handshake p50 2,776 µs / p99 3,586 µs**.
+  Both are *faster* than the single-box local run, which is the expected shape
+  rather than a surprise: there the client, Envoy and sdsmintd were competing
+  for the same cores.
+- `listener.mitm.on_demand_secret.cert_requested` went 57 → 107, so each of the
+  50 connections missed the cache and minted its own leaf.
+- Those 50 handshakes verified against the MITM root with no `--insecure`, so
+  Go checked both that the leaf chained to the cluster CA and that its SAN
+  matched the SNI. Per-SNI binding is measured, not assumed.
+- `blocked%d.invalid` failed 3/3, with `certificate request denied … no
+  allowlist pattern matches` in sdsmintd's log.
+- A self-signed client bundle failed 2/2 at the front door.
+
+`poc/sdsmint/__run/cluster-check.sh` is the harness. One caveat it encodes:
+`cert_requested` counts SDS round trips, so a second run over the same names
+measures Envoy's on-demand cache and reports zero mints. The script offsets
+`--sni-start` per run to keep the names cold.
+
+One deployment detail worth recording, because it costs an hour to rediscover:
+the Envoy readiness probe cannot be an `httpGet` with `host: 127.0.0.1`.
+kubelet issues that request from the *node's* network namespace, so it dials the
+node's loopback and gets `connection refused` forever while Envoy sits perfectly
+healthy. The manifest uses an `exec` probe over bash's `/dev/tcp` instead, which
+keeps the admin interface bound to pod loopback where it belongs.
+
 ## Deploying this for real
 
 **substrate deploys

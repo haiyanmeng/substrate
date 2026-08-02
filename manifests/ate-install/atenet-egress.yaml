@@ -569,11 +569,27 @@ spec:
           allowPrivilegeEscalation: false
           capabilities:
             drop: ["ALL"]
+        # An exec probe rather than httpGet, because the admin listener is bound
+        # to pod loopback and must stay there. A `host: 127.0.0.1` on an httpGet
+        # probe does not mean "loopback inside the pod": kubelet performs the
+        # request itself, from the node's network namespace, so it dials the
+        # node's own 127.0.0.1 and gets connection refused forever. The only
+        # httpGet that works here would need the admin interface bound to the
+        # pod IP, which exposes /quitquitquit and /config_dump to anything that
+        # can route to the pod. Running the check inside the container instead
+        # keeps the blast radius at zero.
+        #
+        # bash is the one thing this borrows from the upstream Envoy image; it
+        # has shipped in every envoyproxy/envoy tag to date, and /dev/tcp is a
+        # bash builtin, so nothing else needs to be installed. If a future base
+        # image drops it, the fallback is a dedicated /ready-only listener on
+        # the pod IP rather than opening up admin.
         readinessProbe:
-          httpGet:
-            path: /ready
-            port: 9901
-            host: 127.0.0.1
+          exec:
+            command:
+            - bash
+            - -c
+            - 'exec 3<>/dev/tcp/127.0.0.1/9901; printf "GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3; head -1 <&3 | grep -q "200 OK"'
           initialDelaySeconds: 2
           periodSeconds: 5
       volumes:
