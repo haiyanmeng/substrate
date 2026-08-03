@@ -79,6 +79,7 @@ function usage() {
   echo ""
   echo "  --create-jwt-authority-pool-secret     Create JWT authority pool secret"
   echo "  --create-actor-id-ca-pool-secret       Create actor ID CA pool secret"
+  echo "  --create-egress-mitm-ca-pool-secret    Create egress MITM CA pool secret"
   echo "  --create-podcertificate-controller-cas Create podcertificate controller CAs"
   echo "  --create-valkey-ca-certs-secret        Create Valkey CA certs secret"
   echo "  --create-api-server-env-vars           Create ate-api-server env vars"
@@ -275,6 +276,35 @@ create_actor_id_ca_pool_secret() {
     --secret-namespace=ate-system
 }
 
+# The MITM CA the egress gateway's sdsmintd sidecar signs per-SNI leaves with.
+#
+# --permitted-dns-domain is the backstop under the gateway's allowlist: the
+# allowlist is what sdsmintd agrees to mint, the name constraint is what the key
+# is cryptographically able to mint at all. Keep these values equal to the
+# --allow patterns in manifests/ate-install/atenet-egress.yaml. A leaf outside
+# the constraint is rejected by every verifier, so a mismatch surfaces as a
+# handshake failure rather than as a config error.
+#
+# --max-path-len=1 leaves room for the in-memory delegated signing intermediate
+# that --ca-intermediate-ttl creates. Without it the root would have to sign
+# every leaf itself, which is the difference between a future KMS-backed root
+# signing a few times a day and signing once per cache miss.
+#
+# ecdsa-p256 rather than the ed25519 default: these leaves are validated by
+# arbitrary clients inside actor sandboxes, where Ed25519 support cannot be
+# assumed.
+create_egress_mitm_ca_pool_secret() {
+  log_step "create_egress_mitm_ca_pool_secret"
+  run_kubectl_ate admin make-ca-pool \
+    --ca-id="mitm" \
+    --name="egress-mitm-ca-pool" \
+    --secret-namespace=ate-system \
+    --key-type=ecdsa-p256 \
+    --common-name="substrate egress MITM CA" \
+    --permitted-dns-domain=example.com \
+    --max-path-len=1
+}
+
 create_podcertificate_controller_cas() {
   log_step "create_podcertificate_controller_cas"
   run_kubectl create namespace podcertificate-controller-system || true
@@ -405,6 +435,7 @@ deploy_ate_system() {
   run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=120s
   run_kubectl rollout status deployment/ate-controller -n ate-system --timeout=120s
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
+  run_kubectl rollout status deployment/atenet-egress -n ate-system --timeout=120s
   run_kubectl rollout status statefulset/valkey-cluster -n ate-system --timeout=120s
   run_kubectl rollout status daemonset/atelet -n ate-system --timeout=120s
 }
@@ -420,6 +451,11 @@ ensure_apiserver_prerequisites() {
     || create_podcertificate_controller_cas
   run_kubectl get secret -n ate-system valkey-ca-certs >/dev/null 2>&1 \
     || create_valkey_ca_certs_secret
+  # The egress gateway's sdsmintd sidecar projects this read-only. A missing
+  # secret makes the volume unmountable and the pod never starts, so it has to
+  # exist before the ate-system manifests are applied.
+  run_kubectl get secret -n ate-system egress-mitm-ca-pool >/dev/null 2>&1 \
+    || create_egress_mitm_ca_pool_secret
   run_kubectl get configmap -n ate-system ate-api-server-envvars >/dev/null 2>&1 \
     || create_api_server_env_vars
 }
@@ -476,8 +512,16 @@ deploy_atenet() {
   router_manifest="$(render_atenet_router_manifest)"
   echo "${router_manifest}" | run_kubectl apply -f -
 
+  # The egress gateway's sdsmintd sidecar projects this secret read-only. A
+  # missing secret makes the volume unmountable and the pod never starts, so
+  # create it before the Deployment rather than alongside it.
+  run_kubectl get secret -n ate-system egress-mitm-ca-pool >/dev/null 2>&1 \
+    || create_egress_mitm_ca_pool_secret
+
   run_ko apply -f manifests/ate-install/atenet-dns.yaml
+  run_ko apply -f manifests/ate-install/atenet-egress.yaml
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
+  run_kubectl rollout status deployment/atenet-egress -n ate-system --timeout=120s
   # The Deployment in atenet-dns.yaml is named "dns"; every other resource in
   # that file is "atenet-dns". Waiting on the filename rather than the actual
   # Deployment made this step fail with NotFound on every successful deploy.
@@ -734,6 +778,7 @@ while [[ "$#" -gt 0 ]]; do
 
     --create-jwt-authority-pool-secret) create_jwt_authority_pool_secret ;;
     --create-actor-id-ca-pool-secret) create_actor_id_ca_pool_secret ;;
+    --create-egress-mitm-ca-pool-secret) create_egress_mitm_ca_pool_secret ;;
     --create-podcertificate-controller-cas) create_podcertificate_controller_cas ;;
     --create-valkey-ca-certs-secret) create_valkey_ca_certs_secret ;;
     --create-api-server-env-vars) create_api_server_env_vars ;;
