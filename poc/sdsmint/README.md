@@ -330,7 +330,7 @@ turns out to be where the limits are.
 ./poc/sdsmint/hack/run-scale.sh --phases 1,6
 ```
 
-Nine phases, each isolating one question. Phases 0–2 and 4–7 run
+Eleven phases, each isolating one question. Phases 0–2 and 4–7 run
 `sdsmintd --unsafe-null-minter`, which serves pre-signed wildcard leaves: a mint costs
 ~375 µs and would swamp everything Envoy does, so the signer is removed from the
 measurement rather than measured through. Phase 3 is the exception — the signer
@@ -374,6 +374,10 @@ Untreated, memory for an egress proxy fronting arbitrary destinations is a
 function of **every host ever contacted since the process started**, not of the
 working set: 10k hosts ≈ 600 MB, 50k ≈ 3 GB.
 
+Phase 9 has since taken that projection to 100,000 names and it holds almost
+exactly — but it turns out to have been counting half the pod. See
+[What 100,000 live secrets actually cost](#what-100000-live-secrets-actually-cost).
+
 **This is now fixed server-side.** `sdsmintd --idle <duration>` withdraws names
 the proxy has stopped asking for, via `removed_resources`. Phase 6 runs both
 arms over the same 3,000-name fill and the difference is unambiguous:
@@ -413,14 +417,113 @@ nobody has *asked* for recently is a name nobody needs. The bet is cheap to lose
 which is what makes it takeable — and it is asserted in the harness rather than
 assumed, because a broken re-fetch would be invisible in the memory curve.
 
+### What 100,000 live secrets actually cost
+
+Phases 9 and 10 are opt-in and sized by `$NAMES` rather than by `--full`. They
+are the only phases that measure **sdsmintd** rather than Envoy, and the only
+ones that read CPU at all:
+
+```sh
+NAMES=100000 ./poc/sdsmint/hack/run-scale.sh --phases 9,10   # ~18 min, ~10 GB
+```
+
+Filling to 100,000 names at 500/s against the **real signer**, rotation off:
+
+| live secrets | Envoy RSS | sdsmintd RSS | goroutines |
+|---|---|---|---|
+| 0 | 59 MB | 16 MB | 7 |
+| 25,000 | 1,479 MB | 1,029 MB | 75,082 |
+| 50,000 | 2,888 MB | 1,998 MB | 150,154 |
+| 75,000 | 4,307 MB | 3,030 MB | 225,229 |
+| 100,000 | 5,712 MB | 3,973 MB | 300,301 |
+
+- **Envoy: 59,271 B per secret, and the marginal cost never moves** — 59,589 /
+  59,099 / 59,494 / 58,934 B across the four steps. The ~60 KB first measured at
+  3,000 names is the same number at 100,000, i.e. dead linear across a 500×
+  range. It is the most stable figure in this repo.
+- **sdsmintd: 41,586 B per secret**, which nothing here had measured before.
+  This is not certificates — `--cache-cap` bounds those. It is the *stream*:
+  three goroutines and a gRPC stream per live name. 300,301 goroutines for
+  100,000 streams is 3.003 apiece, exactly what `server.go` implies.
+- **So the pod costs ~1.7× what the Envoy figure alone predicts**: 5.7 GB of
+  Envoy plus 4.0 GB of sdsmintd, 9.7 GB for 100,000 names. Every previous
+  estimate in this repo sized Envoy and treated the SDS server as a rounding
+  error.
+
+**Idle CPU**, measured over 30 s of complete quiet at 100,000 live secrets —
+the measurement no other phase takes:
+
+- **sdsmintd: 0 ms.** Not "small", unmeasurable. 300,301 goroutines parked on
+  channels cost nothing to keep, which is the good half of finding #1: the
+  per-stream model is expensive in memory and free in CPU.
+- **Envoy: 125 ms of CPU per wall-second** — 12.5% of a core to hold 100,000
+  idle streams with nothing arriving at all. That is a floor a real workload
+  sits on top of, not a cost that overlaps with it.
+
+**Rotation** (`--rotate --ttl 5m`, the deployed default) at 100,000 live
+secrets, watched for 420 s:
+
+- **507 mints/s and 507 pushes/s, sustained, indefinitely, with zero traffic.**
+  A stream re-mints at 2/3 TTL and every name owns its own ticker, so this
+  arrives as a continuous rate rather than as a periodic storm — the ticks are
+  smeared across however long the fill took. Fill faster than 200 s and they
+  bunch instead: the same run peaked at 681/s in one 15 s window.
+- **sdsmintd 128% of a core and Envoy 73% of a core, purely to keep the set
+  alive.** 302 s of sdsmintd's 540 s of CPU was P-256 signing.
+- Envoy accepted every one of the 213,225 rotated secrets. No NACKs.
+- **But a new name took 5.65 s at the median to be served** while that ran, and
+  nothing failed. An assertion on failures alone calls that a pass, which is
+  what the harness originally did; it now fails a median above one second.
+  Rotation at this size does not coexist with new work, it starves it.
+
+One earlier answer needs correcting. Phase 2 reports first contact as flat, and
+it is — to 3,000 names. Across the phase 9 fill, at a fixed 500/s arrival rate,
+cold-handshake p50 went **8.1 ms at 25,000 live → 15.3 ms at 50,000 → 154.6 ms
+at 75,000 → 233.6 ms at 100,000**, a 29× spread with p99 reaching 1.86 s. The
+live-set size does eventually cost lookups; 3,000 is just nowhere near where it
+starts.
+
+### The deployed pod dies at 6,000 names, and sdsmintd is why
+
+The numbers above come from a workstation with 62 GB and no cgroup.
+`poc/sdsmint/__run/pod-ceiling.sh` ramps the **deployed** `atenet-egress` pod in
+500-name steps until something sheds or dies. It is not committed — like
+`cluster-check.sh` it lives in the gitignored `__run/`, because it is specific
+to one cluster and it deliberately kills a container.
+
+- **The local curve transfers.** Envoy cost ~63,500 B/secret in the pod against
+  59,271 B/secret locally, within 7% across a different CPU, kernel and
+  allocator.
+- **sdsmintd was OOM-killed between 5,500 and 6,000 live secrets**, against its
+  256Mi limit. At 5,501 names it was already at 249 MiB.
+- **Envoy was at 351 MiB of its 768 MiB `fixed_heap` ceiling at that moment** —
+  `fixed_heap.pressure` 43, `shrink_heap` never fired, `stop_accepting_requests`
+  never fired. The overload manager is guarding the container that was not going
+  to die. It is tuned to shed load at roughly 11,500 names; the pod is destroyed
+  at just over half that, in the sidecar, which has no shed path of any kind.
+- **And it does not recover on its own.** sdsmintd dying does not restart Envoy,
+  so Envoy keeps all 6,001 secrets and replays every one of them on reconnect —
+  phase 7's thundering herd, now in production form. The replay rebuilds
+  sdsmintd to 6,001 streams over about four minutes and OOM-kills it again.
+  Observed restart counts went 2 → 3 → 4 → 5 over sixteen minutes on a ~5-minute
+  cycle, alternating `2/2 Running` with `Init:OOMKilled`. Clearing it needs the
+  pod deleted so that Envoy loses the set; `--idle 30m` cannot help, because
+  sdsmintd never survives long enough to reach the timeout, and each restart
+  resets it.
+
+The manifest's own sizing note reasons from the Envoy figure alone and concludes
+the 1Gi/768Mi pair is the binding constraint. It is not: **the 256Mi on
+sdsmintd is**, at less than half the count, and the failure it produces is a
+crash loop rather than graceful shedding.
+
 ### The rest
 
 | Phase | Question | Answer |
 |---|---|---|
-| 2 | Does first contact slow down as the live set grows? | **No.** Cold-fetch p50 was 6,535 µs at 200 live and 6,629 µs at 3,000 — flat. Lookup is not the problem. |
+| 2 | Does first contact slow down as the live set grows? | **Not at this size.** Cold-fetch p50 was 6,535 µs at 200 live and 6,629 µs at 3,000 — flat. It stops being flat well above that: phase 9 measured 8.1 ms at 25,000 and 233.6 ms at 100,000. |
 | 3 | Where does minting saturate? | Every offered rate to **500/s was fully served, zero failures**, at ~650 µs/sign. The tail is what moves: handshake p99 goes 8,967 µs → 28,860 µs (3.2×) from 50/s to 500/s while p50 barely changes. Capacity-plan against the p99 knee, not the throughput one. |
 | 4 | What does the selector cost on a cache hit? | **Nothing measurable.** p50 deltas vs the control were −2 µs at `--concurrency 1` and −130 µs at 4, i.e. below this harness's resolution. No sign of contention on the shared secret cache. |
-| 5 | What does a rotation tick cost? | At 500 live names, 999 pushes reached the data plane, per-stream cost ≤ 1 ms, largest response 1,705 B, no NACKs, and concurrent handshakes were undisturbed (p99 3,588 µs). But one stream per secret means a tick is **N independent sign-and-push operations** — at 50k live names, 50k signatures per tick. |
+| 5 | What does a rotation tick cost? | At 500 live names, 999 pushes reached the data plane, per-stream cost ≤ 1 ms, largest response 1,705 B, no NACKs, and concurrent handshakes were undisturbed (p99 3,588 µs). But one stream per secret means a tick is **N independent sign-and-push operations** — at 50k live names, 50k signatures per tick. Phase 10 measures this at production settings: 100k live names at `--ttl 5m` is **507 signatures/second, sustained, with no traffic**. |
 | 7 | What does an SDS restart cost? | Warm names kept serving with SDS fully down (200/200, p99 3,569 µs) — no per-connection dependency. On restart Envoy replayed **2,997 names across 2,997 separate requests**, first at +306 ms, settled by +20 s. With a real signer that burst is N mints, not N cache hits. |
 
 ### Sustained load at 500/s
@@ -832,11 +935,22 @@ gate above is a finding to report, not a change to make here.
 
 - `sdsmintd`'s cache is per-process; a replicated deployment mints once per
   replica. Fine for the PoC, worth deciding on before it ships.
-- The rotation timer pushes to every live subscription on one shared ticker
-  rather than per-name deadlines. Response size turned out not to be the
-  problem — Envoy's one-stream-per-secret model means one resource per message —
-  but the tick is N independent signatures, so at 50k live names it is 50k mints
-  in a burst on a shared ticker. Per-name deadlines would spread it.
+- Rotation has no ceiling and no backpressure. Response size turned out not to
+  be the problem — Envoy's one-stream-per-secret model means one resource per
+  message — but the tick is N independent signatures. The ticker is per *stream*
+  rather than shared, so they do spread out on their own (phase 10 measured a
+  continuous 507/s at 100k names, not a burst); what is missing is any bound on
+  the resulting rate, and any way for a saturated signer to make new work take
+  priority over re-signing. At 100k names rotation alone is 1.28 cores and a new
+  name waits 5.65 s.
+- **sdsmintd's memory is a function of the live name count and nothing bounds
+  it.** ~41.6 KB per name, three goroutines and a stream apiece. There is no
+  equivalent of Envoy's overload manager, so the container does not shed, it
+  OOMs — at ~6,000 names against the deployed 256Mi. Worse, Envoy replays its
+  whole set to the replacement, which re-OOMs it: the observed failure is a
+  crash loop that only a pod delete clears. A memory-pressure path that refuses
+  *new* subscriptions while continuing to serve existing ones is the missing
+  piece.
 - `--idle` defaults to **off**, which is the unbounded-growth behaviour. That is
   deliberate for a PoC — it keeps the control arm of phase 6 available and does
   not change what `run-poc.sh` measures — but any real deployment should set it,

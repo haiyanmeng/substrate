@@ -120,6 +120,29 @@ rss_kb() {
   awk '/^VmRSS:/ {print $2; found=1} END {if (!found) print 0}' "/proc/${pid}/status"
 }
 
+# cpu_ms PID prints the total CPU a process has consumed, user plus system, in
+# milliseconds -- or 0 if it is gone. Milliseconds rather than seconds because
+# the callers subtract two readings and bash has no floats.
+#
+# The field offsets in /proc/PID/stat are counted from the END of the comm
+# field, not from the start of the line: comm is the executable name in
+# parentheses and may itself contain spaces and parentheses, which would shift
+# every subsequent column. Splitting on the last ") " is the documented way to
+# parse this file, and awk's greedy match gives it for free.
+cpu_ms() {
+  local pid="$1"
+  [[ -n "${pid}" && -r "/proc/${pid}/stat" ]] || { printf '0\n'; return; }
+  local tck
+  tck="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+  awk -v tck="${tck}" '
+    {
+      sub(/^.*\) /, "")     # drop pid and comm, leaving state as field 1
+      # utime and stime are fields 14 and 15 of the original line, i.e. 12 and
+      # 13 once pid, comm and the trailing space are gone.
+      printf "%d\n", (($12 + $13) * 1000) / tck
+    }' "/proc/${pid}/stat" 2>/dev/null || printf '0\n'
+}
+
 # require_clean_ports refuses to start when something is already listening on
 # the ports or socket this harness uses.
 #
@@ -150,9 +173,17 @@ require_clean_ports() {
 }
 
 # stat_value NAME prints the current value of an Envoy stat, or 0 if absent.
+#
+# The 30s timeout is not generosity, it is a bug fix. /stats renders every
+# counter Envoy has, and the on-demand selector adds several per live secret;
+# at 100k names the document is large enough that the former 5s ceiling cut the
+# transfer off. curl then exited non-zero, the `|| true` swallowed it, and this
+# returned 0 -- which is indistinguishable from "the counter did not move". A
+# phase 10 run reported cert_updated=+0 across 213,000 pushed rotations that
+# way, and it read as a finding about Envoy rather than about the harness.
 stat_value() {
   local raw
-  raw="$(curl -s --max-time 5 "127.0.0.1:${ADMIN_PORT}/stats" 2>/dev/null || true)"
+  raw="$(curl -s --max-time 30 "127.0.0.1:${ADMIN_PORT}/stats" 2>/dev/null || true)"
   local v
   v="$(printf '%s\n' "${raw}" | awk -F': ' -v n="$1" '$1 == n {print $2}' | tail -1)"
   if [[ "${v}" =~ ^[0-9]+$ ]]; then printf '%s\n' "${v}"; else printf '0\n'; fi

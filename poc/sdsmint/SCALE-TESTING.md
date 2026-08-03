@@ -26,6 +26,10 @@ wall-clock time:
 4. **`__run/cluster-check.sh`** — the deployed gateway on a real cluster, driven
    through its mTLS CONNECT front door with `sdsload --connect-via`. Correctness
    and a handful of latencies, not a scale sweep.
+5. **`__run/pod-ceiling.sh`** — the same deployed gateway, ramped until a
+   container dies. The only thing here that measures the *pod* rather than the
+   processes, and the only one that is destructive. See
+   [Finding the deployed pod's ceiling](#finding-the-deployed-pods-ceiling).
 
 ## Prerequisites
 
@@ -48,6 +52,8 @@ wall-clock time:
   both the fd limit and the ephemeral port range come into play. The run prints
   what it actually got; if that line says 1024, the high-rate phases will report
   failures that are the box's, not Envoy's.
+- **RAM, for phases 9 and 10 only.** At the default `NAMES=100000` the pair
+  needs about 10 GB free. The other phases fit comfortably in under 1 GB.
 - **An otherwise idle machine**, if you intend to quote the numbers. A sweep run
   alongside other work reproduced every *shape* but inflated the tails badly:
   phase 3's p99 at 500/s went from 28.9 ms to 285 ms.
@@ -64,6 +70,8 @@ export PATH="$PATH:$HOME/go/bin"
 ./poc/sdsmint/hack/run-scale.sh --phases 0,1,6   # a subset
 ./poc/sdsmint/hack/run-scale.sh --keep           # leave Envoy and sdsmintd up
 ./poc/sdsmint/hack/run-scale.sh --help
+
+NAMES=100000 ./poc/sdsmint/hack/run-scale.sh --phases 9,10   # 100k, both arms
 ```
 
 The script builds what it needs on every run — `./cmd/sdsmintd` and
@@ -100,7 +108,7 @@ Useful for poking at a live process with the exact state a phase left it in.
 Remember to kill them before the next run, or `require_clean_ports` will refuse
 to start.
 
-## The nine phases
+## The eleven phases
 
 Each isolates one question. `--phases` takes any comma-separated subset.
 
@@ -122,6 +130,74 @@ Each isolates one question. `--phases` takes any comma-separated subset.
   origin. **Opt-in, not in the default set**: real DNS and a real origin add
   variance that would pollute every other number. Run it with
   `--phases 8` to confirm nothing changes qualitatively, not to get a figure.
+- **9 — holding `$NAMES` secrets.** CPU *and* memory for **both** processes
+  while filling to `$NAMES` (default 100,000), rotation off, real signer. Then
+  30 s of complete quiet, which is the only measurement in the harness of what
+  it costs to merely *hold* a live set.
+- **10 — rotation at `$NAMES`.** The same fill with `--rotate --ttl 5m`, the
+  deployed default, watched for two full rotation intervals. Reports sustained
+  signatures/second and the cores that costs, and checks that a *new* name can
+  still be served while it runs.
+
+### Phases 9 and 10 in particular
+
+These two are unlike the rest and are **not in the default set**:
+
+- They are the only phases that measure **sdsmintd** rather than Envoy, and the
+  only ones that read CPU at all.
+- They are sized by the `NAMES` environment variable, not by `--full`.
+- At the default `NAMES=100000` they need **~10 GB of free RAM** — 5.7 GB of
+  Envoy plus 4.0 GB of sdsmintd — and about 18 minutes for the pair. Check
+  `free -g` first; if the fill starts swapping, the achieved rate collapses and
+  every number after that point is the swap, not the server.
+
+```sh
+NAMES=100000 ./poc/sdsmint/hack/run-scale.sh --phases 9,10   # the real run
+NAMES=2000 ROTATE_WATCH=240 ./poc/sdsmint/hack/run-scale.sh --phases 9,10  # ~8 min smoke
+```
+
+Run them **together** rather than separately when you can. Phase 10 subtracts
+phase 9's quiet window to separate the cost *of rotation* from the cost of
+holding the same set; run alone, it says so and reports the gross figure.
+
+Three knobs, all environment variables:
+
+- `NAMES` (100000) — live secrets to hold.
+- `FILL_RATE` (500) — new SNIs per second during the fill. This also sets how
+  wide the rotation ticks are smeared in phase 10, since each stream's ticker
+  starts when that stream opens: a fill much shorter than the 200 s rotation
+  period bunches every ticker together and phase 10 reports a peak well above
+  the average.
+- `ROTATE_WATCH` (420) — seconds to watch rotation. Two full 200 s intervals, so
+  every stream ticks at least twice wherever in the fill it opened.
+
+### Finding the deployed pod's ceiling
+
+Neither phase tells you what the *pod* can carry — a workstation has no cgroup.
+`__run/pod-ceiling.sh` ramps the deployed gateway in 500-name steps until a
+container sheds load or dies, reading Envoy's admin and sdsmintd's pprof through
+`bash /dev/tcp` from inside the envoy container (they share a netns, which is
+the only way to observe the distroless sidecar).
+
+```sh
+export SDSLOAD_IMAGE=$(ko build --bare ./poc/sdsmint/cmd/sdsload)
+RESTART=1 STEP=500 ./poc/sdsmint/__run/pod-ceiling.sh
+```
+
+It is gitignored and cluster-specific, like `cluster-check.sh`. Two things to
+know before running it:
+
+- **It will OOM-kill a container, and the pod will not recover on its own.**
+  That is the terminal condition it looks for. Envoy keeps its secrets when
+  sdsmintd dies and replays them to the replacement, which kills it again —
+  expect a crash loop until you `kubectl delete pod`. The script does that
+  cleanup itself and re-checks readiness, but say so before running it against
+  anything anyone depends on.
+- **`RESTART=1` matters on a second run.** Envoy holding secrets from a previous
+  ramp both corrupts the baseline and re-OOMs sdsmintd in round 1. Without the
+  flag the script detects this and refuses rather than producing a number.
+
+Follow it with `./cluster-check.sh` to confirm the gateway still serves.
 
 Every phase walks a disjoint slice of the synthetic host space
 (`h%d.mitm.example`), so a name is never accidentally warm because an earlier
@@ -193,11 +269,27 @@ pkill -f 'poc/sdsmint/__run/sdsmintd'; pkill -f 'poc/sdsmint/__run/envoy'
 **Phase 8 reports no connection completed.** It needs outbound DNS and a
 reachable origin. Nothing else in the harness does.
 
+**Phase 9 or 10 slows to a crawl partway through the fill.** Almost certainly
+swapping — 100,000 names is ~10 GB across the two processes. The tell is the
+`fill achieved` figure in `scale-results.txt` dropping well below `FILL_RATE`
+on a late step while the early steps held it. Numbers after that point measure
+the disk. Lower `NAMES` rather than waiting it out.
+
+**Phase 10 reports 0 rotations.** `ROTATE_WATCH` is shorter than the 200 s
+rotation interval, so nothing has ticked yet. It needs to be at least ~220 s to
+see anything and 420 s to see every stream tick twice.
+
+**`pod-ceiling.sh` exits with "Envoy is already holding N secrets".** A previous
+ramp's secrets are still live and would be charged to this run's baseline.
+Re-run with `RESTART=1` to roll the pod first.
+
 ## Related
 
 - [`README.md` § How far it scales](README.md#how-far-it-scales) — the measured
   results, the two findings that changed the design, and what this harness
   cannot tell you.
+- [`README.md` § What 100,000 live secrets actually cost](README.md#what-100000-live-secrets-actually-cost) —
+  phases 9 and 10, and the deployed pod's ceiling.
 - [`README.md` § What it costs](README.md#what-it-costs) — the Go
   microbenchmark numbers.
 - [`README.md` § Measuring the deployed gateway](README.md#measuring-the-deployed-gateway-sdsload---connect-via) —

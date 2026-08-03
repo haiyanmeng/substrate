@@ -27,17 +27,30 @@
 #   6  idle reclamation does memory come back, with and without --idle?
 #   7  reconnect        cost of Envoy replaying its live set after SDS restarts
 #   8  realism          one run through dynamic_forward_proxy (needs internet)
+#   9  hold at NAMES    CPU and memory of both processes at NAMES live secrets
+#  10  rotate at NAMES  the same, with --rotate --ttl 5m running underneath
 #
 # Phases 0-7 run the null minter, which serves pre-signed leaves so that what
 # is measured is Envoy and not a P-256 signing loop -- a mint costs ~375us,
 # which would swamp everything else. Phase 3 is the exception: the signer is
-# its subject. Phase 8 is opt-in and not in the default set.
+# its subject. Phases 8, 9 and 10 are opt-in and not in the default set.
+#
+# Phases 9 and 10 are the only ones that measure sdsmintd rather than Envoy, and
+# the only ones that read CPU. They are sized by $NAMES (default 100000) instead
+# of by --full, and at that size they need several GB of RAM and about 15
+# minutes for the pair.
 #
 # Usage:
 #   ./poc/sdsmint/hack/run-scale.sh                  # quick sweep, phases 0-7
 #   ./poc/sdsmint/hack/run-scale.sh --phases 0,1,6   # a subset
 #   ./poc/sdsmint/hack/run-scale.sh --full           # production-scale N, 30m idle
 #   ./poc/sdsmint/hack/run-scale.sh --keep           # leave the processes up
+#   NAMES=100000 ./poc/sdsmint/hack/run-scale.sh --phases 9,10
+#
+# Environment overrides for phases 9 and 10:
+#   NAMES=100000        live secrets to hold
+#   FILL_RATE=500       new SNIs per second during the fill
+#   ROTATE_WATCH=420    seconds to watch rotation in phase 10
 
 set -o errexit
 set -o nounset
@@ -60,7 +73,10 @@ while [[ $# -gt 0 ]]; do
     --keep) KEEP=true ;;
     --phases) PHASES="$2"; shift ;;
     --phases=*) PHASES="${1#*=}" ;;
-    -h|--help) sed -n '17,45p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    # The header comment IS the help text. Printed by matching the block rather
+    # than by a line range, so adding a phase to the list above does not
+    # silently truncate --help.
+    -h|--help) sed -n '/^# Scalability/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
   shift
@@ -83,6 +99,17 @@ else
   IDLE_TIMEOUT=30s
   STEADY_COUNT=3000
 fi
+
+# Phases 9 and 10 are sized by NAMES rather than by --full, because they are not
+# part of the sweep: they answer one question at one number, and that number is
+# the argument. 100000 fills in about 3.5 minutes at 500/s and is projected to
+# cost several GB of Envoy -- override it downward for a smoke run.
+NAMES="${NAMES:-100000}"
+FILL_RATE="${FILL_RATE:-500}"
+# Two full rotation intervals. At --ttl 5m a stream rotates at 2/3 TTL = 200s,
+# so 420s guarantees every stream has ticked at least twice regardless of where
+# in the fill window it opened.
+ROTATE_WATCH="${ROTATE_WATCH:-420}"
 
 readonly RESULTS="${RUN_DIR}/scale-results.txt"
 readonly SNI_FORMAT='h%d.mitm.example'
@@ -249,6 +276,55 @@ expect_all_served() {
     [[ "${k}" == failures_* ]] && note "    ${k#failures_} = ${LOAD[${k}]}"
   done
   return 1
+}
+
+# sds_pprof_int PROFILE PATTERN reads one integer out of a pprof debug=1
+# document. Used for the two things /metrics does not carry and cannot
+# reasonably be made to carry: the goroutine count and the Go runtime's own
+# memory accounting.
+#
+# This matters at 100k names because the per-stream handler in server.go
+# allocates three goroutines and up to two tickers PER STREAM, so the runtime's
+# own overhead is a first-order term rather than a rounding error.
+sds_pprof_int() {
+  local v
+  v="$(curl -s --max-time 10 "127.0.0.1:${METRICS_PORT}/debug/pprof/$1?debug=1" 2>/dev/null \
+    | grep -m1 -oP "$2" || true)"
+  if [[ "${v}" =~ ^[0-9]+$ ]]; then printf '%s\n' "${v}"; else printf '0\n'; fi
+}
+sds_goroutines() { sds_pprof_int goroutine 'goroutine profile: total \K\d+'; }
+sds_heap_sys()   { sds_pprof_int heap '^# Sys = \K\d+'; }
+sds_heap_alloc() { sds_pprof_int heap '^# HeapAlloc = \K\d+'; }
+
+# big_sample prints one whitespace-separated row describing both processes at
+# this instant:
+#
+#   envoy_rss_kb envoy_alloc_b envoy_cpu_ms sds_rss_kb sds_sys_b sds_cpu_ms
+#   goroutines cert_active names_live streams_live mints_issued
+#
+# Read as a row rather than as eleven separate calls because each admin and
+# pprof fetch costs a round trip, and at 100k live secrets a /stats scrape is
+# not instant -- sampling them one at a time would smear a "sample" across
+# seconds of a moving target.
+big_sample() {
+  local stats
+  stats="$(curl -s --max-time 30 "127.0.0.1:${ADMIN_PORT}/stats" 2>/dev/null || true)"
+  local ecpu scpu
+  ecpu="$(cpu_ms "${ENVOY_PID}")"
+  scpu="$(cpu_ms "${SDS_PID}")"
+  local pick
+  pick() {
+    local v
+    v="$(printf '%s\n' "${stats}" | awk -F': ' -v n="$1" '$1 == n {print $2}' | tail -1)"
+    [[ "${v}" =~ ^[0-9]+$ ]] && printf '%s' "${v}" || printf '0'
+  }
+  printf '%s %s %s %s %s %s %s %s %s %s %s\n' \
+    "$(rss_kb "${ENVOY_PID}")" "$(pick server.memory_allocated)" "${ecpu}" \
+    "$(rss_kb "${SDS_PID}")" "$(sds_heap_sys)" "${scpu}" \
+    "$(sds_goroutines)" \
+    "$(pick listener.mitm.on_demand_secret.cert_active)" \
+    "$(sds_metric names_live)" "$(sds_metric streams_live)" \
+    "$(sds_metric mints_issued)"
 }
 
 # envoy_mem prints "rss_kb allocated_bytes" as one line.
@@ -823,6 +899,215 @@ if wants 8; then
     ok "MITM re-origination works under load"
   else
     bad "no connection completed through the forward proxy (network?)"
+  fi
+fi
+
+################################################################################
+if wants 9; then
+  bold ""
+  bold "--- Phase 9: ${NAMES} live secrets, rotation off -- the cost of merely holding them ---"
+  note "Phase 1 measures the same curve but stops at ${N_STEPS[-1]} and takes no CPU"
+  note "reading at all. This one runs the REAL signer and watches both processes,"
+  note "because the sdsmintd side is not the certificates: server.go opens three"
+  note "goroutines and up to two tickers per stream, and Envoy opens one stream"
+  note "per secret. At ${NAMES} names that is the runtime, not the crypto."
+
+  stop_envoy
+  stop_sds
+  # --cache-cap above NAMES so a re-sign is a finding and not the cache evicting
+  # under us; no --rotate and no --idle, so nothing moves once the fill is done.
+  start_sds_real --cache-cap $((NAMES + 50000))
+  start_envoy envoy-scale.yaml 2
+
+  # The baseline has to be taken after Envoy is serving but before any secret
+  # exists, or the per-secret figures carry Envoy's fixed footprint in them.
+  read -r e_rss0 e_alloc0 e_cpu0 s_rss0 s_sys0 s_cpu0 g0 _ _ _ m0 < <(big_sample)
+  record "phase9 baseline (0 secrets): envoy rss=$((e_rss0 / 1024))MB alloc=$((e_alloc0 / 1048576))MB | sds rss=$((s_rss0 / 1024))MB sys=$((s_sys0 / 1048576))MB goroutines=${g0}"
+
+  step=$((NAMES / 4))
+  fill_ok=true
+  prev_e_rss="${e_rss0}"; prev_s_rss="${s_rss0}"
+  prev_e_cpu="${e_cpu0}"; prev_s_cpu="${s_cpu0}"
+  prev_n=0
+  for i in 1 2 3 4; do
+    load "hold-${i}" "${step}" "${FILL_RATE}"
+    expect_all_served "phase9 fill step ${i} (+${step} names)" || { fill_ok=false; break; }
+    # Envoy acknowledges a secret slightly after the handshake that asked for
+    # it completes, so a sample taken the instant sdsload returns undercounts
+    # cert_active by however many were still in flight.
+    sleep 3
+    read -r e_rss e_alloc e_cpu s_rss s_sys s_cpu g active names streams mints < <(big_sample)
+
+    d_n=$((active - prev_n))
+    [[ "${d_n}" -lt 1 ]] && d_n=1
+    e_per=$(( (e_rss - prev_e_rss) * 1024 / d_n ))
+    s_per=$(( (s_rss - prev_s_rss) * 1024 / d_n ))
+    e_cpu_per=$(( (e_cpu - prev_e_cpu) * 1000 / d_n ))
+    s_cpu_per=$(( (s_cpu - prev_s_cpu) * 1000 / d_n ))
+
+    record "phase9 live=${active} envoy rss=$((e_rss / 1024))MB alloc=$((e_alloc / 1048576))MB cpu=$((e_cpu / 1000))s | sds rss=$((s_rss / 1024))MB sys=$((s_sys / 1048576))MB cpu=$((s_cpu / 1000))s goroutines=${g}"
+    record "phase9 live=${active} sds names=${names} streams=${streams} mints=${mints} | marginal: envoy ${e_per}B/secret ${e_cpu_per}us/secret, sds ${s_per}B/secret ${s_cpu_per}us/secret"
+    record "phase9 live=${active} fill achieved ${LOAD[rate_achieved]}/s handshake p50=${LOAD[handshake_us_p50]}us p99=${LOAD[handshake_us_p99]}us"
+    [[ "${i}" -eq 1 ]] && FIRST_FILL_P50="${LOAD[handshake_us_p50]}"
+
+    prev_e_rss="${e_rss}"; prev_s_rss="${s_rss}"
+    prev_e_cpu="${e_cpu}"; prev_s_cpu="${s_cpu}"
+    prev_n="${active}"
+  done
+
+  if [[ "${fill_ok}" == true ]]; then
+    read -r e_rss e_alloc _ s_rss s_sys _ g active _ streams _ < <(big_sample)
+    tot_n="${active}"; [[ "${tot_n}" -lt 1 ]] && tot_n=1
+    ok "held ${active} live secrets with every handshake served"
+    finding "ANSWER (memory): ${active} live secrets cost envoy $(( (e_rss - e_rss0) / 1024 ))MB and sdsmintd $(( (s_rss - s_rss0) / 1024 ))MB over baseline"
+    finding "  => $(( (e_rss - e_rss0) * 1024 / tot_n ))B/secret in Envoy, $(( (s_rss - s_rss0) * 1024 / tot_n ))B/secret in sdsmintd, ${g} goroutines for ${streams} streams"
+
+    # The measurement nothing else in this harness takes: with the fill over and
+    # rotation off, is holding the set free? Every stream is still open and every
+    # goroutine is still scheduled, so "nothing is happening" is a claim about
+    # the runtime that has to be checked rather than assumed.
+    note "30s of complete quiet -- measuring what ${active} idle streams cost..."
+    q_e0="$(cpu_ms "${ENVOY_PID}")"; q_s0="$(cpu_ms "${SDS_PID}")"
+    q_rss0="${s_rss}"
+    sleep 30
+    q_e1="$(cpu_ms "${ENVOY_PID}")"; q_s1="$(cpu_ms "${SDS_PID}")"
+    q_rss1="$(rss_kb "${SDS_PID}")"
+    QUIET_SDS_MS=$((q_s1 - q_s0))
+    QUIET_ENVOY_MS=$((q_e1 - q_e0))
+    envoy_per_s=$((QUIET_ENVOY_MS / 30))
+    sds_per_s=$((QUIET_SDS_MS / 30))
+    record "phase9 quiet 30s at ${active} live: envoy ${QUIET_ENVOY_MS}ms cpu, sds ${QUIET_SDS_MS}ms cpu, sds rss $((q_rss0 / 1024))MB -> $((q_rss1 / 1024))MB"
+    # Milliseconds of CPU per wall-second, not a percentage: the expected answer
+    # is a small fraction of one core, and "0%" would hide the difference
+    # between "nearly free" and "actually free".
+    finding "ANSWER (idle CPU): holding ${active} secrets costs ${envoy_per_s}ms of CPU per wall-second in Envoy and ${sds_per_s}ms in sdsmintd, with nothing arriving"
+    if [[ "${QUIET_SDS_MS}" -lt 3000 ]]; then
+      ok "sdsmintd is genuinely idle: ${active} open streams and their goroutines cost it nothing measurable"
+    else
+      finding "sdsmintd spends $((QUIET_SDS_MS * 100 / 30000))% of a core doing nothing at ${active} streams -- the per-stream goroutines are not free"
+    fi
+    # Checked separately from sdsmintd because the two are not symmetric: the Go
+    # server parks its goroutines on channels and costs nothing, while Envoy
+    # pays per open stream whether or not anything is on it.
+    if [[ "${QUIET_ENVOY_MS}" -ge 1500 ]]; then
+      finding "Envoy spends $((QUIET_ENVOY_MS * 100 / 30000))% of a core holding ${active} idle streams -- open SDS streams are not free on the data plane side, and this is the floor a real workload sits on top of"
+    else
+      ok "Envoy holds ${active} idle streams for under 5% of a core"
+    fi
+
+    # The fill latency is a result, not instrumentation. Phase 2 asks the same
+    # question but only to ${N_STEPS[-1]} names; the last fill step here asks it
+    # at ${active}, and the answer at that size is not a small multiple.
+    if [[ -n "${FIRST_FILL_P50:-}" && "${FIRST_FILL_P50}" -gt 0 ]]; then
+      ratio=$(( LOAD[handshake_us_p50] / FIRST_FILL_P50 ))
+      record "phase9 first contact: p50 ${FIRST_FILL_P50}us at $((NAMES / 4)) live -> ${LOAD[handshake_us_p50]}us at ${active} (${ratio}x)"
+      # A ratio this size is a curve; anything smaller, at a fill this short, is
+      # as likely to be the box as the server, and phase 0's noise-floor marker
+      # already says so. Reporting it either way, but only claiming it when the
+      # margin is well past what the harness can produce by accident.
+      if [[ "${ratio}" -ge 10 ]]; then
+        finding "ANSWER (first-contact latency): ${ratio}x slower at ${active} live than at $((NAMES / 4)), at an unchanged ${FILL_RATE}/s arrival rate -- first contact does degrade with the size of the live set, which phase 2 does not see because it stops at ${N_STEPS[-1]}"
+      fi
+    fi
+  else
+    finding "phase9 stopped at ${prev_n} live secrets -- that is the ceiling on this box, and it is the answer"
+  fi
+fi
+
+################################################################################
+if wants 10; then
+  bold ""
+  bold "--- Phase 10: ${NAMES} live secrets WITH rotation -- the cost of the tick ---"
+  note "Production defaults: --rotate --ttl 5m, so a stream re-mints at 2/3 TTL,"
+  note "about every 200s. This is deliberately NOT phase 5's compressed 15s TTL."
+  note "Each stream has its own ticker, started when that stream opened, so the"
+  note "ticks are smeared across however long the fill took -- and no wider. A"
+  note "fill that is short relative to the 200s period gives a burst; a fill that"
+  note "is comparable to it gives a continuous rate. Both the average and the"
+  note "peak are reported, because at ${NAMES} names they can differ by an order"
+  note "of magnitude and only one of them sizes the CPU request."
+  note "Restarted clean, so this is not measured on top of phase 9's heap."
+
+  stop_envoy
+  stop_sds
+  start_sds_real --cache-cap $((NAMES + 50000)) --rotate --ttl 5m
+  start_envoy envoy-scale.yaml 2
+
+  read -r e_rss0 _ e_cpu0 s_rss0 _ s_cpu0 _ _ _ _ _ < <(big_sample)
+
+  rot_ok=true
+  step=$((NAMES / 4))
+  for i in 1 2 3 4; do
+    load "rot-${i}" "${step}" "${FILL_RATE}"
+    expect_all_served "phase10 fill step ${i}" || { rot_ok=false; break; }
+  done
+
+  if [[ "${rot_ok}" == true ]]; then
+    sleep 3
+    read -r _ _ _ _ _ _ _ active _ streams _ < <(big_sample)
+    record "phase10 filled to ${active} live secrets over ${streams} streams; watching ${ROTATE_WATCH}s"
+
+    # Sample throughout rather than only at the ends: a rotation rate that is
+    # steady and one that arrives in bursts have the same average, and only one
+    # of them is a capacity problem.
+    w_e0="$(cpu_ms "${ENVOY_PID}")"; w_s0="$(cpu_ms "${SDS_PID}")"
+    rot0="$(sds_metric rotations)"; sign0="$(sds_metric sign_nanos_total)"
+    mint0="$(sds_metric mints_issued)"
+    upd0="$(stat_value listener.mitm.on_demand_secret.cert_updated)"
+    prev_rot="${rot0}"; peak_rate=0; peak_at=0
+    for t in $(seq 15 15 "${ROTATE_WATCH}"); do
+      sleep 15
+      now_rot="$(sds_metric rotations)"
+      win_rate=$(( (now_rot - prev_rot) / 15 ))
+      if [[ "${win_rate}" -gt "${peak_rate}" ]]; then peak_rate="${win_rate}"; peak_at="${t}"; fi
+      note "  +${t}s  rotations=${now_rot} (+${win_rate}/s)  sds rss=$(( $(rss_kb "${SDS_PID}") / 1024 ))MB  envoy rss=$(( $(rss_kb "${ENVOY_PID}") / 1024 ))MB"
+      prev_rot="${now_rot}"
+    done
+    w_e1="$(cpu_ms "${ENVOY_PID}")"; w_s1="$(cpu_ms "${SDS_PID}")"
+    rot1="$(sds_metric rotations)"; sign1="$(sds_metric sign_nanos_total)"
+    mint1="$(sds_metric mints_issued)"
+    upd1="$(stat_value listener.mitm.on_demand_secret.cert_updated)"
+    nacks="$(sds_metric nacks)"
+
+    d_rot=$((rot1 - rot0))
+    d_mint=$((mint1 - mint0))
+    sds_ms=$((w_s1 - w_s0))
+    envoy_ms=$((w_e1 - w_e0))
+    record "phase10 over ${ROTATE_WATCH}s at ${active} live: rotations=${d_rot} mints=${d_mint} cert_updated=+$((upd1 - upd0)) nacks=${nacks}"
+    record "phase10 over ${ROTATE_WATCH}s: sds ${sds_ms}ms cpu, envoy ${envoy_ms}ms cpu, signing $(( (sign1 - sign0) / 1000000 ))ms of it"
+    finding "ANSWER (rotation): ${active} live secrets at --ttl 5m sustain $((d_mint / ROTATE_WATCH)) mints/s and $((d_rot / ROTATE_WATCH)) pushes/s, forever, with no traffic at all"
+    finding "  => peak was ${peak_rate}/s in the 15s window at +${peak_at}s; a fill shorter than the 200s period bunches every ticker together, so size for the peak"
+    finding "  => sdsmintd $((sds_ms * 100 / (ROTATE_WATCH * 1000)))% of a core, envoy $((envoy_ms * 100 / (ROTATE_WATCH * 1000)))% of a core, purely to keep the set alive"
+    if [[ -n "${QUIET_SDS_MS:-}" ]]; then
+      # Only meaningful when phase 9 ran in the same invocation; the quiet
+      # window is the zero point that turns these into the cost OF rotation
+      # rather than the cost of rotation plus everything else.
+      base_ms=$((QUIET_SDS_MS * ROTATE_WATCH / 30))
+      finding "  => against phase 9's quiet window ($((base_ms))ms for the same duration), rotation itself is $((sds_ms - base_ms))ms"
+    else
+      note "run --phases 9,10 together to get the rotation cost net of the idle baseline"
+    fi
+
+    if [[ "${nacks}" -eq 0 ]]; then
+      ok "Envoy accepted every rotated secret (no NACKs) at ${active} live names"
+    else
+      bad "${nacks} NACKs during the rotation watch -- Envoy is rejecting rotated secrets at ${active} live names"
+    fi
+
+    # Serving during the sustained rotation, not merely surviving it.
+    load "rot-serve" 200 50
+    record "phase10 cold fetch during sustained rotation: ok=${LOAD[ok]} failed=${LOAD[failed]} p50=${LOAD[handshake_us_p50]}us p99=${LOAD[handshake_us_p99]}us"
+    if [[ "${LOAD[failed]}" -gt 0 ]]; then
+      bad "${LOAD[failed]} of ${LOAD[attempted]} cold handshakes failed during sustained rotation"
+    elif [[ "${LOAD[handshake_us_p50]}" -gt 1000000 ]]; then
+      # Completing is not the same as working. Rotation at this size saturates
+      # the signer, and a new name then queues behind it -- so this arrives as a
+      # latency result rather than as an error, and asserting only on failures
+      # would report a multi-second handshake as a pass.
+      bad "no handshake failed, but a new name took $((LOAD[handshake_us_p50] / 1000))ms at the median while ${active} secrets rotate -- rotation is starving new work, not coexisting with it"
+    else
+      ok "new names are still minted normally while ${active} secrets rotate underneath ($((LOAD[handshake_us_p50] / 1000))ms median)"
+    fi
   fi
 fi
 
