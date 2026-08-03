@@ -37,6 +37,56 @@
 #     substrate workload holding a podidentity credential. It does NOT
 #     establish which actor is calling. See point 1.
 #
+#  4. THIS POD NO LONGER FITS ON A c3-standard-4. The requests and limits below
+#     are sized for 100,000 simultaneously live per-SNI secrets, which measures
+#     at ~10.2 GiB of actual usage across the two containers. A c3-standard-4
+#     has 12.96 GiB allocatable and has to run kube-system alongside this, so
+#     the 10.5Gi of memory requests below will not place and the pod will sit
+#     Pending. That is the intended failure. The memory requests are set to
+#     measured steady-state usage rather than to a token floor precisely so
+#     this fails at the scheduler: understate them and the pod places happily
+#     on a node it then grows to fill, and the thing that breaks is whatever
+#     else was scheduled there. Move the node pool to c3-standard-8 or
+#     c3-highmem-4, or cut the target and re-derive every number in the next
+#     section. Nothing routes here yet (point 2), so Pending is embarrassing
+#     rather than an outage -- but it is still Pending.
+#
+# WHAT THIS IS SIZED FOR
+#
+#   100,000 live secrets, measured rather than projected. The full method and
+#   the raw numbers are in poc/sdsmint/README.md; what matters here is that
+#   BOTH containers scale with the live secret count, and the sidecar is the
+#   one that dies first.
+#
+#     Envoy      ~63,500 B per live secret (GKE; 59,300 local, so the curve
+#                transfers). Flat from 200 names to 100,000 -- there is no
+#                knee. 100k => ~5.4 GiB of heap, ~5.7 GiB RSS.
+#     sdsmintd   ~44,750 B per live secret. This is NOT certificates. Envoy
+#                opens one DELTA_GRPC stream per on-demand secret and holds it
+#                open, and internal/sdsmint/server.go spends 3 goroutines and
+#                up to 2 timers on each one: 100,000 secrets measured 300,301
+#                goroutines. 100k => ~4.2 GiB.
+#     CPU        A floor of ~1.28 cores (sdsmintd) and ~0.73 cores (Envoy) at
+#                100k with ZERO traffic, entirely from --ttl=5m rotation:
+#                rotation is per-stream, so it is 507 signatures/second
+#                sustained forever just to hold the set. That floor falls
+#                linearly with --ttl. Raising it is the cheapest lever here.
+#
+#   The pod's real ceiling was measured too, and it was not Envoy: sdsmintd was
+#   OOMKilled between 5,501 and 6,001 names against its old 256Mi limit while
+#   Envoy sat at 351 MiB of 768 MiB with fixed_heap pressure at 43%. The
+#   overload manager was guarding the container that was never going to die.
+#   Worse, it crash-looped: Envoy keeps its secrets across a sidecar restart
+#   and replays all of them on reconnect, rebuilding sdsmintd to the same count
+#   over ~4 minutes and OOMing it again on a ~5-minute cycle. --idle cannot
+#   help, because sdsmintd never lives long enough to reach it.
+#
+#   Raising the limits below MOVES that ceiling, it does not remove it. There
+#   is still no shed path in sdsmintd -- no GOMEMLIMIT equivalent of Envoy's
+#   fixed_heap, no way to refuse a new subscription while continuing to serve
+#   the ones it has. Past whatever the limit is, it dies and the loop starts.
+#   The real fix is in internal/sdsmint, not in this file.
+#
 # WHAT MUST STAY IN SYNC
 #
 #   The --allow patterns here and the --permitted-dns-domain values on the
@@ -114,19 +164,37 @@ data:
         "@type": type.googleapis.com/envoy.extensions.bootstrap.internal_listener.v3.InternalListener
 
     # An unbounded destination set means unbounded DNS entries and unbounded
-    # live secret subscriptions, and the PoC measured what that costs: 62 KB of
-    # Envoy heap per live secret, so 15,200 names came to 946 MB. --idle 30m on
-    # sdsmintd is what actually bounds it; this is the backstop for a working
-    # set that outgrows the estimate anyway. Keep max_heap_size_bytes at ~75% of
-    # the container memory limit below -- past the limit the kernel OOM-kills
-    # the pod without Envoy getting a chance to shed load.
+    # live secret subscriptions, and it costs ~63,500 bytes of Envoy heap per
+    # live secret -- flat, with no knee, from 200 names to 100,000. --idle 30m
+    # on sdsmintd is what bounds the set in normal operation; this is the
+    # backstop for a working set that outgrows the estimate anyway.
+    #
+    # Sizing max_heap_size_bytes is a three-way constraint, not a percentage:
+    #
+    #   above the target load   100,000 secrets is ~5.4 GiB of heap. shrink_heap
+    #                           fires at 0.92 and stop_accepting_requests at
+    #                           0.98, so a ceiling of 6.5Gi puts the design load
+    #                           at 82% -- headroom to ~112,000 names before
+    #                           Envoy starts shedding. A 6Gi ceiling would have
+    #                           put 100k at 90% and had shrink_heap firing
+    #                           continuously at the load this is sized for.
+    #   below the limit         measured RSS runs ~1.07x allocated, so tripping
+    #                           stop_accepting at 6.37 GiB of heap means ~6.8
+    #                           GiB of RSS against the 8Gi limit. Envoy sheds
+    #                           with ~1.2 GiB to spare instead of being killed.
+    #   the old ~75% rule       is the conservative form of the same arithmetic
+    #                           and would demand a 10Gi limit here. 81% is the
+    #                           measured-RSS-ratio version of it. If you change
+    #                           either number, redo both legs -- a ceiling above
+    #                           the limit means the kernel OOM-kills the pod
+    #                           without Envoy getting a chance to shed load.
     overload_manager:
       refresh_interval: 0.25s
       resource_monitors:
       - name: envoy.resource_monitors.fixed_heap
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.resource_monitors.fixed_heap.v3.FixedHeapConfig
-          max_heap_size_bytes: 805306368  # 768Mi, against the 1Gi limit
+          max_heap_size_bytes: 6979321856  # 6.5Gi, against the 8Gi limit
       # Envoy warns at startup if this is unset, and it is worth setting rather
       # than silencing: it counts both legs, since a tunnelled request holds a
       # downstream connection on connect_in and another on mitm_listener. Two
@@ -378,16 +446,22 @@ data:
         type: STATIC
         connect_timeout: 1s
         # One HTTP/2 connection carrying one DELTA_GRPC stream per name in
-        # flight. max_requests is the one that matters: it caps concurrent
-        # streams, so at the default 1024 a burst of cold SNIs would be refused
-        # a mint rather than queued for one -- which surfaces as a handshake
-        # failure and looks exactly like the allowlist denying the name.
+        # flight. max_requests is the one that matters, and it is subtler than
+        # a burst limit: Envoy does not close the stream once the secret
+        # arrives, it holds it open for as long as the secret is live. So this
+        # is not "concurrent mints", it is a hard cap on the size of the live
+        # secret set, and the 65536 it used to hold sat below the 100,000 this
+        # pod is now sized for. Past the cap Envoy is refused a mint rather
+        # than queued for one, which surfaces as a handshake failure and looks
+        # exactly like the allowlist denying the name -- silently, at a
+        # threshold nothing else in this file mentions. Keep it comfortably
+        # above the target live-secret count, not merely equal to it.
         circuit_breakers:
           thresholds:
           - priority: DEFAULT
             max_connections: 128
-            max_pending_requests: 65536
-            max_requests: 65536
+            max_pending_requests: 131072
+            max_requests: 131072
             max_retries: 8
         typed_extension_protocol_options:
           envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
@@ -486,10 +560,26 @@ spec:
         # cache miss, which is the difference between a KMS-backed root being
         # affordable and being a 30-100x regression on every first contact.
         - "--ca-intermediate-ttl=12h"
+        # --ttl is the single biggest CPU lever in this file. Rotation is
+        # per-stream, not one shared tick, and fires at 2/3 of the TTL -- so at
+        # 5m and 100,000 live secrets it is a sustained 507 signatures/second
+        # with no traffic at all, measured at 1.28 cores for this container and
+        # 0.73 for Envoy applying the pushes. That cost falls linearly with the
+        # TTL. It also does not coexist gracefully with new work: during
+        # sustained rotation at 100k a first-contact handshake for a cold name
+        # measured 5.65s at the median.
         - "--ttl=5m"
         - "--idle=30m"
         - "--rotate"
-        - "--cache-cap=4096"
+        # Just above the target live-secret count, deliberately. At 4096 this
+        # cache did nothing at 100k names -- every entry was evicted before it
+        # could be reused -- and the case it exists for is the one where that
+        # hurts most: when Envoy reconnects it replays its whole subscription
+        # set at once, and a cache that covers the set turns that thundering
+        # herd from 100,000 signatures into 100,000 lookups. The memory is
+        # already inside the per-secret figure quoted in the header; the 100k
+        # measurement ran with a 150,000-entry cache.
+        - "--cache-cap=110000"
         - "--metrics-addr=127.0.0.1:9091"
         - "--log-level=info"
         # THE EGRESS POLICY. This list is the entire control. Keep it in sync
@@ -507,15 +597,44 @@ spec:
         # Do not add --ca-allow-unconstrained. It lets the CA key sign for any
         # name on the internet, which removes the last backstop under the
         # allowlist.
-        # The signer is cheap and bounded: the PoC measured ~600us of P-256 per
-        # mint, so 500 cold names a second is 0.3 of a core, and --cache-cap
-        # bounds the memory rather than the traffic doing it.
+        env:
+        # Go's nearest thing to Envoy's fixed_heap, and it is not as close as
+        # it looks. It bounds the GARBAGE, not the live set: at 100k secrets
+        # almost everything resident here is reachable -- 300,301 goroutine
+        # stacks, their timers, and the cert cache -- and no amount of GC
+        # pressure reclaims a live subscription. What it does buy is real
+        # though, because rotation allocates hard: 507 signatures a second
+        # generates enough transient garbage that a soft ceiling meaningfully
+        # trims peak RSS. Set below the container limit so the collector starts
+        # working before the kernel starts killing. If sdsmintd ever reaches
+        # this figure with a genuinely live heap it will thrash the GC and then
+        # OOM anyway; that is the missing shed path in the header, not a
+        # misconfiguration here.
+        - name: GOMEMLIMIT
+          value: "5GiB"
+        # Both of these scale with the live secret count, not with request rate.
+        #
+        # memory  ~44,750 B per live secret x 100,000 => ~4.2 GiB, plus the
+        #         110,000-entry cache, against a 6Gi limit. See the header for
+        #         why this is stream overhead rather than certificates, and for
+        #         what happens when it is exceeded. The request is the measured
+        #         steady state rather than a token floor, on purpose: the
+        #         scheduler places pods on requests, so a 64Mi request on a
+        #         container that grows to 4.2 GiB does not fail to schedule, it
+        #         schedules onto a node it will later destabilise. Understating
+        #         it here is how this pod takes its neighbours down with it.
+        # cpu     1.28 cores is the measured floor at 100k with no traffic --
+        #         rotation alone, of which 302s out of 540s was time inside the
+        #         P-256 signer. A single mint is still the ~600us the PoC first
+        #         measured; there are simply 507 of them a second. Requested,
+        #         not limited: throttling the signer turns a CPU shortage into
+        #         handshake timeouts across every cold SNI at once.
         resources:
           requests:
-            cpu: 50m
-            memory: 64Mi
+            cpu: 1500m
+            memory: 4608Mi  # 4.5Gi, the measured 100k steady state
           limits:
-            memory: 256Mi
+            memory: 6Gi
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
@@ -555,16 +674,25 @@ spec:
         - name: "podidentity"
           mountPath: "/run/podidentity.podcert.ate.dev"
         # Memory is the resource that actually varies here, and it varies with
-        # the live secret set rather than with request rate. The limit exists so
-        # the overload_manager's fixed_heap ceiling has something to be 75% of;
-        # raise both together or neither, because a ceiling above the limit
-        # means the kernel OOM-kills the pod before Envoy sheds any load.
+        # the live secret set rather than with request rate: ~63,500 B per live
+        # secret, so 100,000 names is ~5.7 GiB of RSS against this 8Gi limit.
+        # The limit and the overload_manager's fixed_heap ceiling are one
+        # decision, not two -- raise both together or neither, and read the
+        # three-way constraint above fixed_heap before touching either, because
+        # a ceiling above the limit means the kernel OOM-kills the pod before
+        # Envoy sheds any load.
+        #
+        # The CPU request is a floor, not an estimate of the traffic: 0.73
+        # cores is what Envoy burns at 100k secrets with no requests at all,
+        # applying the rotation pushes sdsmintd generates. Holding the streams
+        # alone -- no rotation, no traffic -- measured 12.5% of a core. Left
+        # unlimited for the same reason as the sidecar.
         resources:
           requests:
-            cpu: 100m
-            memory: 256Mi
+            cpu: 1000m
+            memory: 6Gi  # the measured 100k steady state, not a token floor
           limits:
-            memory: 1Gi
+            memory: 8Gi
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:

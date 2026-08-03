@@ -511,10 +511,30 @@ to one cluster and it deliberately kills a container.
   sdsmintd never survives long enough to reach the timeout, and each restart
   resets it.
 
-The manifest's own sizing note reasons from the Envoy figure alone and concludes
-the 1Gi/768Mi pair is the binding constraint. It is not: **the 256Mi on
-sdsmintd is**, at less than half the count, and the failure it produces is a
-crash loop rather than graceful shedding.
+The manifest's sizing note used to reason from the Envoy figure alone and
+conclude that the 1Gi/768Mi pair was the binding constraint. It was not: **the
+256Mi on sdsmintd was**, at less than half the count, and the failure it
+produced was a crash loop rather than graceful shedding.
+
+`manifests/ate-install/atenet-egress.yaml` has since been resized for 100,000
+live secrets from these measurements — Envoy 6Gi/8Gi with `fixed_heap` at 6.5Gi,
+sdsmintd 4.5Gi/6Gi, CPU requests of 1000m and 1500m to cover the rotation floor,
+`--cache-cap=110000`, and `sds_mint`'s `max_requests` raised past 100,000 (at
+65,536 it was a silent cap on the live set, since Envoy holds one stream open
+per secret rather than closing it once the secret arrives). Two things that
+resizing does **not** do are worth stating plainly:
+
+- **It moves the ceiling, it does not remove it.** sdsmintd still has no shed
+  path — no way to refuse a *new* subscription under memory pressure while
+  continuing to serve the ones it holds — so past 6Gi the same crash loop
+  returns. `GOMEMLIMIT` is set as the nearest Go equivalent of `fixed_heap`, but
+  it bounds garbage, not live subscriptions, and at 100k almost everything
+  resident is live. The real fix belongs in `internal/sdsmint`.
+- **The pod no longer fits the node pool.** 10.5Gi of memory requests against a
+  `c3-standard-4`'s 12.96 GiB allocatable means it will sit `Pending` until the
+  pool moves to something larger. The requests are deliberately set to measured
+  steady-state usage rather than to a token floor, so that this fails at the
+  scheduler instead of placing onto a node the pod then grows to fill.
 
 ### The rest
 
