@@ -1,0 +1,85 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# THE CONTROL. Not a deployment config and not a design anyone should copy --
+# it is envoy-scale.yaml with the on-demand certificate selector removed and
+# one static certificate in its place.
+#
+# Phase 0 of run-scale.sh runs this to establish the floor: handshake latency,
+# connection rate and memory for the same listener, the same client and the
+# same certificate bytes, with nothing on-demand happening. Every number the
+# later phases produce is the difference from this one. Without it, "a
+# handshake took 900us" is unattributable -- most of that is TLS, not SDS.
+#
+# The certificate is written by `sdsmintd --unsafe-null-minter --null-cert-out`, so it
+# is literally one of the leaves the on-demand arm serves. That makes the
+# comparison change exactly one variable: the selector.
+#
+# Session resumption stays disabled here too. The on-demand arm has to disable
+# it (a resumed connection skips certificate selection entirely), so the
+# control has to disable it as well or it would be measuring cheaper
+# handshakes.
+#
+# Paths are relative to the working directory Envoy is started in, which
+# run-scale.sh sets to poc/sdsmint/__run.
+
+node:
+  id: sdsmint-scale
+  cluster: sdsmint-scale
+
+admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 19000}
+
+static_resources:
+  listeners:
+  - name: mitm
+    stat_prefix: mitm
+    address:
+      socket_address: {address: 127.0.0.1, port_value: 18443}
+    listener_filters:
+    - name: envoy.filters.listener.tls_inspector
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: mitm_http
+          route_config:
+            name: local
+            virtual_hosts:
+            - name: all
+              domains: ["*"]
+              routes:
+              - match: {prefix: "/"}
+                direct_response:
+                  status: 200
+                  body:
+                    inline_string: "mitm ok\n"
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+            - certificate_chain: {filename: ./leaf.pem}
+              private_key: {filename: ./leaf-key.pem}
+          disable_stateless_session_resumption: true
+          disable_stateful_session_resumption: true

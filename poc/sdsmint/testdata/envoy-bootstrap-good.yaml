@@ -1,0 +1,151 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# GOOD CONFIG -- the hermetic bootstrap with transport_socket_connect_timeout set.
+#
+# FOR DEPLOYMENT, USE ../deploy/envoy-egress.yaml INSTEAD. This file exists to
+# isolate one variable for the harness; that one is the real thing.
+#
+# The other two bootstraps in this directory are deliberately flawed. Both omit
+# transport_socket_connect_timeout so that run-poc.sh can demonstrate what
+# happens without it: when sdsmintd is down, a first-contact SNI pauses the
+# handshake and Envoy NEVER gives up -- measured still waiting after the
+# client's full 20s budget, and after 3 minutes by hand. The client hangs and
+# never receives an error.
+#
+# This file is the same configuration with the knob set. run-poc.sh Experiment C
+# runs both and shows the same request failing in ~5s instead of hanging.
+#
+# Requires Envoy 1.37 or newer. on_demand_secret and cert_mappers.sni do not
+# exist in 1.36 or earlier -- notably not in the v1.30-latest that
+# manifests/ate-install/atenet-router.yaml currently pins.
+#
+# Scope of "good": the downstream half, and only the parts the harness needs.
+# The upstream is still a direct_response so the file stays hermetic and usable
+# in CI, and it hardcodes a node block, a loopback listen address and a relative
+# socket path -- none of which belong in a deployment.
+# ../deploy/envoy-egress.yaml is the same design with all of that fixed, plus
+# the dynamic_forward_proxy upstream, ext_proc, access logging, and an overload
+# manager. See README.md "Deploying this for real".
+#
+# Paths are relative to the working directory Envoy is started in, which
+# run-poc.sh sets to poc/sdsmint/__run.
+
+# SDS subscriptions are rejected outright unless the node has an id and a
+# cluster, because the management server keys state off them.
+node:
+  id: sdsmint-poc
+  cluster: sdsmint-poc
+
+admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 19000}
+
+static_resources:
+  listeners:
+  - name: mitm
+    # stat_prefix is what makes the on-demand counters addressable as
+    # listener.mitm.on_demand_secret.* rather than being keyed by address.
+    stat_prefix: mitm
+    address:
+      socket_address: {address: 127.0.0.1, port_value: 18443}
+    listener_filters:
+    # Required: without it Envoy never reads the ClientHello, so the sni
+    # mapper has nothing to map and every request collapses to default_value.
+    - name: envoy.filters.listener.tls_inspector
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: mitm_http
+          route_config:
+            name: local
+            virtual_hosts:
+            - name: all
+              domains: ["*"]
+              routes:
+              - match: {prefix: "/"}
+                direct_response:
+                  status: 200
+                  body:
+                    inline_string: "mitm ok\n"
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      # THE KNOB. Without it an SDS outage does not degrade egress, it wedges
+      # every actor dialling a host Envoy has not already cached -- indefinitely,
+      # because certificate selection pauses the handshake and nothing times it
+      # out. Note this is a filter-chain-level sibling of transport_socket, not
+      # a field inside it; putting it in the wrong place is silently accepted as
+      # an unknown field in some tooling.
+      #
+      # 5s is what the PoC measured against. Size it above the p99 mint latency
+      # (a P-256 sign plus a UDS round-trip, so single-digit ms) and below
+      # whatever the calling actor's own timeout is.
+      transport_socket_connect_timeout: 5s
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            custom_tls_certificate_selector:
+              name: on-demand
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.cert_selectors.on_demand_secret.v3.Config
+                config_source:
+                  api_config_source:
+                    api_type: DELTA_GRPC
+                    transport_api_version: V3
+                    grpc_services:
+                    - envoy_grpc:
+                        cluster_name: sds_mint
+                certificate_mapper:
+                  name: sni
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.cert_mappers.sni.v3.SNI
+                    # Used when a client connects without SNI. It must be in
+                    # sdsmintd's --allow list or those handshakes fail.
+                    default_value: "default.mitm.example"
+                # Fetched at config load, before any request arrives.
+                prefetch_secret_names:
+                - default.mitm.example
+          # Resumption would let a client skip the handshake and therefore skip
+          # certificate selection entirely. Envoy does not support it for
+          # on-demand certificates; disabling it is required, not cosmetic.
+          disable_stateless_session_resumption: true
+          disable_stateful_session_resumption: true
+
+  clusters:
+  - name: sds_mint
+    type: STATIC
+    connect_timeout: 1s
+    # SDS is a gRPC service, so the cluster must speak HTTP/2.
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
+    load_assignment:
+      cluster_name: sds_mint
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              # A unix socket keeps leaf private keys off the network. That
+              # local-only channel is a required control, not a convenience.
+              pipe: {path: ./sdsmint.sock}

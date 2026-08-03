@@ -1,0 +1,144 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The real egress-MITM shape: identical downstream config to
+# envoy-bootstrap.yaml, but the upstream is a dynamic_forward_proxy so Envoy
+# actually re-originates TLS to whatever host the client asked for.
+#
+# This is the configuration that demonstrates the use case -- an actor dialling
+# an arbitrary HTTPS destination through a proxy that can see and police the
+# request. It needs outbound internet access; envoy-bootstrap.yaml is the
+# hermetic equivalent.
+#
+# Requires Envoy 1.37 or newer.
+
+node:
+  id: sdsmint-poc
+  cluster: sdsmint-poc
+
+admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 19000}
+
+static_resources:
+  listeners:
+  - name: mitm
+    stat_prefix: mitm
+    address:
+      socket_address: {address: 127.0.0.1, port_value: 18443}
+    listener_filters:
+    - name: envoy.filters.listener.tls_inspector
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: mitm_http
+          route_config:
+            name: local
+            virtual_hosts:
+            - name: all
+              domains: ["*"]
+              routes:
+              - match: {prefix: "/"}
+                route:
+                  cluster: dynamic_forward_proxy
+                  timeout: 30s
+          http_filters:
+          # Resolves the Host header and hands the address to the cluster. The
+          # client believes it is talking to :443, so Host carries no port and
+          # the upstream port below applies.
+          - name: envoy.filters.http.dynamic_forward_proxy
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+              dns_cache_config: &dns_cache
+                name: egress_dns
+                dns_lookup_family: V4_ONLY
+                max_hosts: 1024
+                dns_cache_circuit_breaker:
+                  max_pending_requests: 128
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      # transport_socket_connect_timeout is omitted here too, so the PoC can
+      # show the unbounded default. Production must set it, or an SDS outage
+      # stalls every first-contact host indefinitely rather than failing fast.
+      # Copy the knob from envoy-bootstrap-good.yaml along with this upstream.
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            custom_tls_certificate_selector:
+              name: on-demand
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.cert_selectors.on_demand_secret.v3.Config
+                config_source:
+                  api_config_source:
+                    api_type: DELTA_GRPC
+                    transport_api_version: V3
+                    grpc_services:
+                    - envoy_grpc:
+                        cluster_name: sds_mint
+                certificate_mapper:
+                  name: sni
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.cert_mappers.sni.v3.SNI
+                    default_value: "default.mitm.example"
+                prefetch_secret_names:
+                - default.mitm.example
+          disable_stateless_session_resumption: true
+          disable_stateful_session_resumption: true
+
+  clusters:
+  - name: sds_mint
+    type: STATIC
+    connect_timeout: 1s
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
+    load_assignment:
+      cluster_name: sds_mint
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              pipe: {path: ./sdsmint.sock}
+
+  - name: dynamic_forward_proxy
+    connect_timeout: 10s
+    lb_policy: CLUSTER_PROVIDED
+    cluster_type:
+      name: envoy.clusters.dynamic_forward_proxy
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+        dns_cache_config: *dns_cache
+    # auto_sni / auto_san_validation make the re-originated connection carry the
+    # SNI and validate the SAN of the *real* host, so the MITM does not weaken
+    # upstream authentication -- Envoy still verifies the true origin.
+    upstream_http_protocol_options:
+      auto_sni: true
+      auto_san_validation: true
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        common_tls_context:
+          validation_context:
+            trusted_ca:
+              filename: /etc/ssl/certs/ca-certificates.crt
