@@ -45,11 +45,15 @@
 #     set_filter_state on the CONNECT chain and internal_upstream on
 #     mitm_internal -- BOTH are required, and omitting the second fails silently.
 #
-#  3. Nothing routes here yet. cmd/atelet never populates
-#     EgressGatewayAddress on the RunWorkloadRequest, so no workload is
-#     currently pointed at this gateway. It is deployed so it can be exercised
-#     and reviewed, not because it is on the data path. Verify it with
-#     poc/sdsmint/cmd/sdsload --connect-via.
+#  3. THIS GATEWAY IS NOW ON THE DATA PATH. ate-api-server sets
+#     --egress-gateway-address to this Service, which puts every actor's TCP
+#     through the CONNECT front door below; ateapi stamps it onto each
+#     RunWorkloadRequest and ateom turns it into an atunnel redirect. Combined
+#     with point 1, that means an actor outside the demo table has NO egress.
+#     Unsetting that one flag is the entire rollback and needs nothing here.
+#
+#     Verify it end to end with internal/e2e/suites/egressauthz, or by hand
+#     with poc/sdsmint/cmd/sdsload --connect-via.
 #
 #  4. The client certificate now establishes WHICH ACTOR is calling, not merely
 #     that the caller is a substrate workload. ateapi mints an X.509 extension
