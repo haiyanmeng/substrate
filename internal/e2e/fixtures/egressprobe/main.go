@@ -12,15 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command egressprobe drives the egress gateway's MITM leg from inside the
-// cluster and reports the certificate it was served, so an e2e suite can assert
-// on what sdsmintd actually minted.
+// Command egressprobe drives the egress gateway from inside the cluster and
+// reports what happened, so an e2e suite can assert on the gateway's real
+// behaviour rather than on a simulation of it.
+//
+// It serves two suites, which need different halves of the same trip:
+//
+//   - internal/e2e/suites/egressauthz asks whether the CONNECT was authorized.
+//     extprocd decides that from the client certificate, so the probe presents
+//     whichever credential the caller supplies.
+//   - internal/e2e/suites/sdsmint asks what certificate the MITM leg served for
+//     a given SNI, which needs the CONNECT to be allowed first.
 //
 // It has to run in a pod rather than in the test process because the gateway's
-// front door requires a client certificate from the podidentity signer, and
-// that credential is only issued to pods. Everything after the front door is
-// the same path a real actor takes: this uses internal/atunnel, the same client
-// cmd/ateom-gvisor builds, so a change that breaks actor egress breaks this too.
+// front door requires a client certificate, and the probe's own credential is
+// only issued to pods. Everything after the front door is the same path a real
+// actor takes: this uses internal/atunnel, the same client cmd/ateom-gvisor
+// builds, so a change that breaks actor egress breaks this too.
+//
+// The probe is not an actor and cannot become one -- an actor certificate comes
+// from atelet, which mints only for a worker's real assignment. A suite that
+// needs the gateway to see an actor signs a certificate itself and posts it, so
+// the identity the gateway authenticates is the suite's choice. That is a test
+// affordance and depends on the suite holding the actor CA, which is true only
+// against a test cluster.
 //
 // The probe deliberately does NOT verify the certificate it is served. The
 // chain goes back to the test verbatim, because verifying here would collapse
@@ -36,11 +51,13 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"time"
 
 	"github.com/agent-substrate/substrate/internal/atunnel"
+	"github.com/agent-substrate/substrate/internal/e2e/fixtures/egressprobe/probeapi"
 )
 
 var (
@@ -49,62 +66,98 @@ var (
 	// carries. cmd/ateom-gvisor derives ServerName the same way -- the host
 	// half of the gateway address -- so keep these consistent.
 	gatewayAddress       = flag.String("gateway-address", "atenet-egress.ate-system.svc:443", "host:port of the egress gateway's CONNECT front door.")
-	credentialBundlePath = flag.String("credential-bundle", "/run/podidentity.podcert.ate.dev/credential-bundle.pem", "PEM credential bundle presented as the client certificate to the gateway.")
+	credentialBundlePath = flag.String("credential-bundle", "/run/podidentity.podcert.ate.dev/credential-bundle.pem", "PEM credential bundle presented as the client certificate to the gateway when a request supplies none.")
 	trustBundlePath      = flag.String("trust-bundle", "/run/servicedns.podcert.ate.dev/trust-bundle.pem", "PEM trust bundle used to verify the gateway's serving certificate.")
 	handshakeTimeout     = flag.Duration("handshake-timeout", 20*time.Second, "Budget for one CONNECT plus inner handshake.")
+	// maxRequestBytes bounds the posted credential. A client certificate chain
+	// is a few kilobytes; this is generous enough not to matter and small enough
+	// that a runaway body cannot exhaust the probe.
+	maxRequestBytes = flag.Int64("max-request-bytes", 256<<10, "Maximum accepted request body size.")
 )
 
-// tunnelDestination is the CONNECT authority. atunnel takes this from
-// SO_ORIGINAL_DST and rejects hostnames, so it must be a literal IP -- and the
-// gateway routes every CONNECT to the MITM listener regardless of authority,
-// which is why a documentation address that resolves nowhere is enough. The
-// name being tested travels in the tunneled ClientHello, not here.
-const tunnelDestination = "192.0.2.1:443"
+// probe runs one Request and reports the outcome. Every refusal -- a denied
+// CONNECT, a refused SNI -- is a normal result, not an HTTP error: which of them
+// happened is the thing under test. Only a malformed request is a 4xx.
+func probe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST a probeapi.Request", http.StatusMethodNotAllowed)
+		return
+	}
+	var req probeapi.Request
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, *maxRequestBytes)).Decode(&req); err != nil {
+		http.Error(w, "decoding request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 
-// handshakeResult is the probe's response body.
-type handshakeResult struct {
-	SNI string `json:"sni"`
-	// OK reports whether the inner TLS handshake completed. A denied SNI is a
-	// normal outcome, not a probe failure, so it comes back as OK=false with
-	// the reason rather than as an HTTP error.
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
-	// ChainPEM is the chain the gateway presented, leaf first.
-	ChainPEM string `json:"chain_pem,omitempty"`
-}
+	destination := req.Destination
+	if destination == "" {
+		destination = probeapi.DefaultDestination
+	}
+	result := probeapi.Result{
+		Destination: destination,
+		SNI:         req.SNI,
+		Identity:    probeapi.IdentityPod,
+	}
+	if req.ClientCredentialPEM != "" {
+		result.Identity = probeapi.IdentitySupplied
+	}
 
-// handshake opens a tunnel through the gateway and completes an inner TLS
-// handshake for the requested SNI, which is what makes Envoy ask sdsmintd for a
-// secret under that name.
-func handshake(w http.ResponseWriter, r *http.Request) {
-	sni := r.URL.Query().Get("sni")
-	if sni == "" {
-		http.Error(w, "missing sni query parameter", http.StatusBadRequest)
+	getClientCertificate, err := clientCertificateSource(req.ClientCredentialPEM)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), *handshakeTimeout)
 	defer cancel()
 
-	result := handshakeResult{SNI: sni}
-	chain, err := fetchChain(ctx, sni)
+	conn, err := dialTunnel(ctx, destination, getClientCertificate)
 	if err != nil {
-		result.Error = err.Error()
-	} else {
-		result.OK = true
-		result.ChainPEM = chain
+		result.ConnectError = err.Error()
+		writeJSON(w, result)
+		return
+	}
+	defer conn.Close()
+	result.Connected = true
+
+	if req.SNI != "" {
+		chain, err := innerHandshake(ctx, conn, req.SNI)
+		if err != nil {
+			result.HandshakeError = err.Error()
+		} else {
+			result.HandshakeOK = true
+			result.ChainPEM = chain
+		}
 	}
 	writeJSON(w, result)
+}
+
+// clientCertificateSource picks the credential this request presents at the
+// gateway's front door.
+//
+// The supplied credential is parsed here rather than inside the callback so a
+// malformed PEM comes back as a 400 naming the problem, instead of surfacing
+// later as an opaque handshake failure that reads like a gateway fault.
+func clientCertificateSource(credentialPEM string) (func(*tls.CertificateRequestInfo) (*tls.Certificate, error), error) {
+	if credentialPEM == "" {
+		return podIdentityCertificate, nil
+	}
+	cert, err := tls.X509KeyPair([]byte(credentialPEM), []byte(credentialPEM))
+	if err != nil {
+		return nil, fmt.Errorf("parsing supplied client credential: %w", err)
+	}
+	return func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &cert, nil }, nil
 }
 
 // podIdentityCertificate reads the probe's own Pod certificate off disk for
 // each handshake.
 //
-// A real actor gets here differently: atunnel.BrokerCertificateSource asks
-// atelet to mint an actor certificate, so the gateway learns which actor a
-// connection came from. The probe has no actor to be. It is an ordinary Pod
-// testing what sdsmintd mints for a given SNI, so it presents the podidentity
-// credential the gateway's front door requires and nothing more.
+// This says "a substrate workload", not which actor: it carries a PodIdentity
+// and no ActorIdentity at all. A real actor gets here differently --
+// atunnel.BrokerCertificateSource asks atelet to mint an actor certificate, so
+// the gateway learns which actor a connection came from -- which is why the
+// egress PEP denies this credential, and why a suite that needs to be an actor
+// supplies its own.
 //
 // Read per handshake, not cached: the bundle is rotated on disk under the
 // probe, and a cached copy would start failing the front door partway through
@@ -121,25 +174,33 @@ func podIdentityCertificate(*tls.CertificateRequestInfo) (*tls.Certificate, erro
 	return &cert, nil
 }
 
-func fetchChain(ctx context.Context, sni string) (string, error) {
-	// Built per request rather than once at startup: cheap, and it keeps the
-	// trust bundle fresh alongside the credential, which NewClient reads once.
+// dialTunnel opens a CONNECT tunnel to destination. A gateway refusal comes back
+// as an error carrying the status line and response body, which is where the
+// egress PEP's denial reason is.
+func dialTunnel(ctx context.Context, destination string, getClientCertificate func(*tls.CertificateRequestInfo) (*tls.Certificate, error)) (net.Conn, error) {
+	// Built per request rather than once at startup: cheap, it keeps the trust
+	// bundle fresh alongside the credential (NewClient reads it once), and each
+	// request may present a different client certificate.
 	client, err := atunnel.NewClient(atunnel.ClientConfig{
 		GatewayAddress:       *gatewayAddress,
 		ServerName:           serverName(*gatewayAddress),
-		GetClientCertificate: podIdentityCertificate,
+		GetClientCertificate: getClientCertificate,
 		TrustBundlePath:      *trustBundlePath,
 	})
 	if err != nil {
-		return "", fmt.Errorf("building egress client: %w", err)
+		return nil, fmt.Errorf("building egress client: %w", err)
 	}
-
-	conn, err := client.DialContext(ctx, tunnelDestination)
+	conn, err := client.DialContext(ctx, destination)
 	if err != nil {
-		return "", fmt.Errorf("opening tunnel: %w", err)
+		return nil, fmt.Errorf("opening tunnel to %s: %w", destination, err)
 	}
-	defer conn.Close()
+	return conn, nil
+}
 
+// innerHandshake completes a TLS handshake inside an open tunnel, which is what
+// makes Envoy ask sdsmintd for a secret under sni, and returns the chain it was
+// served.
+func innerHandshake(ctx context.Context, conn net.Conn, sni string) (string, error) {
 	//nolint:gosec // G402: verification is the caller's assertion; see the package comment.
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName:         sni,
@@ -184,7 +245,7 @@ func main() {
 	flag.Parse()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/handshake", handshake)
+	mux.HandleFunc("/probe", probe)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})

@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The egress probe used by internal/e2e/suites/sdsmint. ${NAMESPACE} is
-# substituted by the suite with the randomized namespace it created, so the
-# probe is torn down with that namespace and leaves nothing behind.
+# The egress probe used by internal/e2e/suites/sdsmint and
+# internal/e2e/suites/egressauthz. ${NAMESPACE} is substituted by the suite with
+# the randomized namespace it created, so the probe is torn down with that
+# namespace and leaves nothing behind.
 #
-# A plain Pod, not an actor: the suite is testing the gateway's MITM leg, and
+# A plain Pod, not an actor: both suites are testing the egress gateway, and
 # routing that through the actor lifecycle would make a snapshot or restore
-# failure look like an sdsmintd failure.
+# failure look like a gateway failure. A suite that needs the gateway to
+# authenticate a particular actor posts a certificate it minted itself, so
+# nothing here has to be an actor for the gateway to see one.
 
 apiVersion: v1
 kind: Pod

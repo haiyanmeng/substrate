@@ -25,31 +25,29 @@
 // pointed at it. That is exactly why this suite exists. Without it the only
 // signal that the gateway still works is that the pod is Running, and the pod
 // is Running whether or not the allowlist, the CA or the SDS socket is intact.
+//
+// Reaching the minter now takes an authorized CONNECT: extprocd decides, from
+// the client certificate, whether the tunnel opens at all. The probe therefore
+// presents an actor identity chosen to be irrelevant to what is under test --
+// see wideOpenCredential -- and every handshake goes through handshake(), which
+// separates a policy refusal from a minting refusal before any assertion here
+// gets to blame sdsmintd. Egress authorization itself is
+// internal/e2e/suites/egressauthz.
 package sdsmint
 
 import (
 	"context"
 	"crypto/x509"
-	"encoding/json"
 	"encoding/pem"
-	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 
-	"github.com/agent-substrate/substrate/internal/ateclient"
 	"github.com/agent-substrate/substrate/internal/e2e"
+	"github.com/agent-substrate/substrate/internal/e2e/fixtures/egressprobe/probeapi"
+	"github.com/agent-substrate/substrate/internal/extproc"
 	"github.com/agent-substrate/substrate/internal/localca"
-	"github.com/agent-substrate/substrate/internal/portforward"
 )
 
 const (
@@ -66,8 +64,6 @@ const (
 	// that suddenly lasts hours is the failure this pair is here to catch.
 	leafTTL  = 5 * time.Minute
 	leafSkew = 1 * time.Minute
-
-	probeName = "egressprobe"
 )
 
 // TestSdsmintMintsALeafPerSNI is the core functional assertion: two different
@@ -83,16 +79,17 @@ func TestSdsmintMintsALeafPerSNI(t *testing.T) {
 	ns := e2e.CreateNamespace(t)
 
 	root := mitmRootCertificate(t, ctx)
-	probe := startProbe(t, ctx, ns.Name)
+	probe := e2e.StartEgressProbe(t, ctx, ns.Name)
+	credential := wideOpenCredential(t, ctx)
 
 	first := ns.Name + "-a.example.com"
 	second := ns.Name + "-b.example.com"
 
 	chains := map[string][]*x509.Certificate{}
 	for _, sni := range []string{first, second} {
-		result := probe.handshake(t, ctx, sni)
-		if !result.OK {
-			t.Fatalf("handshake for allowlisted SNI %q failed: %s", sni, result.Error)
+		result := handshake(t, ctx, probe, credential, sni)
+		if !result.HandshakeOK {
+			t.Fatalf("handshake for allowlisted SNI %q failed: %s", sni, result.HandshakeError)
 		}
 		chains[sni] = parseChain(t, sni, result.ChainPEM)
 	}
@@ -162,26 +159,68 @@ func TestSdsmintMintsALeafPerSNI(t *testing.T) {
 }
 
 // TestSdsmintRefusesSNIOutsideTheAllowlist is the security half. --allow is the
-// entire egress policy, so an SNI outside it must not produce a certificate --
-// sdsmintd withdraws the resource, Envoy has nothing to present, and the
-// handshake fails. A pass here that used to fail means the gateway will sign
-// for names it was never authorized for.
+// entire egress policy for the MITM leg, so an SNI outside it must not produce
+// a certificate -- sdsmintd withdraws the resource, Envoy has nothing to
+// present, and the handshake fails. A pass here that used to fail means the
+// gateway will sign for names it was never authorized for.
+//
+// The tunnel opens either way: the actor is authorized to CONNECT, and the name
+// it then asks for is not something the CONNECT checkpoint can see. That is the
+// separation handshake() enforces.
 func TestSdsmintRefusesSNIOutsideTheAllowlist(t *testing.T) {
 	ctx := context.Background()
 	ns := e2e.CreateNamespace(t)
 
-	probe := startProbe(t, ctx, ns.Name)
+	probe := e2e.StartEgressProbe(t, ctx, ns.Name)
+	credential := wideOpenCredential(t, ctx)
 
 	// .invalid can never be delegated (RFC 6761), so this cannot collide with
 	// a name someone later adds to the allowlist.
 	sni := ns.Name + ".notallowed.invalid"
-	result := probe.handshake(t, ctx, sni)
-	if result.OK {
+	result := handshake(t, ctx, probe, credential, sni)
+	if result.HandshakeOK {
 		chain := parseChain(t, sni, result.ChainPEM)
 		t.Fatalf("gateway served a certificate for non-allowlisted SNI %q (leaf CN %q, DNSNames %v) -- the allowlist is not being enforced",
 			sni, chain[0].Subject.CommonName, chain[0].DNSNames)
 	}
-	t.Logf("non-allowlisted SNI %q was refused as expected: %s", sni, result.Error)
+	t.Logf("non-allowlisted SNI %q was refused as expected: %s", sni, result.HandshakeError)
+}
+
+// handshake asks the probe for one inner TLS handshake, having first confirmed
+// the gateway allowed the CONNECT that carries it.
+//
+// The two refusals look nothing alike and must not be confused. extprocd
+// refuses the CONNECT with a 403 and no tunnel is created; sdsmintd refuses by
+// declining to mint, which leaves Envoy with no certificate to present inside a
+// tunnel that opened normally. Only the second is this suite's business, so a
+// policy refusal fails here with that said plainly rather than being reported
+// as an sdsmintd regression several assertions later.
+func handshake(t *testing.T, ctx context.Context, probe *e2e.EgressProbe, credential, sni string) probeapi.Result {
+	t.Helper()
+	result := probe.Probe(t, ctx, probeapi.Request{SNI: sni, ClientCredentialPEM: credential})
+	if !result.Connected {
+		t.Fatalf("the gateway refused the CONNECT carrying SNI %q, so the MITM leg was never reached. "+
+			"This is an egress authorization failure, not an sdsmintd one: %s", sni, result.ConnectError)
+	}
+	return result
+}
+
+// wideOpenCredential mints the actor identity the probe presents at the
+// gateway's front door.
+//
+// The probe's own Pod certificate carries no ActorIdentity, and the gateway
+// refuses a CONNECT it cannot attribute to an actor, so with it the probe never
+// reaches the MITM leg at all. acme-prod/wide-open is
+// internal/extproc/hardcoded.go's ALLOW_ALL entry: it authorizes the CONNECT
+// and constrains nothing else, which leaves what happens inside the tunnel
+// entirely to sdsmintd -- exactly the separation this suite wants.
+//
+// ALLOW_ALL resolves to passthrough mode, which does not change where the
+// tunnel goes: the CONNECT vhost has a single connect_matcher route to the
+// internal MITM listener, so every allowed CONNECT is MITMed.
+func wideOpenCredential(t *testing.T, ctx context.Context) string {
+	t.Helper()
+	return e2e.MintActorCredential(t, ctx, extproc.DemoAtespace, "wide-open", "uid-e2e-sdsmint")
 }
 
 // mitmRootCertificate reads the trust anchor sdsmintd signs under, straight
@@ -208,143 +247,6 @@ func mitmRootCertificate(t *testing.T, ctx context.Context) *x509.Certificate {
 	}
 	t.Fatalf("MITM CA pool %s/%s has no CA with id %q", egressNamespace, mitmCASecret, mitmCAID)
 	return nil
-}
-
-// probeClient talks to the in-cluster egress probe over a port-forward.
-type probeClient struct {
-	baseURL string
-	http    *http.Client
-}
-
-// startProbe builds and deploys the probe into ns, waits for it to be ready,
-// and returns a client for it. Teardown rides on the namespace.
-func startProbe(t *testing.T, ctx context.Context, ns string) *probeClient {
-	t.Helper()
-	if _, err := e2e.CheckEnv("KO_DOCKER_REPO"); err != nil {
-		t.Fatalf("CheckEnv failed: %v", err)
-	}
-	root, err := e2e.FindRepoRoot()
-	if err != nil {
-		t.Fatalf("FindRepoRoot: %v", err)
-	}
-
-	tmpl, err := os.ReadFile(filepath.Join(root, "internal/e2e/fixtures/egressprobe/egressprobe.yaml.tmpl"))
-	if err != nil {
-		t.Fatalf("reading egressprobe manifest template: %v", err)
-	}
-	manifest := filepath.Join(t.TempDir(), "egressprobe.yaml")
-	rendered := strings.ReplaceAll(string(tmpl), "${NAMESPACE}", ns)
-	if err := os.WriteFile(manifest, []byte(rendered), 0o644); err != nil {
-		t.Fatalf("writing rendered egressprobe manifest: %v", err)
-	}
-
-	// Same invocation as the identity suite's probe: the repo's pinned ko via
-	// hack/run-tool.sh, with KO_CONFIG_PATH pointing at the repo root because
-	// ko resolves .ko.yaml relative to its working directory, which here is the
-	// test's package dir. Without it the build loses defaultPlatforms.
-	applyArgs := []string{"ko", "apply", "-f", manifest}
-	if e2e.KubeContext != "" {
-		applyArgs = append(applyArgs, "--", "--context="+e2e.KubeContext)
-	}
-	e2e.RunCmdWithEnv(t, []string{"KO_CONFIG_PATH=" + root}, filepath.Join(root, "hack/run-tool.sh"), applyArgs...)
-
-	waitForProbeReady(t, ctx, ns)
-
-	config, err := ateclient.LoadConfig(e2e.KubeConfig, e2e.KubeContext)
-	if err != nil {
-		t.Fatalf("loading kubeconfig: %v", err)
-	}
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		t.Fatalf("creating k8s client for port-forward: %v", err)
-	}
-	localPort, stop, err := portforward.ServicePortForward(ctx, config, clientset, ns, probeName, 8080)
-	if err != nil {
-		t.Fatalf("port-forwarding %s/%s: %v", ns, probeName, err)
-	}
-	t.Cleanup(stop)
-
-	return &probeClient{
-		baseURL: fmt.Sprintf("http://127.0.0.1:%d", localPort),
-		// Comfortably above the probe's own --handshake-timeout, so a gateway
-		// that stalls is reported as the probe's tunnel error rather than as a
-		// client timeout with nothing to point at.
-		http: &http.Client{Timeout: 90 * time.Second},
-	}
-}
-
-func waitForProbeReady(t *testing.T, ctx context.Context, ns string) {
-	t.Helper()
-	const timeout = 3 * time.Minute
-	deadline := time.Now().Add(timeout)
-	// Kept so the timeout can say why the pod never came up. Without it the
-	// failure is just "timed out", and the pod is in a namespace the harness
-	// retains but nobody thinks to look in.
-	var lastState string
-	for time.Now().Before(deadline) {
-		pod, err := e2e.GetClients().K8s.CoreV1().Pods(ns).Get(ctx, probeName, metav1.GetOptions{})
-		switch {
-		case err != nil:
-			lastState = err.Error()
-		case portforward.IsPodReady(pod):
-			t.Logf("probe pod %s/%s is ready", ns, probeName)
-			return
-		default:
-			lastState = describeProbeState(pod)
-		}
-		time.Sleep(2 * time.Second)
-	}
-	t.Fatalf("timed out after %v waiting for probe pod %s/%s to become ready: %s", timeout, ns, probeName, lastState)
-}
-
-func describeProbeState(pod *corev1.Pod) string {
-	parts := []string{"phase=" + string(pod.Status.Phase)}
-	for _, cs := range pod.Status.ContainerStatuses {
-		switch {
-		case cs.State.Waiting != nil:
-			parts = append(parts, fmt.Sprintf("%s waiting: %s: %s", cs.Name, cs.State.Waiting.Reason, cs.State.Waiting.Message))
-		case cs.State.Terminated != nil:
-			parts = append(parts, fmt.Sprintf("%s terminated: %s: %s", cs.Name, cs.State.Terminated.Reason, cs.State.Terminated.Message))
-		default:
-			parts = append(parts, fmt.Sprintf("%s running, ready=%t", cs.Name, cs.Ready))
-		}
-	}
-	return strings.Join(parts, "; ")
-}
-
-// handshake asks the probe to complete one inner TLS handshake for sni. A
-// refused SNI comes back as a result with OK false, not as an error: refusal is
-// one of the outcomes under test.
-func (c *probeClient) handshake(t *testing.T, ctx context.Context, sni string) handshakeResult {
-	t.Helper()
-	endpoint := c.baseURL + "/handshake?sni=" + url.QueryEscape(sni)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		t.Fatalf("building probe request for %q: %v", sni, err)
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		t.Fatalf("calling probe for %q: %v", sni, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		t.Fatalf("probe returned %d for %q: %s", resp.StatusCode, sni, strings.TrimSpace(string(body)))
-	}
-	var out handshakeResult
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatalf("decoding probe response for %q: %v", sni, err)
-	}
-	return out
-}
-
-// handshakeResult mirrors the probe's response body. It is duplicated rather
-// than imported because the probe is package main.
-type handshakeResult struct {
-	SNI      string `json:"sni"`
-	OK       bool   `json:"ok"`
-	Error    string `json:"error"`
-	ChainPEM string `json:"chain_pem"`
 }
 
 func parseChain(t *testing.T, sni, chainPEM string) []*x509.Certificate {
