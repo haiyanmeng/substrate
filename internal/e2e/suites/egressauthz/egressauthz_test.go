@@ -47,13 +47,17 @@ import (
 // Destinations chosen against metrics-shipper's CIDR allowlist, which is the
 // only policy that reads the CONNECT authority.
 //
-// Neither is ever dialled. An allowed CONNECT routes to the gateway's internal
-// MITM listener -- the vhost has a single connect_matcher route -- which answers
-// without reaching the network, and dynamic_forward_proxy only resolves a name
-// on the inner request, which these tests do not send. 9.9.9.9 is a real
-// resolver address rather than documentation space on purpose: if a future
-// change did start dialling, the failure should be a timeout that is obviously
-// wrong, not a connection to a host the test appeared to intend.
+// Neither is ever dialled, though for two different reasons now that the vhost
+// branches on x-ate-egress-mode. A deferred CONNECT routes to the internal MITM
+// listener, which answers without reaching the network -- dynamic_forward_proxy
+// only resolves a name on the inner request, which these tests do not send. A
+// passthrough CONNECT routes to an ORIGINAL_DST cluster that WOULD dial, but
+// Envoy connects the upstream lazily and nothing here writes into the tunnel.
+//
+// 9.9.9.9 is a real resolver address rather than documentation space on
+// purpose: if a future change did start dialling, the failure should be a
+// timeout that is obviously wrong, not a connection to a host the test appeared
+// to intend.
 const (
 	inBlockDestination    = "1.2.3.4:443" // inside 1.2.3.0/24
 	outOfBlockDestination = "9.9.9.9:443" // outside every allowed block
@@ -112,20 +116,31 @@ func TestEgressAuthzEnforcesEachPolicy(t *testing.T) {
 		wantReason: "policy DENY_ALL",
 	}, {
 		// The two hostname policies cannot be decided at the CONNECT: the
-		// authority is an IP literal and the actor resolves DNS itself. They are
-		// deferrals to an inner checkpoint the gateway does not run, so they
-		// must deny. Allowing them would leave these actors constrained only by
-		// the gateway's global sdsmintd allowlist -- a per-actor bypass that
-		// looks like working authorization in every log line.
-		name:        "ALLOW_BY_HOSTNAME fails closed without the inner checkpoint",
+		// authority is an IP literal and the actor resolves DNS itself. Now that
+		// the gateway runs the inner checkpoint, the CONNECT is a DEFERRAL and
+		// so it succeeds -- the hostname check happens later, on the tunnelled
+		// request.
+		//
+		// A pass here therefore proves less than the other cases do, and the
+		// gap is deliberate rather than overlooked: the probe stops at the inner
+		// TLS handshake and never issues an inner HTTP request, which is what
+		// the second ext_proc filter fires on. So nothing below reaches
+		// DecideInner, and neither the hostname allowlist nor credential
+		// injection has end-to-end coverage. Closing that needs a probe that
+		// speaks HTTP inside the tunnel and reports what the destination
+		// received; poc/extproc asserts it against a local Envoy in the
+		// meantime.
+		//
+		// What a pass DOES prove is the failure this file previously guarded:
+		// if --inner-listen were dropped from the Deployment while these routes
+		// stayed, extprocd would have nobody to defer to and would deny here.
+		name:        "ALLOW_BY_HOSTNAME is deferred to the inner checkpoint",
 		actor:       actorRepoReader,
 		destination: anyDestination,
-		wantReason:  "requires the inner checkpoint",
 	}, {
-		name:        "BASIC_CREDENTIAL_INJECT fails closed without the inner checkpoint",
+		name:        "BASIC_CREDENTIAL_INJECT is deferred to the inner checkpoint",
 		actor:       actorInvoiceAgent,
 		destination: anyDestination,
-		wantReason:  "requires the inner checkpoint",
 	}, {
 		// No policy is not an empty policy. An actor the table has never heard
 		// of must be refused rather than defaulted to anything.

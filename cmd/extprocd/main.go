@@ -24,11 +24,14 @@
 // It also assembles the gateway's client-CA bundle; see
 // extproc.ClientCABundler for why that lives here.
 //
-// The gateway's second checkpoint, on the tunnel's inner request after MITM, is
-// implemented (extproc.CheckpointInner) but not deployed: --inner-listen is
-// empty by default. Until it is wired the CONNECT checkpoint denies the two
-// policies that can only be decided there, ALLOW_BY_HOSTNAME and
-// BASIC_CREDENTIAL_INJECT.
+// It answers a second checkpoint on the tunnel's inner request after MITM
+// (extproc.CheckpointInner), which is where the two policies that need a
+// hostname are decided and where credentials are injected. That one is opt-in:
+// --inner-listen is empty by default, and while it is empty the CONNECT
+// checkpoint denies ALLOW_BY_HOSTNAME and BASIC_CREDENTIAL_INJECT rather than
+// letting them through undecided. manifests/ate-install/atenet-egress.yaml sets
+// it; the Envoy side needs three pieces to match, two of which fail silently,
+// and they are documented there.
 //
 // The policy table is hardcoded. --policy-source has no default, so a
 // deployment has to say so out loud.

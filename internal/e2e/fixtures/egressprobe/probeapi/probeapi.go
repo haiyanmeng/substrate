@@ -33,6 +33,14 @@ package probeapi
 // because the name under test travels in the tunneled ClientHello rather than
 // here. A test of egress *policy* wants a destination the policy has an opinion
 // about, and passes one explicitly.
+//
+// "Resolves nowhere" stopped being free once the CONNECT vhost began branching
+// on x-ate-egress-mode. It is still right for an actor whose policy routes to
+// MITM, because that leg answers inside the pod. An actor whose policy resolves
+// to passthrough is dialled for real, and against this address that is a hang
+// until the handshake budget expires -- which reads as a gateway fault rather
+// than as a test pointed at the wrong actor. Pick the destination and the
+// actor together.
 const DefaultDestination = "192.0.2.1:443"
 
 // Identity source names reported back in Result.Identity, so a suite can tell

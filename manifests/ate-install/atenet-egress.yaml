@@ -29,14 +29,21 @@
 #     which actor may reach which destination, and sdsmintd's --allow list still
 #     bounds cluster-wide what this gateway will mint a MITM leaf for at all.
 #
-#  2. TWO OF THE FIVE POLICY KINDS FAIL CLOSED. ALLOW_BY_HOSTNAME and
-#     BASIC_CREDENTIAL_INJECT can only be decided after the MITM, at extprocd's
-#     inner checkpoint, and this deployment does not run one -- --inner-listen
-#     is unset. extprocd denies those actors at CONNECT rather than passing them
-#     through constrained only by the gateway-wide allowlist, which would be a
-#     silent per-actor bypass. Wiring the inner checkpoint means a second
-#     ext_proc filter on mitm_listener plus filter-state plumbing across the
-#     internal listener, and it is deliberately not in this file.
+#  2. THE INJECTED CREDENTIALS ARE FAKE. Both checkpoints now run, so
+#     ALLOW_BY_HOSTNAME and BASIC_CREDENTIAL_INJECT resolve for real: extprocd
+#     answers a second ext_proc call on the tunnelled request, matches the
+#     inner :authority against the policy, and rewrites the credential header.
+#     But the values it writes come from the same hardcoded table as the policy
+#     kinds -- internal/extproc/hardcoded.go carries a literal
+#     "Bearer gho_poc_not_a_real_token". What is wired here is the MECHANISM.
+#     Sourcing real secrets is the Credential/CredentialBinding split in
+#     egress-credentials-scope.md, and it is not in this file either.
+#
+#     The two checkpoints are joined by an Envoy filter-state object rather than
+#     by a header: a CONNECT's headers are not replayed into the tunnel body, so
+#     nothing an actor can see or set carries the identity across. See
+#     set_filter_state on the CONNECT chain and internal_upstream on
+#     mitm_internal -- BOTH are required, and omitting the second fails silently.
 #
 #  3. Nothing routes here yet. cmd/atelet never populates
 #     EgressGatewayAddress on the RunWorkloadRequest, so no workload is
@@ -397,21 +404,57 @@ data:
                   request_headers_to_remove:
                   - x-ate-egress-policy
                   - x-forwarded-client-cert
+                  # Branching on x-ate-egress-mode is what makes the two
+                  # checkpoints add up. extprocd resolves the three
+                  # IP-answerable policies here and defers the two hostname ones
+                  # by asking for MITM, and these routes are how that answer
+                  # turns into a path.
+                  #
+                  # THE BRANCH IS ALSO LOAD-BEARING FOR CORRECTNESS, not just
+                  # for cost. DecideInner rejects DENY_ALL, ALLOW_ALL and
+                  # ALLOW_BY_IP_BLOCK outright (internal/extproc/decision.go)
+                  # because reaching MITM means the route table disagrees with
+                  # the policy table. Collapse these back into one route and the
+                  # three policies that work today start failing at the inner
+                  # checkpoint.
                   routes:
-                  # One route: every allowed CONNECT is MITMed, exactly as
-                  # before extprocd existed. extprocd's "passthrough" mode is
-                  # therefore recorded but not acted on -- those actors still
-                  # take the MITM leg and are still bounded by sdsmintd's
-                  # --allow list. That is stricter than passthrough, not looser,
-                  # so it is safe to leave; making it mean something needs a
-                  # second route matched on x-ate-egress-mode and a cluster that
-                  # tunnels straight out.
-                  - match: {connect_matcher: {}}
+                  - name: passthrough
+                    match:
+                      connect_matcher: {}
+                      headers:
+                      - name: x-ate-egress-mode
+                        string_match: {exact: passthrough}
+                    route:
+                      cluster: passthrough_dst
+                      upgrade_configs:
+                      - upgrade_type: CONNECT
+                        connect_config: {}
+
+                  - name: mitm
+                    match:
+                      connect_matcher: {}
+                      headers:
+                      - name: x-ate-egress-mode
+                        string_match: {exact: mitm}
                     route:
                       cluster: mitm_internal
                       upgrade_configs:
                       - upgrade_type: CONNECT
                         connect_config: {}
+
+                  # Unreachable if ext_proc is working, and deliberately a 500
+                  # rather than a fallback to either route above. extprocd sets
+                  # the mode header with clear_route_cache: true, and the
+                  # measured failure when that flag is missing is that Envoy
+                  # picks a route BEFORE the mutation lands -- so every request
+                  # would silently take whichever route sits first and skip its
+                  # check. This makes that loud.
+                  - name: no_mode
+                    match: {connect_matcher: {}}
+                    direct_response:
+                      status: 500
+                      body:
+                        inline_string: "no egress mode set: ext_proc did not decide, or the route cache was not cleared\n"
               http_filters:
               # THE PER-ACTOR AUTHORIZATION POINT. Runs before the router, which
               # is the only ordering that works: it decides on the CONNECT
@@ -442,6 +485,33 @@ data:
                     response_body_mode: NONE
                     request_trailer_mode: SKIP
                     response_trailer_mode: SKIP
+
+              # HOW THE ACTOR REACHES THE INNER CHECKPOINT. Ordering is not
+              # cosmetic: this reads the x-ate-actor-key that the ext_proc above
+              # just wrote, so it has to run after it and before the router.
+              #
+              # It exists because a header cannot do this job. Envoy terminates
+              # the CONNECT and forwards only the tunnel body, so the CONNECT's
+              # own headers never reach mitm_listener -- and a header sent
+              # INSIDE the tunnel is a channel the actor controls end to end,
+              # which would let one actor name another and inherit its injected
+              # credentials. Filter state is the only carrier whose value
+              # provably came from the certificate Envoy verified.
+              #
+              # factory_key is REQUIRED. Omitting it fails at config LOAD with
+              # "'ate.actor' does not have an object factory", which names this
+              # key rather than the missing field.
+              - name: envoy.filters.http.set_filter_state
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config
+                  on_request_headers:
+                  - object_key: ate.actor
+                    factory_key: envoy.string
+                    format_string:
+                      text_format_source:
+                        inline_string: "%REQ(x-ate-actor-key)%"
+                    shared_with_upstream: TRANSITIVE
+
               - name: envoy.filters.http.router
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -521,6 +591,42 @@ data:
                       cluster: dynamic_forward_proxy
                       timeout: 30s
               http_filters:
+              # THE INNER CHECKPOINT, and the only place credential injection
+              # can happen. It runs FIRST, ahead of dynamic_forward_proxy, so
+              # the hostname is authorized before Envoy resolves or dials it.
+              #
+              # This is where ALLOW_BY_HOSTNAME and BASIC_CREDENTIAL_INJECT are
+              # actually decided: the CONNECT checkpoint could only see an IP,
+              # so it deferred them here by routing to MITM. extprocd matches
+              # the inner :authority, then rewrites the credential header and
+              # strips the substrate-internal ones.
+              #
+              # request_attributes MUST SUBSCRIPT THE KEY. Bare "filter_state"
+              # yields the whole CEL map, which ext_proc flattens to the literal
+              # string "CelMap value" -- an attribute that is present,
+              # non-empty, and carries nothing, so every request resolves to no
+              # actor and is denied. Measured on 1.37.5.
+              #
+              # failure_mode_allow: false for the same reason as the front door,
+              # and it matters more here: a dropped mutation does not fail the
+              # request, it sends it upstream UNAUTHENTICATED.
+              - name: envoy.filters.http.ext_proc
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                  grpc_service:
+                    envoy_grpc:
+                      cluster_name: extproc_inner
+                  failure_mode_allow: false
+                  message_timeout: 5s
+                  processing_mode:
+                    request_header_mode: SEND
+                    response_header_mode: SKIP
+                    request_body_mode: NONE
+                    response_body_mode: NONE
+                    request_trailer_mode: SKIP
+                    response_trailer_mode: SKIP
+                  request_attributes:
+                  - "filter_state['ate.actor']"
               # Re-resolves the destination from the tunnelled request's own
               # Host header rather than reusing the CONNECT authority. This is
               # what stops a client pointing SNI at an allowed name while the
@@ -592,6 +698,30 @@ data:
             max_pending_requests: 65536
             max_requests: 65536
             max_retries: 128
+        # REQUIRED for the inner checkpoint to learn which actor is calling, and
+        # the single least obvious line in this file.
+        #
+        # set_filter_state's shared_with_upstream: TRANSITIVE puts ate.actor on
+        # the UPSTREAM connection; only this transport socket copies it onto the
+        # internal listener's DOWNSTREAM connection, where the inner chain can
+        # read it. The two are one mechanism and neither works alone.
+        #
+        # Omitting it does not error. The hop succeeds, the request proxies, and
+        # the object is simply gone -- measured as fs=[acme-prod/repo-reader] on
+        # the CONNECT chain and fs=[-] on the inner one. Since an absent actor
+        # resolves to the zero key, which has no policy, which denies, the
+        # symptom is "every MITM request is refused", which reads like a policy
+        # bug rather than a config one. Budget a day for anyone who reassembles
+        # this by hand. raw_buffer is the inner socket because the tunnel body
+        # is carried verbatim; the MITM leaf lives on the listener side.
+        transport_socket:
+          name: envoy.transport_sockets.internal_upstream
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.transport_sockets.internal_upstream.v3.InternalUpstreamTransport
+            transport_socket:
+              name: envoy.transport_sockets.raw_buffer
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
         load_assignment:
           cluster_name: mitm_internal
           endpoints:
@@ -633,6 +763,35 @@ data:
                 address:
                   socket_address: {address: 127.0.0.1, port_value: 19600}
 
+      - name: extproc_inner
+        type: STATIC
+        connect_timeout: 1s
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            explicit_http_config:
+              http2_protocol_options: {}
+        # Sized ABOVE extproc_connect on purpose, even though it serves a subset
+        # of the traffic. That cluster gets one stream per CONNECT; this one gets
+        # one per inner HTTP request, and a keep-alive client makes many requests
+        # down a single tunnel. Sizing the two alike is the mistake to avoid: it
+        # would trip here first, and with failure_mode_allow: false a tripped
+        # circuit breaker is a denied request, not a slow one.
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 128
+            max_pending_requests: 32768
+            max_requests: 32768
+            max_retries: 8
+        load_assignment:
+          cluster_name: extproc_inner
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address: {address: 127.0.0.1, port_value: 19601}
+
       - name: sds_mint
         type: STATIC
         connect_timeout: 1s
@@ -668,6 +827,39 @@ data:
             - endpoint:
                 address:
                   pipe: {path: /var/run/sdsmint/sdsmint.sock}
+
+      # The non-MITM leg: tunnels straight out to whatever the CONNECT asked
+      # for, without terminating TLS. Reached only by the passthrough route, so
+      # only by actors whose policy was fully resolved from the destination IP
+      # -- ALLOW_ALL and a satisfied ALLOW_BY_IP_BLOCK. There is nothing left to
+      # inspect for those, and skipping the MITM also skips a minted secret,
+      # which is what keeps the live-secret count tied to actual hostname policy
+      # rather than to total egress volume.
+      #
+      # Reading the destination off :authority is safe here for the same reason
+      # the header comment gives: atunnel's validateDestination rejects
+      # hostnames, so the authority is an IP:port from SO_ORIGINAL_DST. Note
+      # that this cluster is NOT bounded by sdsmintd's --allow list, which the
+      # single-route arrangement used to provide as a backstop -- extprocd's
+      # verdict is now the only thing standing between these actors and the
+      # internet.
+      - name: passthrough_dst
+        type: ORIGINAL_DST
+        lb_policy: CLUSTER_PROVIDED
+        connect_timeout: 2s
+        original_dst_lb_config:
+          use_http_header: true
+          http_header_name: ":authority"
+        # Same reasoning as dynamic_forward_proxy below: this one faces the
+        # internet, so it keeps the tighter limits rather than the internal
+        # legs' 65536.
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 8192
+            max_pending_requests: 8192
+            max_requests: 8192
+            max_retries: 32
 
       - name: dynamic_forward_proxy
         connect_timeout: 10s
@@ -757,8 +949,19 @@ spec:
         # Envoy's admin listener.
         - "--connect-listen=127.0.0.1:19600"
         - "--admin-listen=127.0.0.1:19602"
-        # No --inner-listen. See point 2 in the header: without it the two
-        # post-MITM policy kinds are denied at CONNECT rather than allowed.
+        # The post-MITM checkpoint. Setting this is what makes the CONNECT
+        # checkpoint willing to DEFER a decision instead of denying it: extprocd
+        # treats an unset --inner-listen as "nobody to defer to" and fails
+        # ALLOW_BY_HOSTNAME and BASIC_CREDENTIAL_INJECT closed, because allowing
+        # them would leave those actors bounded only by the gateway-wide
+        # sdsmintd allowlist -- a per-actor bypass that reads as working
+        # authorization in every log line. Pod loopback, same as the others.
+        #
+        # Unsetting it again is a safe rollback of the Go half, but NOT of this
+        # file on its own: the mitm_listener ext_proc below would then call a
+        # port nothing is listening on, and with failure_mode_allow: false that
+        # denies every MITM request. Roll both back together.
+        - "--inner-listen=127.0.0.1:19601"
         #
         # THE POLICY TABLE. "hardcoded" is the only value implemented and it has
         # no default, so a gateway enforcing a demo table has to say so here
