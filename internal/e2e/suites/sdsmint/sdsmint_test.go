@@ -21,10 +21,12 @@
 // unix socket line up. Every assertion here is made on a certificate that came
 // off a real handshake through the real gateway.
 //
-// The gateway is dormant: nothing sets EgressGatewayAddress, so no actor is
-// pointed at it. That is exactly why this suite exists. Without it the only
-// signal that the gateway still works is that the pod is Running, and the pod
-// is Running whether or not the allowlist, the CA or the SDS socket is intact.
+// The probe here is a plain Pod issuing its own CONNECT, which is the only way
+// to drive the minter with an arbitrary SNI: it lets a suite ask for a name
+// nobody has subscribed to, and for one deliberately outside the allowlist.
+// internal/e2e/suites/actoregress covers the other side -- a real Actor whose
+// traffic is redirected into the gateway -- and can assert only that the chain
+// roots here, because it does not get to choose the identity it presents.
 //
 // Reaching the minter now takes an authorized CONNECT: extprocd decides, from
 // the client certificate, whether the tunnel opens at all. The probe therefore
@@ -39,26 +41,15 @@ package sdsmint
 import (
 	"context"
 	"crypto/x509"
-	"encoding/pem"
 	"testing"
 	"time"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/agent-substrate/substrate/internal/e2e"
 	"github.com/agent-substrate/substrate/internal/e2e/fixtures/egressprobe/probeapi"
 	"github.com/agent-substrate/substrate/internal/extproc"
-	"github.com/agent-substrate/substrate/internal/localca"
 )
 
 const (
-	// Where the gateway and its CA live. Both are fixed by
-	// manifests/ate-install/atenet-egress.yaml and hack/install-ate.sh.
-	egressNamespace = "ate-system"
-	mitmCASecret    = "egress-mitm-ca-pool"
-	mitmCASecretKey = "pool"
-	mitmCAID        = "mitm"
-
 	// leafTTL is --ttl on the sdsmintd sidecar, and leafSkew is the backdating
 	// internal/sdsmint/ca.go applies to NotBefore. Their sum is the validity
 	// span every leaf should carry. Keep both in step with the manifest: a leaf
@@ -79,7 +70,7 @@ func TestSdsmintMintsALeafPerSNI(t *testing.T) {
 	ctx := context.Background()
 	ns := e2e.CreateNamespace(t)
 
-	root := mitmRootCertificate(t, ctx)
+	root := e2e.MITMRootCertificate(t, ctx)
 	probe := e2e.StartEgressProbe(t, ctx, ns.Name)
 	credential := mitmRoutedCredential(t, ctx)
 
@@ -92,7 +83,7 @@ func TestSdsmintMintsALeafPerSNI(t *testing.T) {
 		if !result.HandshakeOK {
 			t.Fatalf("handshake for allowlisted SNI %q failed: %s", sni, result.HandshakeError)
 		}
-		chains[sni] = parseChain(t, sni, result.ChainPEM)
+		chains[sni] = e2e.ParseCertChain(t, sni, result.ChainPEM)
 	}
 
 	for sni, chain := range chains {
@@ -112,12 +103,12 @@ func TestSdsmintMintsALeafPerSNI(t *testing.T) {
 		// itself so the root's dNSName constraint is applied too.
 		opts := x509.VerifyOptions{
 			DNSName:       sni,
-			Roots:         certPool(root),
-			Intermediates: certPool(chain[1:]...),
+			Roots:         e2e.CertPool(root),
+			Intermediates: e2e.CertPool(chain[1:]...),
 			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		}
 		if _, err := leaf.Verify(opts); err != nil {
-			t.Errorf("leaf for %q does not verify against the %s/%s MITM root: %v", sni, egressNamespace, mitmCASecret, err)
+			t.Errorf("leaf for %q does not verify against the %s/%s MITM root: %v", sni, e2e.EgressNamespace, e2e.MITMCASecret, err)
 		}
 
 		// Short-lived, which is what bounds the damage from a leaked leaf key
@@ -180,7 +171,7 @@ func TestSdsmintRefusesSNIOutsideTheAllowlist(t *testing.T) {
 	sni := ns.Name + ".notallowed.invalid"
 	result := handshake(t, ctx, probe, credential, sni)
 	if result.HandshakeOK {
-		chain := parseChain(t, sni, result.ChainPEM)
+		chain := e2e.ParseCertChain(t, sni, result.ChainPEM)
 		t.Fatalf("gateway served a certificate for non-allowlisted SNI %q (leaf CN %q, DNSNames %v) -- the allowlist is not being enforced",
 			sni, chain[0].Subject.CommonName, chain[0].DNSNames)
 	}
@@ -233,60 +224,4 @@ func handshake(t *testing.T, ctx context.Context, probe *e2e.EgressProbe, creden
 func mitmRoutedCredential(t *testing.T, ctx context.Context) string {
 	t.Helper()
 	return e2e.MintActorCredential(t, ctx, extproc.DemoAtespace, "repo-reader", "uid-e2e-sdsmint")
-}
-
-// mitmRootCertificate reads the trust anchor sdsmintd signs under, straight
-// from the secret the sidecar mounts, so the test is checking the chain against
-// the CA that is actually deployed rather than one it was told about.
-func mitmRootCertificate(t *testing.T, ctx context.Context) *x509.Certificate {
-	t.Helper()
-	secret, err := e2e.GetClients().K8s.CoreV1().Secrets(egressNamespace).Get(ctx, mitmCASecret, metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("reading MITM CA pool secret %s/%s: %v", egressNamespace, mitmCASecret, err)
-	}
-	// This unmarshals the signing key along with the certificate. That is
-	// unavoidable -- the pool is one blob -- and acceptable only because this
-	// runs against a test cluster with a kubeconfig that could read the secret
-	// anyway. Nothing below touches the key.
-	pool, err := localca.Unmarshal(secret.Data[mitmCASecretKey])
-	if err != nil {
-		t.Fatalf("parsing MITM CA pool from %s/%s key %q: %v", egressNamespace, mitmCASecret, mitmCASecretKey, err)
-	}
-	for _, ca := range pool.CAs {
-		if ca.ID == mitmCAID {
-			return ca.RootCertificate
-		}
-	}
-	t.Fatalf("MITM CA pool %s/%s has no CA with id %q", egressNamespace, mitmCASecret, mitmCAID)
-	return nil
-}
-
-func parseChain(t *testing.T, sni, chainPEM string) []*x509.Certificate {
-	t.Helper()
-	var chain []*x509.Certificate
-	rest := []byte(chainPEM)
-	for {
-		var block *pem.Block
-		block, rest = pem.Decode(rest)
-		if block == nil {
-			break
-		}
-		cert, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			t.Fatalf("parsing certificate served for %q: %v", sni, err)
-		}
-		chain = append(chain, cert)
-	}
-	if len(chain) == 0 {
-		t.Fatalf("no certificates in the chain served for %q", sni)
-	}
-	return chain
-}
-
-func certPool(certs ...*x509.Certificate) *x509.CertPool {
-	pool := x509.NewCertPool()
-	for _, cert := range certs {
-		pool.AddCert(cert)
-	}
-	return pool
 }

@@ -15,6 +15,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -79,5 +80,23 @@ func (c *RouterClient) Get(ctx context.Context, actorRef resources.ActorRef, pat
 	}
 	// The router routes on the Host/:authority, not a header.
 	req.Host = actorRef.DNSName()
+	return c.http.Do(req)
+}
+
+// PostJSON issues POST path to actor through the router with body as
+// application/json, the same routing rules as Get. The caller must close the
+// body.
+//
+// Whatever the actor does with the request has to finish inside this client's
+// timeout, which is a fixed 30s and not derived from ctx. That is ample for an
+// actor already resumed and running; it is not ample for a cold resume plus a
+// slow handler, so resume first and post second.
+func (c *RouterClient) PostJSON(ctx context.Context, actorRef resources.ActorRef, path string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Host = actorRef.DNSName()
+	req.Header.Set("Content-Type", "application/json")
 	return c.http.Do(req)
 }

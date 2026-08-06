@@ -16,26 +16,33 @@
 // reports what happened, so an e2e suite can assert on the gateway's real
 // behaviour rather than on a simulation of it.
 //
-// It serves two suites, which need different halves of the same trip:
+// It runs in two shapes, and Request.Via says which trip to make.
+//
+// As a PLAIN POD (egressprobe.yaml.tmpl) it issues its own CONNECT, presenting
+// whichever client certificate the caller supplies:
 //
 //   - internal/e2e/suites/egressauthz asks whether the CONNECT was authorized.
-//     extprocd decides that from the client certificate, so the probe presents
-//     whichever credential the caller supplies.
+//     extprocd decides that from the client certificate.
 //   - internal/e2e/suites/sdsmint asks what certificate the MITM leg served for
 //     a given SNI, which needs the CONNECT to be allowed first.
 //
-// It has to run in a pod rather than in the test process because the gateway's
-// front door requires a client certificate, and the probe's own credential is
-// only issued to pods. Everything after the front door is the same path a real
-// actor takes: this uses internal/atunnel, the same client cmd/ateom-gvisor
-// builds, so a change that breaks actor egress breaks this too.
+// In this shape the probe is not an actor and cannot become one -- an actor
+// certificate comes from atelet, which mints only for a worker's real
+// assignment. A suite that needs the gateway to see an actor signs a
+// certificate itself and posts it, so the identity the gateway authenticates is
+// the suite's choice. That is a test affordance and depends on the suite
+// holding the actor CA, which is true only against a test cluster. It also
+// means these suites prove nothing about the certificate ateapi really issues.
 //
-// The probe is not an actor and cannot become one -- an actor certificate comes
-// from atelet, which mints only for a worker's real assignment. A suite that
-// needs the gateway to see an actor signs a certificate itself and posts it, so
-// the identity the gateway authenticates is the suite's choice. That is a test
-// affordance and depends on the suite holding the actor CA, which is true only
-// against a test cluster.
+// As an ACTOR (egressprobe-actor.yaml.tmpl) it does the opposite: it dials the
+// destination directly, presents nothing, and knows nothing about a gateway.
+// internal/e2e/suites/actoregress uses this. ateom REDIRECTs the connection and
+// builds the tunnel with the certificate the broker minted for the actor's real
+// assignment, so this is the shape that covers the path production traffic
+// takes -- and the only one that covers the broker at all.
+//
+// The two shapes need different things mounted, which is why direct mode reads
+// neither the credential bundle nor the trust bundle: an Actor has neither.
 //
 // The probe deliberately does NOT verify the certificate it is served. The
 // chain goes back to the test verbatim, because verifying here would collapse
@@ -89,29 +96,49 @@ func probe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	via := req.Via
+	if via == "" {
+		via = probeapi.ViaTunnel
+	}
 	destination := req.Destination
 	if destination == "" {
 		destination = probeapi.DefaultDestination
 	}
 	result := probeapi.Result{
+		Via:         via,
 		Destination: destination,
 		SNI:         req.SNI,
-		Identity:    probeapi.IdentityPod,
-	}
-	if req.ClientCredentialPEM != "" {
-		result.Identity = probeapi.IdentitySupplied
-	}
-
-	getClientCertificate, err := clientCertificateSource(req.ClientCredentialPEM)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), *handshakeTimeout)
 	defer cancel()
 
-	conn, err := dialTunnel(ctx, destination, getClientCertificate)
+	var (
+		conn net.Conn
+		err  error
+	)
+	switch via {
+	case probeapi.ViaDirect:
+		// No credential and no proxy: the whole point is that this looks like an
+		// ordinary outbound connection. If it reaches the gateway anyway,
+		// something below this process put it there.
+		conn, err = dialDirect(ctx, destination)
+	case probeapi.ViaTunnel:
+		result.Identity = probeapi.IdentityPod
+		if req.ClientCredentialPEM != "" {
+			result.Identity = probeapi.IdentitySupplied
+		}
+		var getClientCertificate func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
+		getClientCertificate, err = clientCertificateSource(req.ClientCredentialPEM)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		conn, err = dialTunnel(ctx, destination, getClientCertificate)
+	default:
+		http.Error(w, fmt.Sprintf("unknown via %q, want %q or %q", via, probeapi.ViaTunnel, probeapi.ViaDirect), http.StatusBadRequest)
+		return
+	}
 	if err != nil {
 		result.ConnectError = err.Error()
 		writeJSON(w, result)
@@ -193,6 +220,29 @@ func dialTunnel(ctx context.Context, destination string, getClientCertificate fu
 	conn, err := client.DialContext(ctx, destination)
 	if err != nil {
 		return nil, fmt.Errorf("opening tunnel to %s: %w", destination, err)
+	}
+	return conn, nil
+}
+
+// dialDirect opens a plain TCP connection to destination, with no knowledge that
+// a gateway exists.
+//
+// Under an Actor this is the entire mechanism under test. ateom's nftables
+// prerouting rule REDIRECTs the connection to atunnel's local listener, which
+// recovers the intended address from SO_ORIGINAL_DST and rebuilds it as a
+// CONNECT carrying the Actor's certificate. None of that is visible from here,
+// which is why the interesting assertion is on what comes back from the
+// handshake rather than on this call.
+//
+// Two consequences for a caller reading the Result. Success proves almost
+// nothing on its own -- the REDIRECT is local, so this returns before atunnel
+// has spoken to the gateway. And a policy denial arrives as an EOF partway
+// through the handshake, because atunnel logs the 403 and closes the socket
+// (internal/atunnel/egress.go).
+func dialDirect(ctx context.Context, destination string) (net.Conn, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", destination)
+	if err != nil {
+		return nil, fmt.Errorf("dialing %s: %w", destination, err)
 	}
 	return conn, nil
 }
