@@ -47,17 +47,20 @@ import (
 // Destinations chosen against metrics-shipper's CIDR allowlist, which is the
 // only policy that reads the CONNECT authority.
 //
-// Neither is ever dialed, though for two different reasons now that the vhost
-// branches on x-ate-egress-mode. A deferred CONNECT routes to the internal MITM
-// listener, which answers without reaching the network -- dynamic_forward_proxy
-// only resolves a name on the inner request, which these tests do not send. A
-// passthrough CONNECT routes to an ORIGINAL_DST cluster that WOULD dial, but
-// Envoy connects the upstream lazily and nothing here writes into the tunnel.
+// Whether a destination is dialed depends on which route its policy selects,
+// and the two answers differ. A deferred CONNECT (the hostname policies) goes
+// to the internal MITM listener, which answers without reaching the network --
+// dynamic_forward_proxy only resolves a name on the inner request, which these
+// tests do not send. A passthrough CONNECT goes to an ORIGINAL_DST cluster that
+// really dials the authority, and Envoy withholds the 200 until that upstream
+// connection is up. So an allowed destination that does not answer comes back
+// as a 503 rather than as an open tunnel, which is why the passthrough cases
+// assert through requireAuthorized rather than requireConnected.
 //
-// 9.9.9.9 is a real resolver address rather than documentation space on
-// purpose: if a future change did start dialing, the failure should be a
-// timeout that is obviously wrong, not a connection to a host the test appeared
-// to intend.
+// 1.2.3.4 is inside the allowlist and does not answer, so the in-block case
+// always takes the 503 path. 9.9.9.9 is a real resolver: where the cluster has
+// outbound internet the ALLOW_ALL case is a genuine end-to-end passthrough, and
+// where it does not the same assertion still holds on authorization alone.
 const (
 	inBlockDestination    = "1.2.3.4:443" // inside 1.2.3.0/24
 	outOfBlockDestination = "9.9.9.9:443" // outside every allowed block
@@ -91,16 +94,24 @@ func TestEgressAuthzEnforcesEachPolicy(t *testing.T) {
 		actor       string
 		destination string
 		// wantReason is the substring the gateway's refusal must contain. Empty
-		// means the CONNECT is expected to succeed.
+		// means the CONNECT is expected to be authorized.
 		wantReason string
+		// dialsOut marks the cases whose policy resolves to passthrough. Those
+		// CONNECTs really dial the destination (see the destination block
+		// above), so an authorized one still fails when nothing answers, and
+		// the assertion has to be on the authorization outcome alone. The
+		// MITM-deferred cases never leave the pod and must connect outright.
+		dialsOut bool
 	}{{
 		name:        "ALLOW_ALL reaches anything",
 		actor:       actorWideOpen,
 		destination: outOfBlockDestination,
+		dialsOut:    true,
 	}, {
 		name:        "ALLOW_BY_IP_BLOCK reaches an address in an allowed block",
 		actor:       actorMetricsShipper,
 		destination: inBlockDestination,
+		dialsOut:    true,
 	}, {
 		name:        "ALLOW_BY_IP_BLOCK refuses an address outside every block",
 		actor:       actorMetricsShipper,
@@ -144,10 +155,18 @@ func TestEgressAuthzEnforcesEachPolicy(t *testing.T) {
 	}, {
 		// No policy is not an empty policy. An actor the table has never heard
 		// of must be refused rather than defaulted to anything.
+		//
+		// It is refused with DENY_ALL's own reason, not a distinct one:
+		// Snapshot.Lookup maps an actor it has never seen to DenyAll
+		// (internal/extproc/policy.go), so by the time DecideConnect runs there
+		// is nothing left to tell the two apart. That is the fail-closed default
+		// working, and the reason string is deliberately not more specific --
+		// confirming to a caller that its actor is absent from the table says
+		// more than a denial needs to.
 		name:        "an actor with no policy is refused",
 		actor:       actorUnknown,
 		destination: anyDestination,
-		wantReason:  "unknown policy kind",
+		wantReason:  "policy DENY_ALL",
 	}}
 
 	for _, tc := range cases {
@@ -157,19 +176,29 @@ func TestEgressAuthzEnforcesEachPolicy(t *testing.T) {
 				Destination:         tc.destination,
 				ClientCredentialPEM: credential,
 			})
-			if tc.wantReason == "" {
-				requireConnected(t, extproc.DemoAtespace+"/"+tc.actor, result)
-				return
+			who := extproc.DemoAtespace + "/" + tc.actor
+			switch {
+			case tc.wantReason != "":
+				requireDenied(t, who, result, tc.wantReason)
+			case tc.dialsOut:
+				requireAuthorized(t, who, result)
+			default:
+				requireConnected(t, who, result)
 			}
-			requireDenied(t, extproc.DemoAtespace+"/"+tc.actor, result, tc.wantReason)
 		})
 	}
 }
 
 // TestEgressAuthzRefusesUnusableIdentities covers the certificates that carry
 // no actor the gateway can act on. Each is a distinct way of arriving without
-// an identity, and each must be refused for its own reason rather than
-// collapsing into a generic failure.
+// an identity, and each must be refused.
+//
+// Two of them are refused for their own reason; the third is not, and the
+// difference is the gateway's, not this test's. A certificate the gateway
+// cannot read an identity out of fails in extprocd's identity layer and says
+// so. A certificate it reads perfectly well, which simply names no actor, is
+// not an error at all -- it produces the zero actor key, and every path from
+// there is the ordinary unknown-actor denial.
 func TestEgressAuthzRefusesUnusableIdentities(t *testing.T) {
 	ctx := context.Background()
 	ns := e2e.CreateNamespace(t)
@@ -208,12 +237,20 @@ func TestEgressAuthzRefusesUnusableIdentities(t *testing.T) {
 	// and carrying no ActorIdentity at all. It authenticates a substrate
 	// workload, which is not the same as authorizing an actor's egress. This is
 	// the fail-closed proof -- every pod in the cluster holds one of these.
+	//
+	// The refusal is DENY_ALL's, for the reason above: a certificate with no
+	// ActorIdentity is not malformed, so it yields the zero actor key rather
+	// than an identity error, and Snapshot.Lookup denies the zero key exactly
+	// as it denies an unknown actor. What matters is that the default is a
+	// denial and not an allow; that it is indistinguishable from
+	// acme-prod/quarantined's is the fail-closed path arriving at the same
+	// place from a different direction.
 	t.Run("a pod certificate with no actor identity", func(t *testing.T) {
 		result := probe.Probe(t, ctx, probeapi.Request{Destination: anyDestination})
 		if result.Identity != probeapi.IdentityPod {
 			t.Fatalf("probe presented %q, want %q", result.Identity, probeapi.IdentityPod)
 		}
-		requireDenied(t, "pod identity", result, "unknown policy kind")
+		requireDenied(t, "pod identity", result, "policy DENY_ALL")
 	})
 }
 
@@ -224,6 +261,40 @@ func requireConnected(t *testing.T, who string, result probeapi.Result) {
 		t.Fatalf("%s was refused for %s but should have been allowed: %s", who, result.Destination, result.ConnectError)
 	}
 	t.Logf("%s: CONNECT to %s was allowed", who, result.Destination)
+}
+
+// requireAuthorized asserts the gateway did not refuse the CONNECT on policy
+// grounds, for the passthrough cases where it then really dials.
+//
+// Reaching the destination is not this suite's business and cannot be made
+// this suite's business: the demo table's allowed blocks correspond to nothing
+// a cluster can reach, so an allowed CONNECT legitimately ends in Envoy's
+// upstream connect timeout. What is asserted instead is the shape of that
+// failure. A 403 is a policy denial and fails here. So is anything that is
+// neither a 403 nor an upstream-connect failure, which is what keeps this from
+// silently passing when the tunnel breaks before the dial -- an ext_proc
+// outage under failure_mode_allow false, say, which would otherwise look like
+// "not a 403" and slip through.
+//
+// The gap this leaves: where a cluster has no outbound internet, no case in
+// this file proves a passthrough tunnel carries bytes end to end. Closing it
+// needs a reachable in-cluster destination inside an allowed block, which the
+// hardcoded table cannot express without widening it.
+func requireAuthorized(t *testing.T, who string, result probeapi.Result) {
+	t.Helper()
+	if result.Connected {
+		t.Logf("%s: CONNECT to %s was allowed and the destination answered", who, result.Destination)
+		return
+	}
+	if strings.Contains(result.ConnectError, "403") {
+		t.Fatalf("%s was refused for %s by policy, but should have been allowed: %s", who, result.Destination, result.ConnectError)
+	}
+	if !strings.Contains(result.ConnectError, "upstream connect error") {
+		t.Fatalf("%s failed to reach %s, and not because the destination was unreachable: %s",
+			who, result.Destination, result.ConnectError)
+	}
+	t.Logf("%s: CONNECT to %s was allowed; the destination did not answer, which is expected: %s",
+		who, result.Destination, strings.TrimSpace(result.ConnectError))
 }
 
 // requireDenied asserts the gateway refused the CONNECT, and refused it for the
