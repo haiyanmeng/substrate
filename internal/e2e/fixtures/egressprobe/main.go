@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/agent-substrate/substrate/internal/atunnel"
@@ -96,27 +97,44 @@ func handshake(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, result)
 }
 
+// podIdentityCertificate reads the probe's own Pod certificate off disk for
+// each handshake.
+//
+// A real actor gets here differently: atunnel.BrokerCertificateSource asks
+// atelet to mint an actor certificate, so the gateway learns which actor a
+// connection came from. The probe has no actor to be. It is an ordinary Pod
+// testing what sdsmintd mints for a given SNI, so it presents the podidentity
+// credential the gateway's front door requires and nothing more.
+//
+// Read per handshake, not cached: the bundle is rotated on disk under the
+// probe, and a cached copy would start failing the front door partway through
+// a long suite.
+func podIdentityCertificate(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	pemBytes, err := os.ReadFile(*credentialBundlePath)
+	if err != nil {
+		return nil, fmt.Errorf("reading credential bundle: %w", err)
+	}
+	cert, err := tls.X509KeyPair(pemBytes, pemBytes)
+	if err != nil {
+		return nil, fmt.Errorf("parsing credential bundle %q: %w", *credentialBundlePath, err)
+	}
+	return &cert, nil
+}
+
 func fetchChain(ctx context.Context, sni string) (string, error) {
-	// Built per request rather than once at startup: the credential bundle is
-	// rotated on disk under the probe, and a client that cached it would start
-	// failing the front door partway through a long suite.
+	// Built per request rather than once at startup: cheap, and it keeps the
+	// trust bundle fresh alongside the credential, which NewClient reads once.
 	client, err := atunnel.NewClient(atunnel.ClientConfig{
 		GatewayAddress:       *gatewayAddress,
 		ServerName:           serverName(*gatewayAddress),
-		CredentialBundlePath: *credentialBundlePath,
+		GetClientCertificate: podIdentityCertificate,
 		TrustBundlePath:      *trustBundlePath,
 	})
 	if err != nil {
 		return "", fmt.Errorf("building egress client: %w", err)
 	}
 
-	conn, err := client.DialContext(ctx, tunnelDestination, atunnel.EgressMetadata{
-		// Metadata, not authentication -- the gateway strips and re-derives
-		// anything it acts on. See the header of atenet-egress.yaml.
-		Atespace:     "e2e",
-		ActorName:    "egressprobe",
-		ActorVersion: 1,
-	})
+	conn, err := client.DialContext(ctx, tunnelDestination)
 	if err != nil {
 		return "", fmt.Errorf("opening tunnel: %w", err)
 	}
