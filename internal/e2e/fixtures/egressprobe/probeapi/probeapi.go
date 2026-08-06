@@ -37,7 +37,7 @@ package probeapi
 // "Resolves nowhere" stopped being free once the CONNECT vhost began branching
 // on x-ate-egress-mode. It is still right for an actor whose policy routes to
 // MITM, because that leg answers inside the pod. An actor whose policy resolves
-// to passthrough is dialled for real, and against this address that is a hang
+// to passthrough is dialed for real, and against this address that is a hang
 // until the handshake budget expires -- which reads as a gateway fault rather
 // than as a test pointed at the wrong actor. Pick the destination and the
 // actor together.

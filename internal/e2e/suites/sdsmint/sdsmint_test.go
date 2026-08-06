@@ -215,7 +215,7 @@ func handshake(t *testing.T, ctx context.Context, probe *e2e.EgressProbe, creden
 //
 // Its hostname allowlist (github.com and friends) does not cover the SNIs below
 // and does not have to: that list is checked at the inner checkpoint, which
-// fires on the tunnelled HTTP request, and the probe stops at the TLS
+// fires on the tunneled HTTP request, and the probe stops at the TLS
 // handshake. If the probe ever learns to speak HTTP inside the tunnel, these
 // tests will start failing on an authorization denial that has nothing to do
 // with sdsmintd -- at which point the fix is a demo actor whose allowlist

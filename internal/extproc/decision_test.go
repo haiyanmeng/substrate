@@ -51,7 +51,7 @@ func TestDecideConnect(t *testing.T) {
 		{"ip block matches host bits set", ipBlock, "1.2.3.9:443", ModePassthrough},
 		{"ip block matches network address", ipBlock, "1.2.3.0:443", ModePassthrough},
 		{"ip block matches broadcast address", ipBlock, "1.2.3.255:443", ModePassthrough},
-		{"ip block rejects neighbour /24", ipBlock, "1.2.4.1:443", ModeDeny},
+		{"ip block rejects neighbor /24", ipBlock, "1.2.4.1:443", ModeDeny},
 		{"ip block matches v6", ipBlock, "[2600:2d00::1]:443", ModePassthrough},
 		{"ip block rejects other v6", ipBlock, "[2601::1]:443", ModeDeny},
 
@@ -79,7 +79,7 @@ func TestDecideConnect(t *testing.T) {
 // A CONNECT authority that is not an ip:port literal must fail closed for every
 // policy that would otherwise need to inspect it. Resolving it instead would
 // hand the actor a DNS-rebinding primitive: pass the check with one answer, get
-// dialled with another.
+// dialed with another.
 func TestDecideConnectUnparseableDestinationFailsClosed(t *testing.T) {
 	for _, p := range []Policy{
 		{Kind: KindAllowByIPBlock, IPBlocks: mustPrefixes("1.2.3.0/24")},
@@ -95,7 +95,7 @@ func TestDecideConnectUnparseableDestinationFailsClosed(t *testing.T) {
 	}
 
 	// ALLOW_ALL genuinely does not care what the destination is, and DENY_ALL
-	// never reads it. Neither should change behaviour.
+	// never reads it. Neither should change behavior.
 	if got := DecideConnect(Policy{Kind: KindAllowAll}, netip.AddrPort{}, false); got.Mode != ModePassthrough {
 		t.Errorf("ALLOW_ALL with an unparseable destination = %q, want passthrough", got.Mode)
 	}
@@ -124,7 +124,7 @@ func TestDecideInnerHostname(t *testing.T) {
 		{"GitHub.com", true},
 		{"github.com.", true},
 		{"github.com:443", true},
-		// Neighbours that a sloppy prefix or suffix match would let through.
+		// Neighbors that a sloppy prefix or suffix match would let through.
 		{"evil-github.com", false},
 		{"github.com.evil.example", false},
 		{"sub.github.com", false},

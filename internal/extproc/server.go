@@ -324,7 +324,7 @@ func (s *Server) decideInner(
 // the time a request reaches the inner listener the peer certificate belongs to
 // Envoy's own MITM, not the actor, so nothing on this leg is self-evidently
 // trustworthy: an x-ate-actor-key header here travels inside the tunnel, which
-// is a channel the actor controls end to end, and honouring it would let an
+// is a channel the actor controls end to end, and honoring it would let an
 // actor name another actor and inherit its policy -- injected credentials
 // included. Missing filter state resolves to the zero key, which has no policy,
 // which denies.

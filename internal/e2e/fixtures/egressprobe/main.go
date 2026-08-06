@@ -14,7 +14,7 @@
 
 // Command egressprobe drives the egress gateway from inside the cluster and
 // reports what happened, so an e2e suite can assert on the gateway's real
-// behaviour rather than on a simulation of it.
+// behavior rather than on a simulation of it.
 //
 // It runs in two shapes, and Request.Via says which trip to make.
 //

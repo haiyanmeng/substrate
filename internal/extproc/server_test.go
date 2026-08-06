@@ -113,7 +113,7 @@ func connectRequest(t *testing.T, actor, authority string, extra ...string) *ext
 }
 
 // withFilterStateActor attaches the identity the CONNECT checkpoint established,
-// which is the only source the inner checkpoint honours.
+// which is the only source the inner checkpoint honors.
 func withFilterStateActor(req *extprocv3.ProcessingRequest, actor string) *extprocv3.ProcessingRequest {
 	req.Attributes = map[string]*structpb.Struct{
 		"envoy.filters.http.ext_proc": {
@@ -248,7 +248,7 @@ func TestConnectCheckpointIgnoresForgedIdentityHeaders(t *testing.T) {
 		ActorKeyHeader+": "+DemoAtespace+"/wide-open",
 	))
 	if got := immediateStatus(resp); got != typev3.StatusCode_Forbidden {
-		t.Errorf("status = %v, want 403; header-asserted identity was honoured", got)
+		t.Errorf("status = %v, want 403; header-asserted identity was honored", got)
 	}
 }
 
@@ -432,7 +432,7 @@ func TestInnerCheckpointReadsIdentityOnlyFromFilterState(t *testing.T) {
 			":authority: api.stripe.com",
 		}, forged...)...))
 		if got := immediateStatus(resp); got != typev3.StatusCode_Forbidden {
-			t.Fatalf("status = %v, want 403: a header-asserted identity was honoured", got)
+			t.Fatalf("status = %v, want 403: a header-asserted identity was honored", got)
 		}
 	})
 }

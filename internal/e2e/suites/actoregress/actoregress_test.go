@@ -147,7 +147,7 @@ func TestActorEgressIsTunneled(t *testing.T) {
 			"The handshake succeeded, so something answered -- but it was not this cluster's egress gateway",
 			sni, e2e.EgressNamespace, e2e.MITMCASecret, err)
 	}
-	t.Logf("actor %s/%s dialled %s and was served a %d-cert chain rooted at the MITM CA (leaf CN %q, serial %s): "+
+	t.Logf("actor %s/%s dialed %s and was served a %d-cert chain rooted at the MITM CA (leaf CN %q, serial %s): "+
 		"its egress went through the gateway", actor.Atespace, actor.Name, probeDestination, len(chain),
 		leaf.Subject.CommonName, leaf.SerialNumber.Text(16))
 }
@@ -164,7 +164,7 @@ func TestActorEgressIsTunneled(t *testing.T) {
 // The one thing it does assert on its own is that the connection came up. Under
 // the redirect the socket is local to the worker and connects before atunnel
 // has spoken to the gateway at all, so Connected distinguishes "the gateway
-// refused" from "there was no redirect and the actor really dialled TEST-NET-1"
+// refused" from "there was no redirect and the actor really dialed TEST-NET-1"
 // -- the failure mode that would otherwise let this test pass for the wrong
 // reason.
 func TestActorEgressIsDeniedByPolicy(t *testing.T) {

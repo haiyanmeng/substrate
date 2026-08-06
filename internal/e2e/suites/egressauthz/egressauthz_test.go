@@ -16,7 +16,7 @@
 //
 // extprocd answers an ext_proc call on every CONNECT and decides, from the
 // actor named by the client certificate, whether that destination is allowed.
-// Its unit tests drive that logic directly against a synthesised
+// Its unit tests drive that logic directly against a synthesized
 // ProcessingRequest. What they cannot cover is everything between the actor and
 // the decision: that Envoy calls extprocd at all, that the identity survives the
 // x-forwarded-client-cert round trip, that the actor CA half of the gateway's
@@ -30,7 +30,7 @@
 // The policy table is internal/extproc/hardcoded.go: five actors in one
 // atespace, one per policy kind. The names below are that table. When it is
 // replaced by a real policy source these tests need the equivalent fixtures,
-// not deletion -- the behaviours they pin are properties of the enforcement
+// not deletion -- the behaviors they pin are properties of the enforcement
 // point, not of the table.
 package egressauthz
 
@@ -47,7 +47,7 @@ import (
 // Destinations chosen against metrics-shipper's CIDR allowlist, which is the
 // only policy that reads the CONNECT authority.
 //
-// Neither is ever dialled, though for two different reasons now that the vhost
+// Neither is ever dialed, though for two different reasons now that the vhost
 // branches on x-ate-egress-mode. A deferred CONNECT routes to the internal MITM
 // listener, which answers without reaching the network -- dynamic_forward_proxy
 // only resolves a name on the inner request, which these tests do not send. A
@@ -55,7 +55,7 @@ import (
 // Envoy connects the upstream lazily and nothing here writes into the tunnel.
 //
 // 9.9.9.9 is a real resolver address rather than documentation space on
-// purpose: if a future change did start dialling, the failure should be a
+// purpose: if a future change did start dialing, the failure should be a
 // timeout that is obviously wrong, not a connection to a host the test appeared
 // to intend.
 const (
@@ -118,7 +118,7 @@ func TestEgressAuthzEnforcesEachPolicy(t *testing.T) {
 		// The two hostname policies cannot be decided at the CONNECT: the
 		// authority is an IP literal and the actor resolves DNS itself. Now that
 		// the gateway runs the inner checkpoint, the CONNECT is a DEFERRAL and
-		// so it succeeds -- the hostname check happens later, on the tunnelled
+		// so it succeeds -- the hostname check happens later, on the tunneled
 		// request.
 		//
 		// A pass here therefore proves less than the other cases do, and the
