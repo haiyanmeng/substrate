@@ -97,7 +97,7 @@ var (
 // maxResponseBytes bounds what an inner response can put in a Result. Tests read
 // a denial reason or a short status message out of it -- extprocd's "egress
 // denied: ..." and GitHub's error JSON both fit in a fraction of this -- and an
-// arbitrary origin's response body has no business travelling back through the
+// arbitrary origin's response body has no business traveling back through the
 // probe API in full.
 const maxResponseBytes = 16 << 10
 
