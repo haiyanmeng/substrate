@@ -18,26 +18,42 @@
 #
 # READ THIS BEFORE ENABLING IT FOR REAL TRAFFIC
 #
-#  1. There is NO per-actor authorization. The only egress control here is
-#     sdsmintd's --allow list below, and it applies cluster-wide: every actor
-#     that can reach this gateway gets exactly the same allowlist. The
-#     X-Ate-Atespace / X-Ate-Actor-Name headers that atunnel sends are carried
-#     but nothing reads them, and they are not authentication -- a client that
-#     holds a valid podidentity certificate can set them to anything. Adding
-#     per-actor policy means an ext_proc filter on the CONNECT listener; that
-#     is deliberately not in this file.
+#  1. Per-actor authorization is enforced, but THE POLICY TABLE IS A HARDCODED
+#     DEMO. extprocd below answers an ext_proc call on every CONNECT and decides
+#     from the actor identity in the client certificate. The five actors it
+#     knows live in atespace "acme-prod" (internal/extproc/hardcoded.go); every
+#     other actor is denied, so pointing a real workload here without replacing
+#     that table denies it. Replacing it is the Store seam in that package.
 #
-#  2. Nothing routes here yet. cmd/atelet never populates
+#     Two controls stack here and neither subsumes the other: extprocd decides
+#     which actor may reach which destination, and sdsmintd's --allow list still
+#     bounds cluster-wide what this gateway will mint a MITM leaf for at all.
+#
+#  2. TWO OF THE FIVE POLICY KINDS FAIL CLOSED. ALLOW_BY_HOSTNAME and
+#     BASIC_CREDENTIAL_INJECT can only be decided after the MITM, at extprocd's
+#     inner checkpoint, and this deployment does not run one -- --inner-listen
+#     is unset. extprocd denies those actors at CONNECT rather than passing them
+#     through constrained only by the gateway-wide allowlist, which would be a
+#     silent per-actor bypass. Wiring the inner checkpoint means a second
+#     ext_proc filter on mitm_listener plus filter-state plumbing across the
+#     internal listener, and it is deliberately not in this file.
+#
+#  3. Nothing routes here yet. cmd/atelet never populates
 #     EgressGatewayAddress on the RunWorkloadRequest, so no workload is
 #     currently pointed at this gateway. It is deployed so it can be exercised
 #     and reviewed, not because it is on the data path. Verify it with
 #     poc/sdsmint/cmd/sdsload --connect-via.
 #
-#  3. The client certificate check below authenticates that the caller is a
-#     substrate workload holding a podidentity credential. It does NOT
-#     establish which actor is calling. See point 1.
+#  4. The client certificate now establishes WHICH ACTOR is calling, not merely
+#     that the caller is a substrate workload. ateapi mints an X.509 extension
+#     carrying substratex509.ActorIdentity, and Envoy hands the whole verified
+#     certificate to extprocd in x-forwarded-client-cert -- the identity is in a
+#     custom extension rather than a SAN, so there is no Envoy attribute that
+#     could surface it instead. The front door therefore has to trust TWO client
+#     CAs, podidentity for pod tooling and the actor CA for actors, which is
+#     what the assembled client-ca bundle below exists for.
 #
-#  4. IT IS SIZED FOR 10,000 LIVE SNIs, AND THAT IS A REAL CEILING, not a
+#  5. IT IS SIZED FOR 10,000 LIVE SNIs, AND THAT IS A REAL CEILING, not a
 #     default that degrades politely. Past roughly 13,200 Envoy stops accepting
 #     requests. Going higher is an edit to seven values that have to move
 #     together, not to one -- see RESIZING below.
@@ -187,15 +203,26 @@ data:
         watched_directory:
           path: /run/servicedns.podcert.ate.dev
 
+  # The front door has to authenticate two populations against two different
+  # CAs: actors, whose certificates ateapi signs with the actor-id CA pool, and
+  # ordinary pod tooling holding a podidentity credential. trusted_ca is a
+  # single DataSource with no repeated form, so the two roots have to arrive
+  # already concatenated -- combined_validation_context does not help, it
+  # combines a static context with an SDS one rather than unioning CA sets.
+  #
+  # extprocd assembles the file; see internal/extproc/clientca.go for why the
+  # job lives there. It rewrites the bundle when either input changes, and
+  # watched_directory is what makes Envoy pick that up, so podidentity CA
+  # rotation still propagates without a restart.
   sds-client-ca.yaml: |
     resources:
     - "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret
       name: client_ca
       validation_context:
         trusted_ca:
-          filename: /run/podidentity.podcert.ate.dev/trust-bundle.pem
+          filename: /run/gateway-client-ca/client-ca.pem
         watched_directory:
-          path: /run/podidentity.podcert.ate.dev
+          path: /run/gateway-client-ca
 
   envoy.yaml: |
     # Requires Envoy 1.37 or newer: on_demand_secret and cert_mappers.sni do not
@@ -290,12 +317,30 @@ data:
         address:
           socket_address: {address: 0.0.0.0, port_value: 8443}
         filter_chains:
-        - filters:
+        - name: connect_in
+          filters:
           - name: envoy.filters.network.http_connection_manager
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
               stat_prefix: connect_in
               upgrade_configs: [{upgrade_type: CONNECT}]
+              # How the actor's identity reaches extprocd. It lives in a custom
+              # X.509 extension rather than a SAN, so no Envoy attribute can
+              # surface it -- ext_proc has to be handed the whole certificate
+              # and parse it. This works where a route-level
+              # request_headers_to_add with %DOWNSTREAM_PEER_CERT% would not,
+              # because HCM sets this header at ingress, before the filter
+              # chain, whereas the router filter runs after ext_proc.
+              #
+              # SANITIZE_SET IS THE SECURITY-CRITICAL HALF. It makes Envoy
+              # overwrite whatever the client sent under this name. With
+              # APPEND_FORWARD an actor could prepend a forged element and
+              # choose its own identity, and extprocd reads the nearest hop.
+              forward_client_cert_details: SANITIZE_SET
+              set_current_client_cert_details:
+                cert: true
+                subject: true
+                uri: true
               # The front door sees only the CONNECT authority, which is an IP
               # from SO_ORIGINAL_DST -- the hostname is inside the tunnel and
               # shows up on the mitm_http log below instead. What this leg is
@@ -321,23 +366,46 @@ data:
                       downstream: "%DOWNSTREAM_REMOTE_ADDRESS%"
                       peer_subject: "%DOWNSTREAM_PEER_SUBJECT%"
                       peer_uri_san: "%DOWNSTREAM_PEER_URI_SAN%"
-                      # Metadata, not authentication. See the header comment.
-                      atespace: "%REQ(X-ATE-ATESPACE)%"
-                      actor: "%REQ(X-ATE-ACTOR-NAME)%"
-                      actor_version: "%REQ(X-ATE-ACTOR-VERSION)%"
+                      # extprocd's verdict, and its reason when it denied.
+                      # There is no actor name here on purpose: the identity is
+                      # inside the peer certificate, which does not render into
+                      # an access log field, and the X-Ate-* headers that used
+                      # to sit here were self-asserted metadata that nothing
+                      # authenticated. extprocd logs the actor it resolved, and
+                      # its /stats counters break the same thing down by actor.
+                      egress_mode: "%REQ(X-ATE-EGRESS-MODE)%"
+                      details: "%RESPONSE_CODE_DETAILS%"
                       termination: "%CONNECTION_TERMINATION_DETAILS%"
               route_config:
                 name: connect
                 virtual_hosts:
                 - name: all
                   domains: ["*"]
-                  # Strip anything a client asserts about egress handling.
-                  # Nothing reads these today; stripping them now means adding
-                  # a filter that does cannot be fed by the client itself.
+                  # This list is applied by the ROUTER, which runs after
+                  # ext_proc -- so anything named here is removed even if
+                  # extprocd set it. That is why x-ate-egress-mode is no longer
+                  # in it: extprocd sets that header on every allow, and
+                  # stripping it would blank the egress_mode access-log field
+                  # above and take the value away from the inner checkpoint when
+                  # one is wired. Nothing is lost by dropping it, because what
+                  # stops an actor choosing its own mode is extprocd's
+                  # OVERWRITE_IF_EXISTS_OR_ADD mutation rather than this list.
+                  #
+                  # x-forwarded-client-cert is belt and braces alongside
+                  # SANITIZE_SET above; extprocd has already read it by the time
+                  # the router applies this.
                   request_headers_to_remove:
-                  - x-ate-egress-mode
                   - x-ate-egress-policy
+                  - x-forwarded-client-cert
                   routes:
+                  # One route: every allowed CONNECT is MITMed, exactly as
+                  # before extprocd existed. extprocd's "passthrough" mode is
+                  # therefore recorded but not acted on -- those actors still
+                  # take the MITM leg and are still bounded by sdsmintd's
+                  # --allow list. That is stricter than passthrough, not looser,
+                  # so it is safe to leave; making it mean something needs a
+                  # second route matched on x-ate-egress-mode and a cluster that
+                  # tunnels straight out.
                   - match: {connect_matcher: {}}
                     route:
                       cluster: mitm_internal
@@ -345,6 +413,35 @@ data:
                       - upgrade_type: CONNECT
                         connect_config: {}
               http_filters:
+              # THE PER-ACTOR AUTHORIZATION POINT. Runs before the router, which
+              # is the only ordering that works: it decides on the CONNECT
+              # before a route is picked, and it is handed the peer certificate
+              # by the forward_client_cert_details above.
+              #
+              # failure_mode_allow: false makes extprocd a HARD AVAILABILITY
+              # DEPENDENCY of all actor egress -- if the sidecar is down or
+              # slow, every CONNECT fails rather than bypassing policy. That is
+              # the intended trade and it is why extprocd is a native sidecar
+              # with restartPolicy: Always rather than a separate Deployment.
+              #
+              # Only the request headers are sent. The body of a CONNECT is the
+              # tunnel itself, and streaming it through ext_proc would put a Go
+              # process in the data path of every byte the gateway carries.
+              - name: envoy.filters.http.ext_proc
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                  grpc_service:
+                    envoy_grpc:
+                      cluster_name: extproc_connect
+                  failure_mode_allow: false
+                  message_timeout: 5s
+                  processing_mode:
+                    request_header_mode: SEND
+                    response_header_mode: SKIP
+                    request_body_mode: NONE
+                    response_body_mode: NONE
+                    request_trailer_mode: SKIP
+                    response_trailer_mode: SKIP
               - name: envoy.filters.http.router
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -504,6 +601,38 @@ data:
                   envoy_internal_address:
                     server_listener_name: mitm_listener
 
+      - name: extproc_connect
+        type: STATIC
+        connect_timeout: 1s
+        # ext_proc is gRPC, so HTTP/2 is not optional -- without this the
+        # cluster fails at connect time, and with failure_mode_allow: false that
+        # means every CONNECT is refused. `envoy --mode validate` does not catch
+        # it, because the config is well formed; it shows up only under traffic.
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            explicit_http_config:
+              http2_protocol_options: {}
+        # One bidirectional stream per in-flight CONNECT, closed as soon as the
+        # verdict is sent -- so unlike sds_mint this really is a burst limit and
+        # not a cap on a live set. Sized against the 32,768 downstream
+        # connections the overload manager allows, halved because each tunnel
+        # holds two of those and only the front-door leg reaches this cluster.
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 128
+            max_pending_requests: 16384
+            max_requests: 16384
+            max_retries: 8
+        load_assignment:
+          cluster_name: extproc_connect
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address: {address: 127.0.0.1, port_value: 19600}
+
       - name: sds_mint
         type: STATIC
         connect_timeout: 1s
@@ -608,6 +737,71 @@ spec:
         runAsNonRoot: true
         fsGroup: 65532
       initContainers:
+      # A native sidecar, and it must be FIRST: it writes the client-CA bundle
+      # that Envoy's front door validates against, and Envoy cannot load its
+      # config until that file exists. extprocd writes it synchronously at
+      # startup before it begins serving, so ordering the container here is the
+      # whole of the dependency -- there is no readiness gate to add.
+      #
+      # It outlives Envoy on shutdown for the same reason sdsmintd does: with
+      # failure_mode_allow: false, an extprocd that exits first turns a drain
+      # into a wall of 500s on connections that are still finishing.
+      - name: extprocd
+        image: ko://github.com/agent-substrate/substrate/cmd/extprocd
+        restartPolicy: Always
+        args:
+        # Both listeners are pod-loopback and must stay there. This port
+        # authorizes egress; anything that can reach it can watch every
+        # destination every actor asks for, and admin's /stats names actors and
+        # policy kinds. Same reasoning as sdsmintd's --metrics-addr below and
+        # Envoy's admin listener.
+        - "--connect-listen=127.0.0.1:19600"
+        - "--admin-listen=127.0.0.1:19602"
+        # No --inner-listen. See point 2 in the header: without it the two
+        # post-MITM policy kinds are denied at CONNECT rather than allowed.
+        #
+        # THE POLICY TABLE. "hardcoded" is the only value implemented and it has
+        # no default, so a gateway enforcing a demo table has to say so here
+        # rather than have it inferred. internal/extproc/hardcoded.go is the
+        # table; the Store seam behind it is where an ate-api client goes.
+        - "--policy-source=hardcoded"
+        # The two client CAs, concatenated for Envoy. Order is not significant
+        # to Envoy; podidentity is first because it is the one that rotates.
+        # See internal/extproc/clientca.go, and sds-client-ca.yaml above.
+        - "--client-ca-in=/run/podidentity.podcert.ate.dev/trust-bundle.pem"
+        - "--client-ca-in=/run/actor-id-ca/root.pem"
+        - "--client-ca-out=/run/gateway-client-ca/client-ca.pem"
+        - "--client-ca-refresh=1m"
+        - "--log-level=info"
+        # Neither dimension scales with the live secret count, which is what
+        # makes this the small container in a pod otherwise sized by it: one
+        # short gRPC stream per CONNECT, a policy table measured in kilobytes,
+        # and no cryptography beyond parsing a certificate that Envoy has
+        # already verified.
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: client-ca
+          mountPath: /run/gateway-client-ca
+        - name: "podidentity"
+          mountPath: "/run/podidentity.podcert.ate.dev"
+          readOnly: true
+        # PUBLIC ROOT ONLY. The actor-id-ca-pool Secret that hack/install-ate.sh
+        # creates holds the CA's SIGNING KEY, and mounting it here would hand
+        # the egress policy point the key that mints actor identities. The
+        # ConfigMap carries just the root certificate.
+        - name: actor-id-ca
+          mountPath: /run/actor-id-ca
+          readOnly: true
       # A native sidecar, not a plain init container. Ordering matters in both
       # directions: sdsmintd is serving before Envoy loads its config, and it
       # outlives Envoy on shutdown, so a drain does not pull the SDS server out
@@ -731,7 +925,14 @@ spec:
         # --atunnel-egress-trust-bundle.
         - name: "servicedns"
           mountPath: "/run/servicedns.podcert.ate.dev"
-        # Client CA, for authenticating the calling workload.
+        # The client CAs, for authenticating the calling actor. Envoy reads only
+        # the assembled bundle; the podidentity projection is mounted alongside
+        # it so that a rotation of that trust bundle is visible in this
+        # container too, and so the two paths in sds-client-ca.yaml and
+        # extprocd's --client-ca-in cannot drift apart unnoticed.
+        - name: client-ca
+          mountPath: /run/gateway-client-ca
+          readOnly: true
         - name: "podidentity"
           mountPath: "/run/podidentity.podcert.ate.dev"
         # Memory is the resource that actually varies here, and it varies with
@@ -788,6 +989,20 @@ spec:
           name: atenet-egress-envoy-config
       - name: sdsmint-sock
         emptyDir: {}
+      # Written by extprocd, read by Envoy. An emptyDir rather than a ConfigMap
+      # because one of its two inputs is a projected trust bundle that the
+      # kubelet rotates, so the contents cannot be known at install time.
+      - name: client-ca
+        emptyDir: {}
+      # The actor CA's public root, published by hack/install-ate.sh alongside
+      # the actor-id-ca-pool Secret. A ConfigMap, not that Secret: the Secret
+      # holds the signing key.
+      - name: actor-id-ca
+        configMap:
+          name: actor-id-ca-root
+          items:
+          - key: root.pem
+            path: root.pem
       - name: "servicedns"
         projected:
           sources:

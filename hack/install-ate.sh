@@ -222,10 +222,15 @@ apply_otel_config() {
 }
 
 # Extract a CA pool secret's RootCertificateDER and emit it as a PEM certificate.
+#
+# The namespace is a parameter rather than a constant because the pool secrets
+# do not all live in one: the podcertificate controller's are in its own
+# namespace, and actor-id-ca-pool is in ate-system.
 ca_pool_root_pem() {
   local secret="$1"
+  local namespace="$2"
   local pool_json=""
-  pool_json=$(run_kubectl get secret -n podcertificate-controller-system "${secret}" -o jsonpath='{.data.pool}' | base64 --decode)
+  pool_json=$(run_kubectl get secret -n "${namespace}" "${secret}" -o jsonpath='{.data.pool}' | base64 --decode)
   local der_base64=""
   der_base64=$(echo "${pool_json}" | grep -o '"RootCertificateDER":"[^"]*' | sed 's/"RootCertificateDER":"//')
   echo "${der_base64}" | base64 --decode | openssl x509 -inform der -outform pem
@@ -242,9 +247,9 @@ create_valkey_ca_certs_secret() {
   # failing inside printf's argument list, which would silently produce a CA
   # file with a missing root.
   local servicedns_root=""
-  servicedns_root=$(ca_pool_root_pem service-dns-ca-pool)
+  servicedns_root=$(ca_pool_root_pem service-dns-ca-pool podcertificate-controller-system)
   local podidentity_root=""
-  podidentity_root=$(ca_pool_root_pem pod-identity-ca-pool)
+  podidentity_root=$(ca_pool_root_pem pod-identity-ca-pool podcertificate-controller-system)
   if [[ -z "${servicedns_root}" || -z "${podidentity_root}" ]]; then
     echo "error: failed to extract a CA root for valkey-ca-certs" >&2
     return 1
@@ -273,6 +278,37 @@ create_actor_id_ca_pool_secret() {
     --ca-id="1" \
     --name="actor-id-ca-pool" \
     --secret-namespace=ate-system
+}
+
+# Publish the actor CA's PUBLIC ROOT for the egress gateway.
+#
+# The gateway's front door authenticates two populations against two different
+# CAs: actors, whose certificates ate-apiserver signs with the pool above, and
+# ordinary pod tooling holding a podidentity credential. Envoy's trusted_ca is a
+# single file, so extprocd concatenates the two roots in the pod; this is the
+# input it reads for the actor half.
+#
+# A ConfigMap, and deliberately NOT the actor-id-ca-pool Secret itself: that
+# Secret carries SigningKeyPKCS8 alongside the root, so mounting it on the
+# gateway would hand the component that enforces actor identity the key that
+# mints it. Only the root certificate crosses.
+#
+# Derived from the pool, so it must be created after it -- and recreated if the
+# pool ever is. The presence check below will not notice a root that no longer
+# matches; a rotation means deleting this ConfigMap too.
+create_actor_id_ca_root_configmap() {
+  log_step "create_actor_id_ca_root_configmap"
+  local root_pem=""
+  root_pem=$(ca_pool_root_pem actor-id-ca-pool ate-system)
+  if [[ -z "${root_pem}" ]]; then
+    echo "error: failed to extract the actor-id-ca-pool root certificate" >&2
+    return 1
+  fi
+  run_kubectl create configmap actor-id-ca-root \
+    --from-literal=root.pem="${root_pem}" \
+    -n ate-system \
+    --dry-run=client -o yaml \
+    | run_kubectl apply -f -
 }
 
 # The MITM CA the egress gateway's sdsmintd sidecar signs per-SNI leaves with.
@@ -432,6 +468,11 @@ ensure_apiserver_prerequisites() {
     || create_jwt_authority_pool_secret
   run_kubectl get secret -n ate-system actor-id-ca-pool >/dev/null 2>&1 \
     || create_actor_id_ca_pool_secret
+  # The egress gateway mounts this read-only to authenticate actors, so a
+  # missing ConfigMap makes the volume unmountable and that pod never starts.
+  # Derived from the pool secret above, hence ordered after it.
+  run_kubectl get configmap -n ate-system actor-id-ca-root >/dev/null 2>&1 \
+    || create_actor_id_ca_root_configmap
   run_kubectl get secret -n podcertificate-controller-system service-dns-ca-pool >/dev/null 2>&1 \
     || create_podcertificate_controller_cas
   run_kubectl get secret -n ate-system valkey-ca-certs >/dev/null 2>&1 \

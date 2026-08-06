@@ -36,8 +36,11 @@ type credentialBroker struct {
 }
 
 func (b *credentialBroker) MintActorCertificate(ctx context.Context, req *ateletpb.MintActorCertificateRequest) (*ateletpb.MintActorCertificateResponse, error) {
-	// TODO: Before release, require the egress PEP to reject actor certificates
-	// whose ActorIdentity purpose is not atunnel.
+	// The purpose recorded here is enforced at the egress gateway: extprocd
+	// reads the ActorIdentity back out of the peer certificate and rejects any
+	// Purpose other than atunnel, so a certificate minted for something else
+	// cannot be replayed to open a tunnel. See internal/extproc/identity.go.
+	//
 	// Worker identity comes only from the mTLS certificate. The expected actor
 	// UID is a stale-activation guard; ateapi derives the actor authoritatively.
 	workerIdentity, err := authenticatedWorkerIdentity(ctx)
