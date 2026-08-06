@@ -50,9 +50,18 @@ func HardcodedSnapshot() *Snapshot {
 		// A fixed hostname allowlist. Needs MITM, because the CONNECT authority
 		// is an IP literal (internal/atunnel/client.go:197-213 rejects anything
 		// else) and the actor resolves DNS itself.
+		//
+		// api.github.com is the only entry here that is reachable end to end: a
+		// name must also be in sdsmintd's --allow before the MITM leg can serve
+		// a certificate for it. It is also the control arm of the injection test
+		// in internal/e2e/suites/egressauthz -- this actor reaches the GitHub
+		// API bare, invoice-agent reaches it with a credential attached, and the
+		// difference in what GitHub answers is the whole assertion. Removing it
+		// does not weaken this actor's policy; it silently deletes that test's
+		// baseline.
 		{Atespace: DemoAtespace, Name: "repo-reader"}: {
 			Kind:      KindAllowByHostname,
-			Hostnames: []string{"github.com", "microsoft.com", "my-app.my-company.com"},
+			Hostnames: []string{"api.github.com", "github.com", "microsoft.com", "my-app.my-company.com"},
 		},
 
 		// A fixed CIDR allowlist. Decided entirely from the CONNECT authority,
@@ -69,8 +78,20 @@ func HardcodedSnapshot() *Snapshot {
 		// keeping this process separate from sdsmintd.
 		{Atespace: DemoAtespace, Name: "invoice-agent"}: {
 			Kind:      KindBasicCredentialInject,
-			Hostnames: []string{"api.stripe.com", "github.com"},
+			Hostnames: []string{"api.github.com", "api.stripe.com", "github.com"},
 			Inject: map[string][]Injection{
+				// The one entry that can be observed from outside the gateway,
+				// and the reason it is api.github.com: GitHub answers an
+				// anonymous request with 200 and a bogus bearer with 401, so the
+				// status code alone says whether this injection fired.
+				// internal/e2e/suites/egressauthz asserts exactly that against
+				// repo-reader, which reaches the same host without it.
+				//
+				// A hostname must be in Hostnames as well as here -- Validate
+				// refuses an injection for a host the allowlist does not cover.
+				"api.github.com": {
+					{From: "authorization", To: "authorization", Value: "Bearer gho_poc_not_a_real_token"},
+				},
 				"api.stripe.com": {
 					{From: "authorization", To: "token", Value: "X"},
 				},

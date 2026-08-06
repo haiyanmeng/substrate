@@ -321,6 +321,14 @@ create_actor_id_ca_root_configmap() {
 # the constraint is rejected by every verifier, so a mismatch surfaces as a
 # handshake failure rather than as a config error.
 #
+# Editing this list does NOT change an existing cluster. make-ca-pool creates
+# the secret and the caller above only invokes it when the secret is absent, so
+# a widened constraint needs the secret deleted first:
+#
+#   kubectl delete secret -n ate-system egress-mitm-ca-pool
+#   hack/install-ate.sh --create-egress-mitm-ca-pool-secret
+#   kubectl rollout restart deployment/atenet-egress -n ate-system
+#
 # --max-path-len=1 leaves room for the in-memory delegated signing intermediate
 # that --ca-intermediate-ttl creates. Without it the root would have to sign
 # every leaf itself, which is the difference between a future KMS-backed root
@@ -338,6 +346,7 @@ create_egress_mitm_ca_pool_secret() {
     --key-type=ecdsa-p256 \
     --common-name="substrate egress MITM CA" \
     --permitted-dns-domain=example.com \
+    --permitted-dns-domain=api.github.com \
     --max-path-len=1
 }
 

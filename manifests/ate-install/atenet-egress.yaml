@@ -1051,6 +1051,17 @@ spec:
         # with --permitted-dns-domain on the CA pool; see the header comment.
         - "--allow=example.com"
         - "--allow=*.example.com"
+        # A real name, and the only one here. The inner checkpoint is otherwise
+        # unreachable end to end: a hostname has to clear this list AND the
+        # actor's own allowlist in internal/extproc/hardcoded.go, and every
+        # other pairing of the two is disjoint, so the MITM leg fails at the
+        # handshake before any request exists to police. See
+        # internal/e2e/suites/egressauthz.
+        #
+        # api.github.com rather than *.github.com: the wildcard would need
+        # --permitted-dns-domain=github.com, and a DNS name constraint covers
+        # the apex and every depth beneath it. One name is what the test needs.
+        - "--allow=api.github.com"
         - "--allow=default.egress.invalid"
         #
         # Do not add --ca-allow-unconstrained. It lets the CA key sign for any

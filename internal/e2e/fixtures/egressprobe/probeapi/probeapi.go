@@ -95,6 +95,19 @@ type Request struct {
 	// name. Empty stops after the CONNECT, which is what a test of egress
 	// authorization wants: the decision has already been made by then.
 	SNI string `json:"sni"`
+	// RequestPath, when set alongside SNI, makes the probe send one GET inside
+	// the tunnel and report the response in HTTPStatus and HTTPBody.
+	//
+	// This is the ONLY way to reach the gateway's inner checkpoint. Envoy's
+	// second ext_proc filter fires on request headers, so a probe that stops at
+	// the handshake never invokes it and neither the hostname allowlist nor
+	// credential injection is consulted. Empty keeps that older behavior, which
+	// is what a test of the CONNECT decision wants -- that one has already
+	// happened by the time the tunnel exists.
+	//
+	// The request carries no Authorization header. That is deliberate: any
+	// credential the destination sees was put there by the gateway.
+	RequestPath string `json:"request_path"`
 	// ClientCredentialPEM is the certificate chain and private key presented to
 	// the gateway's front door. Empty means the probe's own Pod credential.
 	//
@@ -144,4 +157,20 @@ type Result struct {
 	// ChainPEM is the chain the gateway presented on the inner handshake, leaf
 	// first. The probe does not verify it; see the probe's package comment.
 	ChainPEM string `json:"chain_pem,omitempty"`
+
+	// HTTPStatus and HTTPBody are the response to Request.RequestPath, and are
+	// the only evidence available about what the destination actually received.
+	// Zero when no request was asked for or the handshake never completed.
+	//
+	// A THIRD PARTY CAN ANSWER 403. extprocd's own denial is a 403 carrying
+	// "egress denied: <reason>", and an origin that dislikes something about the
+	// request can return one too -- GitHub does, for a request with no
+	// User-Agent. Assert on the body, never on the status alone.
+	HTTPStatus int `json:"http_status,omitempty"`
+	// HTTPBody is truncated: a test reads a reason or a status message out of
+	// it, and an unbounded origin response has no business crossing this API.
+	HTTPBody string `json:"http_body,omitempty"`
+	// HTTPError reports a request that could not be completed at all, as
+	// distinct from one the far side refused. A refusal arrives as a status.
+	HTTPError string `json:"http_error,omitempty"`
 }

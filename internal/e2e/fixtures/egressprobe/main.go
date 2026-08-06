@@ -44,6 +44,13 @@
 // The two shapes need different things mounted, which is why direct mode reads
 // neither the credential bundle nor the trust bundle: an Actor has neither.
 //
+// In either shape, a request that sets both SNI and RequestPath goes one step
+// further and sends a real GET inside the tunnel. That step is what reaches the
+// gateway's inner checkpoint: the second ext_proc filter fires on request
+// headers, so a probe that stops at the handshake never consults the hostname
+// allowlist or credential injection at all. The response goes back to the test
+// unexamined, for the same reason the chain does.
+//
 // The probe deliberately does NOT verify the certificate it is served. The
 // chain goes back to the test verbatim, because verifying here would collapse
 // "the leaf was minted for the wrong name", "it does not chain to the MITM CA"
@@ -51,12 +58,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -75,12 +84,22 @@ var (
 	gatewayAddress       = flag.String("gateway-address", "atenet-egress.ate-system.svc:443", "host:port of the egress gateway's CONNECT front door.")
 	credentialBundlePath = flag.String("credential-bundle", "/run/podidentity.podcert.ate.dev/credential-bundle.pem", "PEM credential bundle presented as the client certificate to the gateway when a request supplies none.")
 	trustBundlePath      = flag.String("trust-bundle", "/run/servicedns.podcert.ate.dev/trust-bundle.pem", "PEM trust bundle used to verify the gateway's serving certificate.")
-	handshakeTimeout     = flag.Duration("handshake-timeout", 20*time.Second, "Budget for one CONNECT plus inner handshake.")
+	// Covers the whole trip, which since RequestPath may include a round trip to
+	// a real destination on the internet rather than two handshakes against
+	// something in the pod.
+	handshakeTimeout = flag.Duration("handshake-timeout", 30*time.Second, "Budget for one CONNECT, the inner handshake, and any request sent through it.")
 	// maxRequestBytes bounds the posted credential. A client certificate chain
 	// is a few kilobytes; this is generous enough not to matter and small enough
 	// that a runaway body cannot exhaust the probe.
 	maxRequestBytes = flag.Int64("max-request-bytes", 256<<10, "Maximum accepted request body size.")
 )
+
+// maxResponseBytes bounds what an inner response can put in a Result. Tests read
+// a denial reason or a short status message out of it -- extprocd's "egress
+// denied: ..." and GitHub's error JSON both fit in a fraction of this -- and an
+// arbitrary origin's response body has no business travelling back through the
+// probe API in full.
+const maxResponseBytes = 16 << 10
 
 // probe runs one Request and reports the outcome. Every refusal -- a denied
 // CONNECT, a refused SNI -- is a normal result, not an HTTP error: which of them
@@ -148,12 +167,27 @@ func probe(w http.ResponseWriter, r *http.Request) {
 	result.Connected = true
 
 	if req.SNI != "" {
-		chain, err := innerHandshake(ctx, conn, req.SNI)
+		tlsConn, chain, err := innerHandshake(ctx, conn, req.SNI)
 		if err != nil {
 			result.HandshakeError = err.Error()
-		} else {
-			result.HandshakeOK = true
-			result.ChainPEM = chain
+			writeJSON(w, result)
+			return
+		}
+		defer tlsConn.Close()
+		result.HandshakeOK = true
+		result.ChainPEM = chain
+
+		// Only now is the inner ext_proc reachable: it fires on request headers,
+		// which the handshake above does not produce.
+		if req.RequestPath != "" {
+			status, body, err := innerRequest(ctx, tlsConn, req.SNI, req.RequestPath)
+			// Recorded independently of err: a status that arrived before the
+			// body failed is the more useful half of the answer.
+			result.HTTPStatus = status
+			result.HTTPBody = body
+			if err != nil {
+				result.HTTPError = err.Error()
+			}
 		}
 	}
 	writeJSON(w, result)
@@ -248,9 +282,13 @@ func dialDirect(ctx context.Context, destination string) (net.Conn, error) {
 }
 
 // innerHandshake completes a TLS handshake inside an open tunnel, which is what
-// makes Envoy ask sdsmintd for a secret under sni, and returns the chain it was
-// served.
-func innerHandshake(ctx context.Context, conn net.Conn, sni string) (string, error) {
+// makes Envoy ask sdsmintd for a secret under sni, and returns both the chain it
+// was served and the connection it was served on.
+//
+// The connection comes back open because the caller may have a request to send
+// on it. It is closed here only on the paths that return an error, where there
+// is nothing left to send.
+func innerHandshake(ctx context.Context, conn net.Conn, sni string) (*tls.Conn, string, error) {
 	//nolint:gosec // G402: verification is the caller's assertion; see the package comment.
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName:         sni,
@@ -258,18 +296,68 @@ func innerHandshake(ctx context.Context, conn net.Conn, sni string) (string, err
 		MinVersion:         tls.VersionTLS12,
 	})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		return "", fmt.Errorf("inner TLS handshake for %q: %w", sni, err)
+		tlsConn.Close()
+		return nil, "", fmt.Errorf("inner TLS handshake for %q: %w", sni, err)
 	}
-	defer tlsConn.Close()
 
 	var out []byte
 	for _, cert := range tlsConn.ConnectionState().PeerCertificates {
 		out = append(out, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})...)
 	}
 	if len(out) == 0 {
-		return "", fmt.Errorf("handshake for %q completed with no peer certificates", sni)
+		tlsConn.Close()
+		return nil, "", fmt.Errorf("handshake for %q completed with no peer certificates", sni)
 	}
-	return string(out), nil
+	return tlsConn, string(out), nil
+}
+
+// innerRequest sends one GET over an established inner connection and reads the
+// response. This is the call the gateway's inner ext_proc sees, and the only one
+// that reaches the hostname allowlist or credential injection.
+//
+// Written and read directly rather than through an http.Client: the connection
+// already exists and is the thing under test, and a Transport would be free to
+// open another one, retry, or upgrade the protocol -- none of which a test
+// asserting on a single request through a single tunnel can tolerate.
+//
+// A response status is a result, not an error, however hostile: extprocd denies
+// with a 403 and so may the origin. Only a request that could not be completed
+// comes back as an error.
+func innerRequest(ctx context.Context, conn net.Conn, host, path string) (int, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+path, nil)
+	if err != nil {
+		return 0, "", fmt.Errorf("building request for %q: %w", path, err)
+	}
+	req.Host = host
+	// Named explicitly rather than left to net/http's default. Some origins
+	// refuse a request whose User-Agent they do not like -- GitHub answers one
+	// with no User-Agent at all with a 403, which is indistinguishable at a
+	// glance from the gateway's own denial.
+	req.Header.Set("User-Agent", "substrate-egressprobe/1")
+
+	if deadline, ok := ctx.Deadline(); ok {
+		// The write and the read below are raw socket operations and do not
+		// observe ctx on their own.
+		if err := conn.SetDeadline(deadline); err != nil {
+			return 0, "", fmt.Errorf("setting deadline: %w", err)
+		}
+	}
+	if err := req.Write(conn); err != nil {
+		return 0, "", fmt.Errorf("sending request for %q: %w", path, err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		return 0, "", fmt.Errorf("reading response for %q: %w", path, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		// The status arrived, so report it: a truncated body is still worth
+		// less than knowing the destination answered at all.
+		return resp.StatusCode, "", fmt.Errorf("reading response body: %w", err)
+	}
+	return resp.StatusCode, string(body), nil
 }
 
 // serverName is the host half of a host:port address. It is written by hand

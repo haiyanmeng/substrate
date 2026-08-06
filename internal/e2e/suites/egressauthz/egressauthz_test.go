@@ -24,8 +24,15 @@
 // arrives as a 403 the client can see rather than as a tunnel that quietly
 // opens anyway.
 //
-// Every assertion here is made on the outcome of a real CONNECT through the
-// deployed gateway.
+// extprocd is asked twice per trip, and this suite covers both. The CONNECT
+// checkpoint decides whether a tunnel opens at all; the inner checkpoint runs on
+// the request inside it, and is where the hostname allowlist and credential
+// injection are enforced. Splitting them is what lets the CONNECT succeed for a
+// policy it cannot yet decide, so the second half is not optional coverage --
+// the first half's deferral is only sound if something downstream decides.
+//
+// Every assertion here is made on the outcome of a real CONNECT, or a real
+// request inside the tunnel it opened, through the deployed gateway.
 //
 // The policy table is internal/extproc/hardcoded.go: five actors in one
 // atespace, one per policy kind. The names below are that table. When it is
@@ -36,6 +43,7 @@ package egressauthz
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -130,20 +138,15 @@ func TestEgressAuthzEnforcesEachPolicy(t *testing.T) {
 		// authority is an IP literal and the actor resolves DNS itself. Now that
 		// the gateway runs the inner checkpoint, the CONNECT is a DEFERRAL and
 		// so it succeeds -- the hostname check happens later, on the tunneled
-		// request.
+		// request, which these cases do not send.
 		//
-		// A pass here therefore proves less than the other cases do, and the
-		// gap is deliberate rather than overlooked: the probe stops at the inner
-		// TLS handshake and never issues an inner HTTP request, which is what
-		// the second ext_proc filter fires on. So nothing below reaches
-		// DecideInner, and neither the hostname allowlist nor credential
-		// injection has end-to-end coverage. Closing that needs a probe that
-		// speaks HTTP inside the tunnel and reports what the destination
-		// received; poc/extproc asserts it against a local Envoy in the
-		// meantime.
+		// A pass here therefore proves less than the other cases do, and on its
+		// own it proves the wrong thing: a gateway that deferred to nothing
+		// would pass it too. TestEgressAuthzEnforcesTheInnerCheckpoint is the
+		// other half, and asserts what the deferred-to decision actually does.
 		//
-		// What a pass DOES prove is the failure this file previously guarded:
-		// if --inner-listen were dropped from the Deployment while these routes
+		// What a pass DOES prove is the failure this case was added for: if
+		// --inner-listen were dropped from the Deployment while these routes
 		// stayed, extprocd would have nobody to defer to and would deny here.
 		name:        "ALLOW_BY_HOSTNAME is deferred to the inner checkpoint",
 		actor:       actorRepoReader,
@@ -187,6 +190,198 @@ func TestEgressAuthzEnforcesEachPolicy(t *testing.T) {
 			}
 		})
 	}
+}
+
+// injectionOracleHost is the one real destination this suite reaches, and it is
+// a real one because nothing in the cluster can stand in for it.
+//
+// The gateway re-originates TLS to the true origin and validates it against the
+// public CA bundle with auto_san_validation (atenet-egress.yaml, "The MITM must
+// not weaken upstream authentication"), so a test-controlled echo server cannot
+// answer for an allowlisted name without putting a test CA in Envoy's trust
+// store -- which would change the artifact under test on exactly the property
+// that comment defends. What is left is to pick a destination that reports back
+// what it received, and the GitHub API does: 200 to an anonymous request, 401
+// "Bad credentials" to one bearing a token it does not recognize.
+//
+// The name must appear in the actor's allowlist in internal/extproc/hardcoded.go
+// AND in sdsmintd's --allow in manifests/ate-install/atenet-egress.yaml. In only
+// one of them, this dies at the inner handshake with no certificate to present,
+// and none of the assertions below are ever reached.
+const injectionOracleHost = "api.github.com"
+
+// TestEgressAuthzEnforcesTheInnerCheckpoint covers the decision the CONNECT
+// defers to. DecideInner runs on the tunneled request's headers, which is where
+// the hostname allowlist and credential injection live, and reaching it takes an
+// inner HTTP request -- the reason every case here sets RequestPath and none of
+// the cases above do.
+//
+// The injection pair is the centerpiece. repo-reader and invoice-agent send a
+// byte-identical request to the same host through the same gateway; the only
+// difference is which policy the client certificate selects. So the difference
+// in what GitHub answers is the injected Authorization header and nothing else.
+// Neither probe sends an Authorization header of its own, which is what makes
+// "the destination saw a credential" mean the gateway put it there.
+//
+// The CONNECT authority stays anyDestination throughout and is discarded: these
+// policies route to the MITM leg, where dynamic_forward_proxy resolves from the
+// inner :authority instead.
+func TestEgressAuthzEnforcesTheInnerCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	ns := e2e.CreateNamespace(t)
+	probe := e2e.StartEgressProbe(t, ctx, ns.Name)
+
+	// Derived from the namespace so a repeated run asks for a name Envoy has
+	// never subscribed to, for the reason sdsmint_test.go gives: a name already
+	// in Envoy's live secret set (--idle is 30m) is served without sdsmintd
+	// being asked, and the handshake these cases depend on stops proving the
+	// minter agreed to the name.
+	deniedHost := ns.Name + "-off-allowlist.example.com"
+
+	cases := []struct {
+		name  string
+		actor string
+		sni   string
+		// wantStatus and wantBody are the inner response. wantBody is checked
+		// separately from the status because a 403 is ambiguous: it is
+		// extprocd's denial and it is also what a hostile origin may answer. Only
+		// the body says which happened.
+		wantStatus int
+		wantBody   string
+		// needsInternet marks the cases that leave the cluster. A cluster without
+		// outbound egress cannot run them, and they skip rather than fail; see
+		// skipIfUpstreamUnreachable.
+		needsInternet bool
+	}{{
+		// The assertion this whole change exists for. invoice-agent holds an
+		// Inject entry for this host, so GitHub sees a bearer token the probe
+		// never had and rejects it by name.
+		name:          "BASIC_CREDENTIAL_INJECT attaches a credential the destination sees",
+		actor:         actorInvoiceAgent,
+		sni:           injectionOracleHost,
+		wantStatus:    http.StatusUnauthorized,
+		wantBody:      "Bad credentials",
+		needsInternet: true,
+	}, {
+		// The control arm. Same host, same request, a policy with no Inject
+		// entry -- so GitHub sees an anonymous request and serves it. Without
+		// this case a 401 above could equally be a broken request that GitHub
+		// dislikes for some reason having nothing to do with a header.
+		name:          "ALLOW_BY_HOSTNAME sends the request unmodified",
+		actor:         actorRepoReader,
+		sni:           injectionOracleHost,
+		wantStatus:    http.StatusOK,
+		needsInternet: true,
+	}, {
+		// The allowlist is consulted for the injecting policy too. An actor that
+		// holds third-party credentials is the one it matters most for: a host
+		// off the list must be refused before there is any question of which
+		// credential to attach to it.
+		name:       "BASIC_CREDENTIAL_INJECT refuses a host off its allowlist",
+		actor:      actorInvoiceAgent,
+		sni:        deniedHost,
+		wantStatus: http.StatusForbidden,
+		wantBody:   "egress denied: policy BASIC_CREDENTIAL_INJECT: host not allowed",
+	}, {
+		name:       "ALLOW_BY_HOSTNAME refuses a host off its allowlist",
+		actor:      actorRepoReader,
+		sni:        deniedHost,
+		wantStatus: http.StatusForbidden,
+		wantBody:   "egress denied: policy ALLOW_BY_HOSTNAME: host not allowed",
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			credential := e2e.MintActorCredential(t, ctx, extproc.DemoAtespace, tc.actor, "uid-"+tc.actor)
+			result := probe.Probe(t, ctx, probeapi.Request{
+				Destination:         anyDestination,
+				SNI:                 tc.sni,
+				RequestPath:         "/",
+				ClientCredentialPEM: credential,
+			})
+			who := extproc.DemoAtespace + "/" + tc.actor
+
+			requireInnerRequestSent(t, who, tc.sni, result)
+			if tc.needsInternet {
+				skipIfUpstreamUnreachable(t, who, tc.sni, result)
+			}
+
+			if result.HTTPStatus != tc.wantStatus {
+				t.Fatalf("%s asking %s for / got %d, want %d: %s",
+					who, tc.sni, result.HTTPStatus, tc.wantStatus, bodySnippet(result.HTTPBody))
+			}
+			if tc.wantBody != "" && !strings.Contains(result.HTTPBody, tc.wantBody) {
+				t.Fatalf("%s asking %s for / got %d as expected, but the body does not mention %q: %s",
+					who, tc.sni, result.HTTPStatus, tc.wantBody, bodySnippet(result.HTTPBody))
+			}
+			t.Logf("%s asking %s for / got %d: %s", who, tc.sni, result.HTTPStatus, bodySnippet(result.HTTPBody))
+		})
+	}
+}
+
+// requireInnerRequestSent asserts the request reached the point where the inner
+// checkpoint could see it, so that a failure before that is reported as itself
+// rather than as a missing status code.
+//
+// Three things have to have happened first, and each fails differently: the
+// CONNECT was authorized, the MITM leg served a certificate for the SNI -- which
+// means sdsmintd agreed to mint for it -- and the request was written and a
+// response read. A test that skipped this would report "got 0, want 403" for a
+// name missing from sdsmintd's --allow, which points at the wrong file.
+func requireInnerRequestSent(t *testing.T, who, sni string, result probeapi.Result) {
+	t.Helper()
+	if !result.Connected {
+		t.Fatalf("%s was refused the CONNECT before it could ask %s for anything: %s", who, sni, result.ConnectError)
+	}
+	if !result.HandshakeOK {
+		t.Fatalf("%s could not complete the inner handshake for %s, so no request was sent -- is %q in sdsmintd's --allow? %s",
+			who, sni, sni, result.HandshakeError)
+	}
+	if result.HTTPError != "" {
+		t.Fatalf("%s could not complete a request to %s: %s", who, sni, result.HTTPError)
+	}
+	if result.HTTPStatus == 0 {
+		t.Fatalf("%s got no response status from %s and no error either; the probe reported: %+v", who, sni, result)
+	}
+}
+
+// skipIfUpstreamUnreachable skips a case that needs outbound internet when the
+// cluster does not have it.
+//
+// This is a skip and not a failure because the cluster's connectivity is not
+// under test, but it is a narrow one on purpose. Only Envoy's own
+// upstream-failure shape qualifies: a 503 whose body carries one of the markers
+// below, which is what dynamic_forward_proxy produces when it cannot resolve or
+// cannot dial. Anything else -- including a 503 from somewhere further out -- is
+// left to fail. The same discipline as requireAuthorized: an unrecognized error
+// is not evidence of a missing network, and a test that treated it as one would
+// go quiet exactly when the gateway broke.
+func skipIfUpstreamUnreachable(t *testing.T, who, sni string, result probeapi.Result) {
+	t.Helper()
+	if result.HTTPStatus != http.StatusServiceUnavailable {
+		return
+	}
+	for _, marker := range []string{"upstream connect error", "no healthy upstream", "DNS resolution failure"} {
+		if strings.Contains(result.HTTPBody, marker) {
+			t.Skipf("SKIPPING: this cluster has no outbound internet, so %s could not reach %s and credential injection cannot be observed. The gateway allowed the request; %s answered nothing. Envoy said: %s",
+				who, sni, sni, bodySnippet(result.HTTPBody))
+		}
+	}
+}
+
+// bodySnippet keeps a response body loggable. The probe already truncates, but
+// its bound is sized for an origin's error payload rather than for a test log
+// line.
+func bodySnippet(body string) string {
+	const limit = 300
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "(empty body)"
+	}
+	if len(body) > limit {
+		return body[:limit] + "... (truncated)"
+	}
+	return body
 }
 
 // TestEgressAuthzRefusesUnusableIdentities covers the certificates that carry
