@@ -1,0 +1,109 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# An Actor that calls the GitHub API every ten seconds, holding no credential.
+#
+# demos/egress/demo.sh drives the egress probe and prints a formatted verdict.
+# This is the other way to show the same claim: leave it running, tail the log,
+# and let the audience read raw curl output as it arrives. There is nothing to
+# invoke and nothing to trust the presenter about -- if the responses say
+# "login": "<someone>", a credential reached GitHub, and it did not come from
+# here.
+#
+# THE ACTOR NAME IS THE CONFIGURATION. The egress policy table is keyed on
+# atespace plus actor name (internal/extproc/hardcoded.go), so this template is
+# only the workload; nothing here selects a policy. Create the Actor as
+# "actor-with-github-access" in atespace "acme-prod" to get injection, or as
+# "actor-without-github-access" from this same template to get the baseline.
+# The two differ in no other way -- same image, same command, same bytes.
+#
+# Deployed by hack/install-demo-github-poller.sh. See demos/egress/github-poller.md.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ate-demo-github-poller
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: github-poller
+  namespace: ate-demo-github-poller
+  labels:
+    workload: github-poller
+spec:
+  # Two, so the contrast can be shown side by side: one worker per Actor, and
+  # the injected and bare Actors are only interesting when both are running.
+  replicas: 5
+  ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: github-poller
+  namespace: ate-demo-github-poller
+spec:
+  pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
+  containers:
+  - name: poller
+    # A stock curl image, pinned. Every other template here builds a Go binary
+    # with ko; this one deliberately does not. The workload has to be something
+    # the audience already believes is inert, and "the curl image from Docker
+    # Hub, running a shell loop you can read in full" is a much shorter argument
+    # than "trust this fixture we compiled."
+    image: curlimages/curl:8.14.1@sha256:9a1ed35addb45476afa911696297f8e115993df459278ed036182dd2cd22b67b
+    # No env, no valueFrom.secretKeyRef, no volumeMounts. That absence is the
+    # entire demo: compare against demos/claude-code-multiplex, where the
+    # workload gets its API key the ordinary way. Anything added here weakens
+    # the claim, so add nothing.
+    command:
+    - /bin/sh
+    - -c
+    - |
+      while true; do
+        echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ)  GET https://api.github.com/user ==="
+        curl --verbose --insecure https://api.github.com/user 2>&1
+        echo
+        sleep 10
+      done
+    # --insecure is not laziness and is worth explaining if anyone catches it.
+    # This connection is intercepted on purpose: the egress gateway terminates
+    # TLS and presents a leaf minted by the cluster's private MITM CA
+    # (sdsmintd), which no public trust store contains and which the
+    # ActorTemplate API cannot mount -- Volume offers durableDir and
+    # externalVolumeTemplate, neither of which carries a CA. Without it every
+    # iteration dies at the handshake. It costs nothing here because the
+    # verification that matters is the gateway's: the *outer* leg checks
+    # GitHub's real certificate against the system roots, and no policy
+    # decision on this path depends on what the sandbox chose to trust.
+    #
+    # It also pays for itself. --verbose prints the issuer of the certificate
+    # actually presented, so the log shows the gateway's CA by name -- the
+    # interception is visible rather than asserted.
+    #
+    # --max-time keeps one stalled request from breaking the ten-second cadence
+    # the audience is watching.
+    #
+    # No readyz: this workload serves nothing. readyz is optional (see
+    # demos/claude-code-multiplex), and an httpGet against a container with no
+    # listener would leave the Actor permanently unready.
+  workerSelector:
+    matchLabels:
+      workload: github-poller
+  snapshotsConfig:
+    location: gs://${BUCKET_NAME}/ate-demo-github-poller/
