@@ -1,0 +1,85 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The egress probe deployed as an ACTOR, for internal/e2e/suites/actoregress.
+#
+# egressprobe.yaml.tmpl, beside this file, deploys the same binary as a plain
+# Pod that issues its own CONNECT. This one is the other half: an Actor's TCP is
+# REDIRECTed to atunnel by ateom, so the probe here dials as if no gateway
+# existed and the tunnel is built underneath it, out of a certificate the broker
+# minted for the worker's real assignment. That is the path production traffic
+# takes, and the plain-Pod shape cannot reach it.
+#
+# THE ACTOR NAMES THE SUITE USES ARE NOT ARBITRARY. The egress policy table is
+# keyed on atespace plus actor name (internal/extproc/hardcoded.go), so the
+# suite creates actors called "repo-reader" and "quarantined" in atespace
+# "acme-prod" to select a policy. This template is only the workload; nothing
+# here fixes the name.
+#
+# Deployed by hack/install-demo-egress.sh. It is not a demo -- it is a test
+# fixture that borrows the demo installer's flag plumbing.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ate-demo-egress
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: egressprobe
+  namespace: ate-demo-egress
+  labels:
+    workload: egressprobe
+spec:
+  # Two: the suite runs one actor at a time, and the spare absorbs a worker
+  # still draining a suspended actor from the previous test.
+  replicas: 2
+  ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: egressprobe
+  namespace: ate-demo-egress
+spec:
+  pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
+  containers:
+  - name: egressprobe
+    image: ko://github.com/agent-substrate/substrate/internal/e2e/fixtures/egressprobe
+    command:
+    - /ko-app/egressprobe
+    # Port 80 because that is what atenet-router forwards an Actor's ingress to;
+    # the suite reaches this API through the router, the same way every other
+    # Actor is reached. The probe's own default is :8080, which is right for the
+    # plain-Pod shape and wrong here.
+    - --listen=:80
+    # No --credential-bundle or --trust-bundle overrides, and no volumes to hold
+    # them: a direct-mode probe presents no certificate and verifies no gateway.
+    # The defaults point at paths that do not exist inside an Actor, which is
+    # harmless only because direct mode never reads them. A ViaTunnel request
+    # sent to this deployment will fail on the missing file, and should.
+    readyz:
+      httpGet:
+        path: /healthz
+        port: 80
+  workerSelector:
+    matchLabels:
+      workload: egressprobe
+  snapshotsConfig:
+    location: gs://${BUCKET_NAME}/ate-demo-egress/

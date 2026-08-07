@@ -45,6 +45,8 @@ source "${ROOT}"/hack/install-demo-claude-code-multiplex.sh
 source "${ROOT}"/hack/install-demo-multi-template.sh
 source "${ROOT}"/hack/install-demo-parking.sh
 source "${ROOT}"/hack/install-demo-autoscaled-workerpool.sh
+source "${ROOT}"/hack/install-demo-egress.sh
+source "${ROOT}"/hack/install-demo-github-poller.sh
 
 # ANSI color codes for prettier output
 COLOR_CYAN='\033[1;36m'
@@ -78,6 +80,7 @@ function usage() {
   echo ""
   echo "  --create-jwt-authority-pool-secret     Create JWT authority pool secret"
   echo "  --create-actor-id-ca-pool-secret       Create actor ID CA pool secret"
+  echo "  --create-egress-mitm-ca-pool-secret    Create egress MITM CA pool secret"
   echo "  --create-podcertificate-controller-cas Create podcertificate controller CAs"
   echo "  --create-valkey-ca-certs-secret        Create Valkey CA certs secret"
   echo "  --create-api-server-env-vars           Create ate-api-server env vars"
@@ -221,10 +224,15 @@ apply_otel_config() {
 }
 
 # Extract a CA pool secret's RootCertificateDER and emit it as a PEM certificate.
+#
+# The namespace is a parameter rather than a constant because the pool secrets
+# do not all live in one: the podcertificate controller's are in its own
+# namespace, and actor-id-ca-pool is in ate-system.
 ca_pool_root_pem() {
   local secret="$1"
+  local namespace="$2"
   local pool_json=""
-  pool_json=$(run_kubectl get secret -n podcertificate-controller-system "${secret}" -o jsonpath='{.data.pool}' | base64 --decode)
+  pool_json=$(run_kubectl get secret -n "${namespace}" "${secret}" -o jsonpath='{.data.pool}' | base64 --decode)
   local der_base64=""
   der_base64=$(echo "${pool_json}" | grep -o '"RootCertificateDER":"[^"]*' | sed 's/"RootCertificateDER":"//')
   echo "${der_base64}" | base64 --decode | openssl x509 -inform der -outform pem
@@ -241,9 +249,9 @@ create_valkey_ca_certs_secret() {
   # failing inside printf's argument list, which would silently produce a CA
   # file with a missing root.
   local servicedns_root=""
-  servicedns_root=$(ca_pool_root_pem service-dns-ca-pool)
+  servicedns_root=$(ca_pool_root_pem service-dns-ca-pool podcertificate-controller-system)
   local podidentity_root=""
-  podidentity_root=$(ca_pool_root_pem pod-identity-ca-pool)
+  podidentity_root=$(ca_pool_root_pem pod-identity-ca-pool podcertificate-controller-system)
   if [[ -z "${servicedns_root}" || -z "${podidentity_root}" ]]; then
     echo "error: failed to extract a CA root for valkey-ca-certs" >&2
     return 1
@@ -272,6 +280,75 @@ create_actor_id_ca_pool_secret() {
     --ca-id="1" \
     --name="actor-id-ca-pool" \
     --secret-namespace=ate-system
+}
+
+# Publish the actor CA's PUBLIC ROOT for the egress gateway.
+#
+# The gateway's front door authenticates two populations against two different
+# CAs: actors, whose certificates ate-apiserver signs with the pool above, and
+# ordinary pod tooling holding a podidentity credential. Envoy's trusted_ca is a
+# single file, so extprocd concatenates the two roots in the pod; this is the
+# input it reads for the actor half.
+#
+# A ConfigMap, and deliberately NOT the actor-id-ca-pool Secret itself: that
+# Secret carries SigningKeyPKCS8 alongside the root, so mounting it on the
+# gateway would hand the component that enforces actor identity the key that
+# mints it. Only the root certificate crosses.
+#
+# Derived from the pool, so it must be created after it -- and recreated if the
+# pool ever is. The presence check below will not notice a root that no longer
+# matches; a rotation means deleting this ConfigMap too.
+create_actor_id_ca_root_configmap() {
+  log_step "create_actor_id_ca_root_configmap"
+  local root_pem=""
+  root_pem=$(ca_pool_root_pem actor-id-ca-pool ate-system)
+  if [[ -z "${root_pem}" ]]; then
+    echo "error: failed to extract the actor-id-ca-pool root certificate" >&2
+    return 1
+  fi
+  run_kubectl create configmap actor-id-ca-root \
+    --from-literal=root.pem="${root_pem}" \
+    -n ate-system \
+    --dry-run=client -o yaml \
+    | run_kubectl apply -f -
+}
+
+# The MITM CA the egress gateway's sdsmintd sidecar signs per-SNI leaves with.
+#
+# --permitted-dns-domain is the backstop under the gateway's allowlist: the
+# allowlist is what sdsmintd agrees to mint, the name constraint is what the key
+# is cryptographically able to mint at all. Keep these values equal to the
+# --allow patterns in manifests/ate-install/atenet-egress.yaml. A leaf outside
+# the constraint is rejected by every verifier, so a mismatch surfaces as a
+# handshake failure rather than as a config error.
+#
+# Editing this list does NOT change an existing cluster. make-ca-pool creates
+# the secret and the caller above only invokes it when the secret is absent, so
+# a widened constraint needs the secret deleted first:
+#
+#   kubectl delete secret -n ate-system egress-mitm-ca-pool
+#   hack/install-ate.sh --create-egress-mitm-ca-pool-secret
+#   kubectl rollout restart deployment/atenet-egress -n ate-system
+#
+# --max-path-len=1 leaves room for the in-memory delegated signing intermediate
+# that --ca-intermediate-ttl creates. Without it the root would have to sign
+# every leaf itself, which is the difference between a future KMS-backed root
+# signing a few times a day and signing once per cache miss.
+#
+# ecdsa-p256 rather than the ed25519 default: these leaves are validated by
+# arbitrary clients inside actor sandboxes, where Ed25519 support cannot be
+# assumed.
+create_egress_mitm_ca_pool_secret() {
+  log_step "create_egress_mitm_ca_pool_secret"
+  run_kubectl_ate admin make-ca-pool \
+    --ca-id="mitm" \
+    --name="egress-mitm-ca-pool" \
+    --secret-namespace=ate-system \
+    --key-type=ecdsa-p256 \
+    --common-name="substrate egress MITM CA" \
+    --permitted-dns-domain=example.com \
+    --permitted-dns-domain=api.github.com \
+    --max-path-len=1
 }
 
 create_podcertificate_controller_cas() {
@@ -390,6 +467,7 @@ deploy_ate_system() {
   run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=120s
   run_kubectl rollout status deployment/ate-controller -n ate-system --timeout=120s
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
+  run_kubectl rollout status deployment/atenet-egress -n ate-system --timeout=120s
   run_kubectl rollout status statefulset/valkey-cluster -n ate-system --timeout=120s
   run_kubectl rollout status daemonset/atelet -n ate-system --timeout=120s
 }
@@ -401,10 +479,20 @@ ensure_apiserver_prerequisites() {
     || create_jwt_authority_pool_secret
   run_kubectl get secret -n ate-system actor-id-ca-pool >/dev/null 2>&1 \
     || create_actor_id_ca_pool_secret
+  # The egress gateway mounts this read-only to authenticate actors, so a
+  # missing ConfigMap makes the volume unmountable and that pod never starts.
+  # Derived from the pool secret above, hence ordered after it.
+  run_kubectl get configmap -n ate-system actor-id-ca-root >/dev/null 2>&1 \
+    || create_actor_id_ca_root_configmap
   run_kubectl get secret -n podcertificate-controller-system service-dns-ca-pool >/dev/null 2>&1 \
     || create_podcertificate_controller_cas
   run_kubectl get secret -n ate-system valkey-ca-certs >/dev/null 2>&1 \
     || create_valkey_ca_certs_secret
+  # The egress gateway's sdsmintd sidecar projects this read-only. A missing
+  # secret makes the volume unmountable and the pod never starts, so it has to
+  # exist before the ate-system manifests are applied.
+  run_kubectl get secret -n ate-system egress-mitm-ca-pool >/dev/null 2>&1 \
+    || create_egress_mitm_ca_pool_secret
   run_kubectl get configmap -n ate-system ate-api-server-envvars >/dev/null 2>&1 \
     || create_api_server_env_vars
 }
@@ -461,8 +549,16 @@ deploy_atenet() {
   router_manifest="$(render_atenet_router_manifest)"
   echo "${router_manifest}" | run_kubectl apply -f -
 
+  # The egress gateway's sdsmintd sidecar projects this secret read-only. A
+  # missing secret makes the volume unmountable and the pod never starts, so
+  # create it before the Deployment rather than alongside it.
+  run_kubectl get secret -n ate-system egress-mitm-ca-pool >/dev/null 2>&1 \
+    || create_egress_mitm_ca_pool_secret
+
   run_ko apply -f manifests/ate-install/atenet-dns.yaml
+  run_ko apply -f manifests/ate-install/atenet-egress.yaml
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
+  run_kubectl rollout status deployment/atenet-egress -n ate-system --timeout=120s
   # The Deployment in atenet-dns.yaml is named "dns"; every other resource in
   # that file is "atenet-dns". Waiting on the filename rather than the actual
   # Deployment made this step fail with NotFound on every successful deploy.
@@ -707,6 +803,7 @@ while [[ "$#" -gt 0 ]]; do
 
     --create-jwt-authority-pool-secret) create_jwt_authority_pool_secret ;;
     --create-actor-id-ca-pool-secret) create_actor_id_ca_pool_secret ;;
+    --create-egress-mitm-ca-pool-secret) create_egress_mitm_ca_pool_secret ;;
     --create-podcertificate-controller-cas) create_podcertificate_controller_cas ;;
     --create-valkey-ca-certs-secret) create_valkey_ca_certs_secret ;;
     --create-api-server-env-vars) create_api_server_env_vars ;;

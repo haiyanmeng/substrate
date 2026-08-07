@@ -102,6 +102,26 @@ spec:
           - --actor-id-ca-pool=/run/actor-id-ca-pool/pool.json
           - --atelet-client-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem
           - --pod-identity-ca-certs=/run/podidentity.podcert.ate.dev/trust-bundle.pem
+          # ROUTES EVERY ACTOR'S TCP THROUGH THE EGRESS GATEWAY. This flag is
+          # the only switch: it is global, so there is no per-atespace or
+          # per-actor opt-in, and unsetting it is the whole rollback. Empty
+          # means actors reach the network directly.
+          #
+          # Read point 1 of manifests/ate-install/atenet-egress.yaml before
+          # relying on this. The gateway authorizes per actor against a
+          # HARDCODED DEMO TABLE of five names in atespace "acme-prod"; every
+          # other actor resolves to no policy and is denied. That is the
+          # enforcement point failing closed as designed, but it means turning
+          # this on for a cluster running real actors takes their egress with
+          # it. Replacing internal/extproc/hardcoded.go is the prerequisite.
+          #
+          # The name must be the <service>.<namespace>.svc form and nothing
+          # else. Both ateoms derive the TLS ServerName from the host half of
+          # this address (prepareActorEgress in cmd/ateom-gvisor and
+          # cmd/ateom-microvm), and the servicedns signer issues exactly one
+          # SAN in that shape, so the .cluster.local spelling resolves and then
+          # fails verification.
+          - --egress-gateway-address=atenet-egress.ate-system.svc:443
           # Graceful shutdown knobs. The sum must fit within terminationGracePeriodSeconds.
           - --drain-delay=13s
           - --drain-timeout=15s
