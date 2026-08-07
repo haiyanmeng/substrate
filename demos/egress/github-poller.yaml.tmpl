@@ -45,8 +45,10 @@ metadata:
   labels:
     workload: github-poller
 spec:
-  # Two, so the contrast can be shown side by side: one worker per Actor, and
-  # the injected and bare Actors are only interesting when both are running.
+  # One worker per Actor, with headroom. The contrast is only interesting when
+  # the injected, bare, and denied Actors are all running side by side, and a
+  # pool sized exactly to the Actor count leaves nothing free for the golden
+  # actor to resume into during a redeploy.
   replicas: 5
   ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
 
@@ -74,6 +76,16 @@ spec:
     command:
     - /bin/sh
     - -c
+    # The loop is not a stylistic choice -- a one-shot curl does not work here.
+    # The ActorTemplate is materialized once into a golden snapshot, and every
+    # Actor is RESTORED from it rather than started fresh. A command that runs
+    # to completion therefore runs exactly once, at snapshot time, under the
+    # golden actor in the ate-golden atespace -- which matches no policy and is
+    # denied. Restored Actors resume into whatever came after, having made no
+    # request of their own, and their logs show only "Actor restored".
+    #
+    # Anything that must happen per-Actor has to happen repeatedly, after
+    # restore. Hence the loop.
     - |
       while true; do
         echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ)  GET https://api.github.com/user ==="

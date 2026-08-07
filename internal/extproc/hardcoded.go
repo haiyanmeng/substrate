@@ -29,7 +29,7 @@ import (
 // serve the last good snapshot on failure instead of clearing it.
 
 // Demo atespace used by every hardcoded actor.
-const DemoAtespace = "acme-prod"
+const DemoAtespace = "egress-demo"
 
 // HardcodedSnapshot returns a table exercising all five policies, one actor
 // each. It panics on a malformed entry: this is a compile-time-ish constant, so
@@ -59,7 +59,7 @@ func HardcodedSnapshot() *Snapshot {
 		// difference in what GitHub answers is the whole assertion. Removing it
 		// does not weaken this actor's policy; it silently deletes that test's
 		// baseline.
-		{Atespace: DemoAtespace, Name: "repo-reader"}: {
+		{Atespace: DemoAtespace, Name: "actor-without-github-access"}: {
 			Kind:      KindAllowByHostname,
 			Hostnames: []string{"api.github.com", "github.com", "microsoft.com", "my-app.my-company.com"},
 		},
@@ -76,7 +76,7 @@ func HardcodedSnapshot() *Snapshot {
 		// actor never held. This is the only policy that requires the gateway to
 		// hold third-party secrets, which is the argument in egress-authn.md for
 		// keeping this process separate from sdsmintd.
-		{Atespace: DemoAtespace, Name: "invoice-agent"}: {
+		{Atespace: DemoAtespace, Name: "actor-with-github-access"}: {
 			Kind:      KindBasicCredentialInject,
 			Hostnames: []string{"api.github.com", "api.stripe.com", "github.com"},
 			Inject: map[string][]Injection{
@@ -90,7 +90,7 @@ func HardcodedSnapshot() *Snapshot {
 				// A hostname must be in Hostnames as well as here -- Validate
 				// refuses an injection for a host the allowlist does not cover.
 				"api.github.com": {
-					{From: "authorization", To: "authorization", Value: "Bearer gho_poc_not_a_real_token"},
+					{From: "authorization", To: "authorization", Value: "Bearer xxx"},
 				},
 				"api.stripe.com": {
 					{From: "authorization", To: "token", Value: "X"},
@@ -98,7 +98,7 @@ func HardcodedSnapshot() *Snapshot {
 				// Same destination as repo-reader's, but reached with a
 				// credential attached rather than bare.
 				"github.com": {
-					{From: "authorization", To: "authorization", Value: "Bearer gho_poc_not_a_real_token"},
+					{From: "authorization", To: "authorization", Value: "Bearer xxx"},
 				},
 			},
 		},

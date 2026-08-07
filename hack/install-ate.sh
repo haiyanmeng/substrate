@@ -46,6 +46,7 @@ source "${ROOT}"/hack/install-demo-multi-template.sh
 source "${ROOT}"/hack/install-demo-parking.sh
 source "${ROOT}"/hack/install-demo-autoscaled-workerpool.sh
 source "${ROOT}"/hack/install-demo-egress.sh
+source "${ROOT}"/hack/install-demo-github-poller.sh
 
 # ANSI color codes for prettier output
 COLOR_CYAN='\033[1;36m'
