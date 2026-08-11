@@ -13,29 +13,51 @@
 # limitations under the License.
 
 # The egress gateway: terminates the mTLS HTTP CONNECT that internal/atunnel
-# speaks, MITMs the tunnelled TLS with a certificate minted per SNI, and
-# re-originates to the real destination.
+# speaks, authorizes the actor behind it, MITMs the tunnelled TLS with a
+# certificate minted per SNI, and re-originates to the real destination.
+#
+# THIS MANIFEST IS AHEAD OF THIS BRANCH'S CODE
+#
+#   The ext-proc leg below came from main and its dependencies did not. It
+#   needs main's cmd/atenet/internal/router/egress and .../router/extproc
+#   packages, the router's --mode / --port-extproc / --extproc-address /
+#   --actor-identity-ca-file flags, and the actor-id-ca-certs secret that main's
+#   hack/install-ate.sh creates. None of those are on this branch, and the two
+#   branches restructured cmd/atenet/internal/router in conflicting ways, so
+#   this is a real merge rather than a cherry-pick.
+#
+#   Applying this before that merge gives you a crashlooping ext-proc container
+#   on unknown flags, a pod that never starts for want of the secret, and a
+#   client CA file that is not on disk -- so every handshake fails. Merge main
+#   into this branch first.
 #
 # READ THIS BEFORE ENABLING IT FOR REAL TRAFFIC
 #
-#  1. There is NO per-actor authorization. The only egress control here is
-#     sdsmintd's --allow list below, and it applies cluster-wide: every actor
-#     that can reach this gateway gets exactly the same allowlist. The
-#     X-Ate-Atespace / X-Ate-Actor-Name headers that atunnel sends are carried
-#     but nothing reads them, and they are not authentication -- a client that
-#     holds a valid podidentity certificate can set them to anything. Adding
-#     per-actor policy means an ext_proc filter on the CONNECT listener; that
-#     is deliberately not in this file.
+#  1. Egress is authorized per actor at the CONNECT checkpoint, and separately
+#     bounded cluster-wide by sdsmintd's --allow list below. The two are
+#     different gates and both apply. ext_proc on connect_in reads the actor
+#     certificate out of x-forwarded-client-cert, re-verifies the chain against
+#     the actor-identity CA, reads the ActorIdentity extension, and asks the ate
+#     API whether that UID is a live actor; it fails closed. The allowlist is
+#     the coarser gate underneath: it bounds which names can be minted for at
+#     all, identically for every actor. The X-Ate-Atespace / X-Ate-Actor-Name
+#     headers atunnel sends remain metadata only -- nothing reads them and a
+#     client can set them to anything.
 #
 #  2. Nothing routes here yet. cmd/atelet never populates
 #     EgressGatewayAddress on the RunWorkloadRequest, so no workload is
 #     currently pointed at this gateway. It is deployed so it can be exercised
-#     and reviewed, not because it is on the data path. Verify it with
-#     poc/sdsmint/cmd/sdsload --connect-via.
+#     and reviewed, not because it is on the data path. Note that
+#     poc/sdsmint/cmd/sdsload --connect-via no longer verifies it as-is: the
+#     handshake now demands an actor-identity certificate, and a podidentity
+#     one is rejected. See point 3.
 #
-#  3. The client certificate check below authenticates that the caller is a
-#     substrate workload holding a podidentity credential. It does NOT
-#     establish which actor is calling. See point 1.
+#  3. The client certificate establishes WHICH actor is calling, not merely
+#     that the caller is a substrate workload. Envoy enforces chain, signature
+#     and validity against the actor-identity CA during the handshake, so an
+#     unsigned or expired actor certificate never reaches ext_proc. The
+#     ActorIdentity extension itself is checked in ext_proc, because Envoy
+#     cannot read custom X.509 extensions.
 #
 #  4. IT IS SIZED FOR 10,000 LIVE SNIs, AND THAT IS A REAL CEILING, not a
 #     default that degrades politely. Past roughly 13,200 Envoy stops accepting
@@ -187,15 +209,22 @@ data:
         watched_directory:
           path: /run/servicedns.podcert.ate.dev
 
+  # Actors authenticate with an actor-identity client certificate, NOT with a
+  # podidentity one. The distinction is the whole point of the CONNECT
+  # checkpoint: podidentity says "some substrate workload", actor identity says
+  # which actor, and only the latter can be authorized against a policy. Envoy
+  # enforces chain, signature and validity here; the ActorIdentity extension
+  # carried inside the certificate is read by ext_proc, because Envoy cannot
+  # parse custom X.509 extensions.
   sds-client-ca.yaml: |
     resources:
     - "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret
       name: client_ca
       validation_context:
         trusted_ca:
-          filename: /run/podidentity.podcert.ate.dev/trust-bundle.pem
+          filename: /run/actor-id-ca-certs/ca.crt
         watched_directory:
-          path: /run/podidentity.podcert.ate.dev
+          path: /run/actor-id-ca-certs
 
   envoy.yaml: |
     # Requires Envoy 1.37 or newer: on_demand_secret and cert_mappers.sni do not
@@ -290,12 +319,38 @@ data:
         address:
           socket_address: {address: 0.0.0.0, port_value: 8443}
         filter_chains:
-        - filters:
+        # The name is load-bearing, not decoration. ext_proc reads it back as
+        # the xds.filter_chain_name attribute and dispatches on it, which is how
+        # the router tells egress from ingress -- it applies opposite trust
+        # models to the two directions and will not take a client's word for
+        # which one this is. Must match EgressFilterChainName in
+        # cmd/atenet/internal/router/extproc/dispatch.go. Renaming this without
+        # updating that constant fails closed: the request is classified as
+        # ingress, which a --mode=egress instance does not serve, and is
+        # refused with a 404.
+        - name: egress
+          filters:
           - name: envoy.filters.network.http_connection_manager
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
               stat_prefix: connect_in
+              codec_type: HTTP1
               upgrade_configs: [{upgrade_type: CONNECT}]
+              # Synthesize x-forwarded-client-cert from the verified peer
+              # certificate. SANITIZE_SET rather than APPEND_FORWARD so Envoy is
+              # the only writer: a client-supplied XFCC is discarded, not
+              # appended to, which is what lets ext_proc treat a single-element
+              # header as "this is my actual peer" and refuse to guess otherwise.
+              # chain: true because the ActorIdentity extension can only be read
+              # out of the certificate itself.
+              forward_client_cert_details: SANITIZE_SET
+              set_current_client_cert_details:
+                chain: true
+              # atunnel holds the tunnel open for the life of the actor's
+              # connection, so the default log-on-close would not emit anything
+              # for a live tunnel.
+              access_log_options:
+                flush_log_on_tunnel_successfully_established: true
               # The front door sees only the CONNECT authority, which is an IP
               # from SO_ORIGINAL_DST -- the hostname is inside the tunnel and
               # shows up on the mitm_http log below instead. What this leg is
@@ -345,6 +400,39 @@ data:
                       - upgrade_type: CONNECT
                         connect_config: {}
               http_filters:
+              # The CONNECT checkpoint. On every egress CONNECT this reads the
+              # actor certificate out of x-forwarded-client-cert, re-verifies
+              # the chain against the actor-identity CA, pulls the ActorIdentity
+              # extension, and asks the ate API whether that UID is a real,
+              # running actor. Denials come back as an immediate 403.
+              #
+              # It sees only the CONNECT authority, which is an IP -- the
+              # hostname is inside the tunnel. Per-destination policy therefore
+              # cannot be decided here; that is what the MITM leg exists for.
+              # This checkpoint answers "which actor, and may it egress at all".
+              - name: envoy.filters.http.ext_proc
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                  grpc_service:
+                    envoy_grpc:
+                      cluster_name: ext_proc_server
+                    timeout: 2s
+                  # Fails closed. A router outage stops egress rather than
+                  # opening it, which is the only defensible default for the
+                  # component that decides whether egress is allowed.
+                  failure_mode_allow: false
+                  request_attributes:
+                  - xds.filter_chain_name
+                  # A CONNECT has no body before the tunnel opens and its
+                  # response is a status line and then raw bytes, so headers are
+                  # the only thing here worth showing a policy processor.
+                  processing_mode:
+                    request_header_mode: SEND
+                    response_header_mode: SKIP
+                    request_body_mode: NONE
+                    response_body_mode: NONE
+                    request_trailer_mode: SKIP
+                    response_trailer_mode: SKIP
               - name: envoy.filters.http.router
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -482,6 +570,38 @@ data:
               disable_stateful_session_resumption: true
 
       clusters:
+      # The authorization processor, a sidecar in this same pod. Loopback TCP
+      # rather than a unix socket because the router binds --extproc-address
+      # 127.0.0.1; nothing outside the pod's network namespace can reach it.
+      - name: ext_proc_server
+        type: STATIC
+        connect_timeout: 1s
+        # One HTTP/2 stream per CONNECT in flight, held for the duration of the
+        # authorization call. Sized to the internal legs rather than to the
+        # upstream one: tripping this is indistinguishable, from the actor's
+        # side, from being denied, and failure_mode_allow is false so it
+        # degrades to a hard stop on all egress. Overload should be caught by
+        # the memory guards, not here.
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 128
+            max_pending_requests: 65536
+            max_requests: 65536
+            max_retries: 8
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            explicit_http_config:
+              http2_protocol_options: {}
+        load_assignment:
+          cluster_name: ext_proc_server
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address: {address: 127.0.0.1, port_value: 50051}
+
       - name: mitm_internal
         connect_timeout: 1s
         # Envoy's defaults (1024 connections, 1024 pending) are low for a
@@ -597,6 +717,11 @@ spec:
         app: atenet-egress
     spec:
       serviceAccountName: atenet-egress
+      # The ceiling on the drain handshake below, not a target. Envoy's preStop
+      # blocks until ext-proc says the drain finished; if ext-proc dies first
+      # nobody ever writes the marker, and this is what stops the pod hanging
+      # until the node reaps it.
+      terminationGracePeriodSeconds: 60
       # Both containers must share a UID: sdsmintd creates the SDS socket mode
       # 0600, and Envoy has to be able to open it. The stock Envoy image runs as
       # UID 101 and ko's distroless base as 65532, so left alone they would not
@@ -718,6 +843,22 @@ spec:
         - "/usr/local/bin/envoy"
         - "-c"
         - "/etc/envoy/envoy.yaml"
+        # Keeps Envoy alive on SIGTERM until the ext-proc sidecar has finished
+        # draining it, or until terminationGracePeriodSeconds cuts it off. The
+        # sidecar drives the drain over the admin interface and then writes the
+        # marker on the shared emptyDir; without this Envoy exits on the signal
+        # immediately and the drain has nothing left to drain.
+        #
+        # TODO: the drain loop polls downstream_cx_active to zero, which does
+        # not describe egress. A CONNECT tunnel lives as long as the actor's
+        # connection does, so any rollout with traffic in flight will sit here
+        # until the deadline and then cut anyway. Either accept that or give
+        # egress a shorter window of its own; pretending a tunnel closes on its
+        # own is the one option that is wrong.
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sh", "-c", "while [ ! -f /var/run/atenet/drain-complete ]; do sleep 0.5; done"]
         ports:
         - name: connect
           containerPort: 8443
@@ -731,9 +872,16 @@ spec:
         # --atunnel-egress-trust-bundle.
         - name: "servicedns"
           mountPath: "/run/servicedns.podcert.ate.dev"
-        # Client CA, for authenticating the calling workload.
-        - name: "podidentity"
-          mountPath: "/run/podidentity.podcert.ate.dev"
+        # Client CA, for authenticating the calling actor. Actor identity, not
+        # podidentity -- see sds-client-ca.yaml above. Envoy no longer mounts
+        # the podidentity bundle at all; only the ext-proc sidecar does, and it
+        # uses it as a client credential rather than as a trust root.
+        - name: actor-id-ca-certs
+          mountPath: /run/actor-id-ca-certs
+          readOnly: true
+        - name: drain-signal
+          mountPath: /var/run/atenet
+          readOnly: true
         # Memory is the resource that actually varies here, and it varies with
         # the live secret set rather than with request rate: ~63,500 B per live
         # secret, so 10,000 names is ~606 MiB of RSS against this 1Gi limit.
@@ -782,12 +930,104 @@ spec:
             - 'exec 3<>/dev/tcp/127.0.0.1/9901; printf "GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3; head -1 <&3 | grep -q "200 OK"'
           initialDelaySeconds: 2
           periodSeconds: 5
+        # Same check, faster and with a longer leash, so a slow first config
+        # load is not read as a liveness failure. Also the same exec form: the
+        # reason httpGet cannot be used is the probe mechanism, not the probe.
+        startupProbe:
+          exec:
+            command:
+            - bash
+            - -c
+            - 'exec 3<>/dev/tcp/127.0.0.1/9901; printf "GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3; head -1 <&3 | grep -q "200 OK"'
+          periodSeconds: 1
+          failureThreshold: 60
+      # The authorization processor for the CONNECT checkpoint: the same atenet
+      # router binary the ingress gateway runs, started with --mode=egress so it
+      # serves the egress ext_proc handler and nothing else -- no xDS server, no
+      # ActorTemplate controller, no Kubernetes access.
+      #
+      # A plain container rather than a native sidecar, unlike sdsmintd. That is
+      # deliberate: it has to still be running during Envoy's preStop, and it is
+      # the thing that ends Envoy's preStop, so it cannot be ordered to outlive
+      # it. Startup order is handled by failure_mode_allow: false -- until this
+      # container answers, Envoy denies egress rather than allowing it.
+      - name: ext-proc
+        image: ko://github.com/agent-substrate/substrate/cmd/atenet
+        args:
+        - router
+        - --mode=egress
+        - --namespace=ate-system
+        - --port-extproc=50051
+        # Loopback only. This must agree with the ext_proc_server cluster
+        # address in envoy.yaml above.
+        - --extproc-address=127.0.0.1
+        - --ateapi-address=dns:///api.ate-system.svc:443
+        - --ateapi-ca-file=/run/servicedns.podcert.ate.dev/trust-bundle.pem
+        - --ateapi-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+        # The same roots Envoy validates the handshake against, because the
+        # handler re-verifies the chain in Go: Envoy can check a chain but
+        # cannot parse the ActorIdentity extension, so the certificate is
+        # forwarded in x-forwarded-client-cert and read here. Without this flag
+        # the router has no actor-identity roots and denies every CONNECT.
+        - --actor-identity-ca-file=/run/actor-id-ca-certs/ca.crt
+        - --otlp-collector-address=
+        # 9901, not the 15000 main's egress Envoy uses. This gateway's admin
+        # listener is on the ingress port number; get it wrong and the drain
+        # dials a closed port, reads the refusal as "Envoy already exited", and
+        # reports a drain it never performed.
+        - --envoy-admin-address=127.0.0.1:9901
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        ports:
+        - name: extproc
+          containerPort: 50051
+        readinessProbe:
+          tcpSocket:
+            port: extproc
+          periodSeconds: 10
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        # Trust bundle for verifying the ate API's servicedns serving cert.
+        - name: "servicedns"
+          mountPath: "/run/servicedns.podcert.ate.dev"
+          readOnly: true
+        # This container's own client identity, presented to the ate API. Note
+        # the direction: podidentity is a credential here, not a trust root.
+        - name: "podidentity"
+          mountPath: "/run/podidentity.podcert.ate.dev"
+          readOnly: true
+        - name: actor-id-ca-certs
+          mountPath: /run/actor-id-ca-certs
+          readOnly: true
+        # Writable, unlike Envoy's mount of the same volume: this is the end
+        # that writes drain-complete.
+        - name: drain-signal
+          mountPath: /var/run/atenet
       volumes:
       - name: envoy-config
         configMap:
           name: atenet-egress-envoy-config
       - name: sdsmint-sock
         emptyDir: {}
+      # The drain handshake. ext-proc writes drain-complete here, Envoy's
+      # preStop polls for it. An emptyDir and not a file in either container's
+      # rootfs, because both of those are read-only and neither is shared.
+      - name: drain-signal
+        emptyDir: {}
+      # Both halves: the credential Envoy serves to workers, and the trust
+      # bundle ext-proc verifies the ate API against. Same signer, opposite
+      # ends of two different connections.
       - name: "servicedns"
         projected:
           sources:
@@ -795,15 +1035,33 @@ spec:
               signerName: servicedns.podcert.ate.dev/identity
               keyType: ECDSAP256
               credentialBundlePath: credential-bundle.pem
+          - clusterTrustBundle:
+              signerName: servicedns.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem
+      # ext-proc only. Envoy stopped mounting this when the client CA moved to
+      # actor identity; what is left is a client credential for the ate API
+      # call, plus the bundle its peer verifies against.
       - name: "podidentity"
         projected:
           sources:
+          - podCertificate:
+              signerName: podidentity.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem
           - clusterTrustBundle:
               signerName: podidentity.podcert.ate.dev/identity
               labelSelector:
                 matchLabels:
                   podcert.ate.dev/canarying: live
               path: trust-bundle.pem
+      # Created by hack/install-ate.sh on main. Not by this branch's copy --
+      # see the warning at the top of this file.
+      - name: actor-id-ca-certs
+        secret:
+          secretName: actor-id-ca-certs
       - name: ca-state
         projected:
           sources:
