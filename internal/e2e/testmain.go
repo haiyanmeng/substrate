@@ -19,6 +19,7 @@ import (
 	goflag "flag"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/spf13/pflag"
@@ -29,6 +30,39 @@ var (
 	KubeConfig  string
 	KubeContext string
 )
+
+var (
+	suiteCleanupsMu sync.Mutex
+	suiteCleanups   []func()
+)
+
+// RegisterSuiteCleanup registers fn to run once the suite's tests are done,
+// while the shared clients are still open. It exists for resources that outlive
+// the test that created them -- an actor several tests share, say -- which
+// t.Cleanup cannot express: the first test's cleanup would run while the rest
+// of the suite still needed the resource.
+//
+// Cleanups run LIFO, and run whether or not the suite passed. That is the
+// opposite of the namespace policy above, deliberately: a namespace is where
+// the pods and their logs live, so a failed run keeps it, while what goes
+// through here is control-plane state that a post-mortem reads from the
+// control plane rather than from the object itself.
+func RegisterSuiteCleanup(fn func()) {
+	suiteCleanupsMu.Lock()
+	defer suiteCleanupsMu.Unlock()
+	suiteCleanups = append(suiteCleanups, fn)
+}
+
+func runSuiteCleanups() {
+	suiteCleanupsMu.Lock()
+	fns := suiteCleanups
+	suiteCleanups = nil
+	suiteCleanupsMu.Unlock()
+
+	for i := len(fns) - 1; i >= 0; i-- {
+		fns[i]()
+	}
+}
 
 func bindFlags() {
 	pflag.BoolVar(&RunE2E, "e2e", false, "run e2e tests")
@@ -82,6 +116,7 @@ func runAndCleanup(m *testing.M) int {
 	// namespace takes those pods with it before anyone — a developer or CI's
 	// post-failure log dump — can read them.
 	code := m.Run()
+	runSuiteCleanups()
 	if code != 0 {
 		RetainNamespaces()
 		return code

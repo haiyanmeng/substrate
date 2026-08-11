@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -27,6 +28,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // TODO(liorlieberman): support/use CONNECT on Ingress as well.
@@ -40,6 +42,44 @@ type ClientConfig struct {
 
 // DialFunc dials a network address. It matches net.Dialer.DialContext.
 type DialFunc func(ctx context.Context, network, address string) (net.Conn, error)
+
+// ErrGatewayHandshake reports that the gateway's front door refused the
+// connection at TLS: it rejected the client certificate, or its own
+// certificate did not verify.
+//
+// It is a sentinel because "the door refused me" and "the door let me in and
+// then declined the request" are different failures that look alike from the
+// outside -- both are just a dial that did not return a connection -- and
+// telling them apart by matching on message text breaks the first time the
+// wording changes.
+//
+// It is NOT limited to errors from HandshakeContext, because under TLS 1.3 a
+// client-certificate rejection cannot surface there. The client sends its
+// certificate in its last flight and considers the handshake finished without
+// waiting for the server to accept it, so a server that rejects the
+// certificate does so after HandshakeContext has already returned nil. The
+// refusal then arrives as an alert on the next read, or as a reset write if we
+// got the CONNECT out first -- which of the two is a race. Everything up to
+// the CONNECT response is therefore treated as part of the door: see
+// connectExchangeError.
+var ErrGatewayHandshake = errors.New("atunnel: egress gateway TLS handshake")
+
+// ConnectRejectedError reports a CONNECT the gateway answered with a non-2xx
+// status. The caller authenticated successfully and the request was declined
+// anyway, which is what an authorization denial looks like from here. The
+// status code is carried separately from the message because it is the part a
+// caller can act on.
+type ConnectRejectedError struct {
+	StatusCode int
+	// Status is the full status line, e.g. "403 Forbidden".
+	Status string
+	// Message is the response body, or the status text when the body is empty.
+	Message string
+}
+
+func (e *ConnectRejectedError) Error() string {
+	return fmt.Sprintf("atunnel: egress gateway rejected CONNECT with %s: %s", e.Status, e.Message)
+}
 
 // ClientOption customizes a Client beyond its configuration. Production
 // callers need none of these.
@@ -117,7 +157,7 @@ func (c *Client) DialContext(ctx context.Context, destination string) (net.Conn,
 	tlsConn := tls.Client(rawConn, c.tlsConfig.Clone())
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		_ = rawConn.Close()
-		return nil, fmt.Errorf("atunnel: egress gateway TLS handshake: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrGatewayHandshake, err)
 	}
 
 	req := &http.Request{
@@ -127,14 +167,14 @@ func (c *Client) DialContext(ctx context.Context, destination string) (net.Conn,
 	}
 	if err := req.Write(tlsConn); err != nil {
 		_ = tlsConn.Close()
-		return nil, fmt.Errorf("atunnel: writing CONNECT request: %w", err)
+		return nil, connectExchangeError("writing CONNECT request", err)
 	}
 
 	reader := bufio.NewReader(tlsConn)
 	resp, err := http.ReadResponse(reader, req)
 	if err != nil {
 		_ = tlsConn.Close()
-		return nil, fmt.Errorf("atunnel: reading CONNECT response: %w", err)
+		return nil, connectExchangeError("reading CONNECT response", err)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
@@ -144,10 +184,49 @@ func (c *Client) DialContext(ctx context.Context, destination string) (net.Conn,
 		if message == "" {
 			message = http.StatusText(resp.StatusCode)
 		}
-		return nil, fmt.Errorf("atunnel: egress gateway rejected CONNECT with %s: %s", resp.Status, message)
+		return nil, &ConnectRejectedError{StatusCode: resp.StatusCode, Status: resp.Status, Message: message}
 	}
 
 	return &bufferedConn{Conn: tlsConn, reader: reader}, nil
+}
+
+// connectExchangeError wraps a failure that happened after the TLS handshake
+// returned but before the gateway answered CONNECT, naming the front door as
+// the cause when the connection was torn down rather than answered.
+//
+// Nothing but the front door can be speaking yet: no CONNECT response has been
+// read, so no upstream has been dialed and no ext_proc verdict has been
+// rendered -- a denial from either of those arrives as a status line and
+// becomes a ConnectRejectedError. A connection that dies in this window is one
+// the gateway hung up on, and under TLS 1.3 the overwhelmingly common reason
+// is the client certificate it only got round to checking after the handshake.
+func connectExchangeError(op string, err error) error {
+	if gatewayHungUp(err) {
+		return fmt.Errorf("%w: %s: %w", ErrGatewayHandshake, op, err)
+	}
+	return fmt.Errorf("atunnel: %s: %w", op, err)
+}
+
+// gatewayHungUp reports whether err is the peer tearing the connection down,
+// as opposed to a local failure such as a context deadline or a malformed
+// response.
+func gatewayHungUp(err error) bool {
+	// A TLS alert from the peer -- "unknown certificate authority" is the one
+	// a wrong client CA produces. crypto/tls reports an alert as a net.OpError
+	// whose Op is "remote error" and whose Err is an unexported alert type, so
+	// the Op is the only part of it that can be matched without matching on
+	// the message text this package deliberately avoids.
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "remote error" {
+		return true
+	}
+	// Or the gateway closed or reset instead of alerting -- including a reset
+	// that lands while the CONNECT request is still going out, which is what
+	// makes the alert-versus-EPIPE outcome a race rather than a distinction.
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET)
 }
 
 func validateDestination(destination string) error {
