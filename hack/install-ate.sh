@@ -68,6 +68,13 @@ function usage() {
   echo "  --delete-all                           Delete core system and all registered demos"
   echo "  --ateapi-client-auth=cert|token        Select how in-cluster clients authenticate to ateapi for --deploy-ate-system (default: cert; the server always accepts both)"
   echo "  --atenet-router=envoy|agentgateway     Select the atenet router dataplane (default: envoy)"
+  echo "  --egress-extproc-service=NS/NAME[:PORT] Run an operator-supplied ext_proc filter on the egress"
+  echo "                                         CONNECT path, backed by this Kubernetes Service"
+  echo "                                         (default port ${EGRESS_EXTPROC_DEFAULT_PORT}). Applies to --deploy-ate-system"
+  echo "                                         and --deploy-atenet. Omit to leave it out entirely."
+  echo "                                         The filter runs after substrate's actor-identity check,"
+  echo "                                         so it can only deny, never widen; it fails closed, so an"
+  echo "                                         unreachable Service denies every egress CONNECT."
   echo ""
   echo "Infrastructure components:"
   echo ""
@@ -161,7 +168,189 @@ atenet_router() {
   esac
 }
 
+# Default port for --egress-extproc-service, matching the port every other
+# ext_proc server in this repo listens on.
+readonly EGRESS_EXTPROC_DEFAULT_PORT=50051
+
+# Resolve --egress-extproc-service into the "<address> <port>" pair the injected
+# Envoy cluster dials, or nothing at all when the flag is unset. Accepts
+# <namespace>/<name> and <namespace>/<name>:<port>.
+#
+# Like atenet_router, this exits rather than returning on a bad value, so it has
+# to be called once at top level (see the call next to atenet_router below)
+# before any use inside a command substitution, where the exit would only kill
+# the subshell.
+egress_extproc_endpoint() {
+  local spec="${ATE_EGRESS_EXTPROC_SERVICE:-}"
+  if [[ -z "${spec}" ]]; then
+    return 0
+  fi
+
+  local ref="${spec}"
+  local port="${EGRESS_EXTPROC_DEFAULT_PORT}"
+  if [[ "${spec}" == *:* ]]; then
+    ref="${spec%:*}"
+    port="${spec##*:}"
+  fi
+
+  local dns1123='[a-z0-9]([-a-z0-9]*[a-z0-9])?'
+  if [[ ! "${ref}" =~ ^${dns1123}/${dns1123}$ ]]; then
+    echo "Error: --egress-extproc-service must be <namespace>/<name>[:<port>], got '${spec}'" >&2
+    exit 1
+  fi
+  if [[ ! "${port}" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
+    echo "Error: --egress-extproc-service port must be 1-65535, got '${port}'" >&2
+    exit 1
+  fi
+
+  echo "${ref#*/}.${ref%/*}.svc.cluster.local ${port}"
+}
+
+# The ext_proc filter spliced in at the ate:egress-extproc-filter marker.
+# Emitted without leading indentation; inject_egress_extproc reindents it to
+# match the marker.
+egress_extproc_filter_block() {
+  cat <<'EOF'
+# Operator-supplied ext_proc, spliced in by hack/install-ate.sh
+# --egress-extproc-service. See the marker comment below for why it sits here.
+- name: ate.egress.custom_ext_proc
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+    # Without a distinct prefix both ext_proc instances share the
+    # http.egress_connect.ext_proc.* scope and their counters cannot be told
+    # apart -- which is exactly the pair you need separated when deciding
+    # whether substrate or the operator is denying traffic.
+    stat_prefix: custom
+    grpc_service:
+      envoy_grpc:
+        cluster_name: custom_ext_proc_server
+      timeout: 5s
+    # Same posture as substrate's own filter. Fail-open would mean a crashed
+    # operator processor silently stops enforcing the operator's policy, which
+    # is the wrong default for a security control. Note the consequence of the
+    # Service shape: reachability now depends on kube-proxy, endpoint health,
+    # and rollout ordering, so an unready processor fails every CONNECT in the
+    # cluster.
+    failure_mode_allow: false
+    message_timeout: 5s
+    # Denying is the only power the processor has. It cannot promote itself to
+    # seeing bodies (allow_mode_override), cannot rewrite the authenticated
+    # client certificate, and cannot force a re-route. disallow_is_error makes
+    # a disallowed mutation a visible failure rather than a silent no-op.
+    allow_mode_override: false
+    disable_clear_route_cache: true
+    mutation_rules:
+      disallow_is_error: true
+      disallow_expression:
+        regex: "^x-forwarded-client-cert$"
+    # A CONNECT response is a status line and then raw bytes, and the request
+    # has no body before the tunnel opens -- headers are the only thing here
+    # worth showing a policy processor.
+    processing_mode:
+      request_header_mode: SEND
+      response_header_mode: SKIP
+      request_body_mode: NONE
+      response_body_mode: NONE
+      request_trailer_mode: SKIP
+      response_trailer_mode: SKIP
+EOF
+}
+
+# The cluster spliced in at the ate:egress-extproc-cluster marker, pointing at
+# the Service named by --egress-extproc-service.
+egress_extproc_cluster_block() {
+  local address="$1"
+  local port="$2"
+  cat <<EOF
+# Operator-supplied ext_proc server, spliced in by hack/install-ate.sh
+# --egress-extproc-service=${ATE_EGRESS_EXTPROC_SERVICE:-}. Unlike ext_proc_server
+# above this is a real network hop, not loopback: anything that can answer at
+# this address answers for the operator's policy, and it sees every destination
+# every actor asks for. The gateway's own egress is deliberately unmanaged by
+# the NetworkPolicy controller, so nothing constrains this leg today.
+- name: custom_ext_proc_server
+  type: STRICT_DNS
+  dns_lookup_family: V4_ONLY
+  lb_policy: ROUND_ROBIN
+  connect_timeout: 1s
+  typed_extension_protocol_options:
+    envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+      "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+      explicit_http_config:
+        http2_protocol_options: {}
+  load_assignment:
+    cluster_name: custom_ext_proc_server
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            socket_address:
+              address: ${address}
+              port_value: ${port}
+EOF
+}
+
+# Splice the operator's ext_proc filter and cluster into a rendered manifest
+# stream, at the two markers in atenet-egress.yaml's inline envoy.yaml. A no-op
+# passthrough when --egress-extproc-service is unset.
+#
+# This runs on the *rendered* stream rather than the source file so that every
+# install path picks it up -- the kind overlay, the token-client and
+# agentgateway overlays, and the targeted --deploy-atenet redeploy all funnel
+# through here. Each inserted line is prefixed with the indentation of the
+# marker line it replaces, so a re-indent by kustomize cannot corrupt the splice.
+inject_egress_extproc() {
+  local endpoint=""
+  endpoint="$(egress_extproc_endpoint)"
+  if [[ -z "${endpoint}" ]]; then
+    cat
+    return
+  fi
+
+  local address="${endpoint%% *}"
+  local port="${endpoint##* }"
+
+  awk \
+    -v filter_block="$(egress_extproc_filter_block)" \
+    -v cluster_block="$(egress_extproc_cluster_block "${address}" "${port}")" '
+    function emit(block, indent,   n, lines, i) {
+      n = split(block, lines, "\n")
+      for (i = 1; i <= n; i++) {
+        print (lines[i] == "" ? "" : indent lines[i])
+      }
+    }
+    function indent_of(line) {
+      match(line, /^[ \t]*/)
+      return substr(line, 1, RLENGTH)
+    }
+    /# ate:egress-extproc-filter$/  { emit(filter_block, indent_of($0));  print; next }
+    /# ate:egress-extproc-cluster$/ { emit(cluster_block, indent_of($0)); print; next }
+    { print }
+  '
+}
+
+# kubectl apply on a ConfigMap does not restart the pods that mount it, and
+# Envoy reads /etc/envoy/envoy.yaml only at startup. Without this, changing the
+# egress config -- toggling --egress-extproc-service, or editing envoy.yaml at
+# all -- leaves the running gateway on the old config while the manifest claims
+# otherwise, and the rollout waits below happily pass. Only "configured" gets a
+# restart: "created" means the pods have not started yet and will read the new
+# config on their own.
+apply_manifests() {
+  local out=""
+  out="$(run_kubectl apply -f -)"
+  echo "${out}"
+  if grep -q '^configmap/atenet-egress configured$' <<<"${out}"; then
+    log_step "egress envoy config changed; restarting atenet-egress"
+    run_kubectl rollout restart deployment/atenet-egress -n ate-system
+  fi
+}
+
 render_ate_system_manifests() {
+  render_ate_system_overlay | inject_egress_extproc
+}
+
+render_ate_system_overlay() {
   local client_auth=""
   local router=""
   client_auth="$(ateapi_client_auth)"
@@ -430,7 +619,7 @@ deploy_ate_system() {
 
   local manifests=""
   manifests="$(render_ate_system_manifests)"
-  echo "${manifests}" | run_kubectl apply -f -
+  echo "${manifests}" | apply_manifests
 
   log_step "Waiting for ATE system components to be ready..."
   run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=120s
@@ -511,7 +700,13 @@ deploy_atenet() {
   router_manifest="$(render_atenet_router_manifest)"
   echo "${router_manifest}" | run_kubectl apply -f -
 
-  run_ko apply -f manifests/ate-install/atenet-egress.yaml
+  # resolve-then-apply rather than `ko apply`, so the rendered stream can pass
+  # through inject_egress_extproc on its way to the cluster. Same shape
+  # render_atenet_router_manifest already uses above.
+  run_ko resolve -f manifests/ate-install/atenet-egress.yaml \
+    | inject_egress_extproc \
+    | apply_manifests
+
   run_ko apply -f manifests/ate-install/atenet-dns.yaml
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
   run_kubectl rollout status deployment/atenet-egress -n ate-system --timeout=120s
@@ -697,6 +892,14 @@ for ((i = 0; i < ${#prescan_args[@]}; i++)); do
       fi
       ATE_ATENET_ROUTER="${prescan_args[$((i + 1))]}"
       ;;
+    --egress-extproc-service=*) ATE_EGRESS_EXTPROC_SERVICE="${prescan_args[i]#*=}" ;;
+    --egress-extproc-service)
+      if (( i + 1 >= ${#prescan_args[@]} )); then
+        echo "Error: --egress-extproc-service requires <namespace>/<name>[:<port>]" >&2
+        exit 1
+      fi
+      ATE_EGRESS_EXTPROC_SERVICE="${prescan_args[$((i + 1))]}"
+      ;;
     --benchmark-worker-count)
       BENCHMARK_WORKER_COUNT="${prescan_args[i+1]:-1}"
       ;;
@@ -709,6 +912,9 @@ for ((i = 0; i < ${#prescan_args[@]}; i++)); do
   esac
 done
 atenet_router >/dev/null
+# Validate at top level, where a bad value can actually exit: inside the command
+# substitutions that use it later, the exit would only kill the subshell.
+egress_extproc_endpoint >/dev/null
 
 while [[ "$#" -gt 0 ]]; do
   # Run ${demo}_cmdline if it exists. If it returns 0, then we successfully
@@ -742,6 +948,10 @@ while [[ "$#" -gt 0 ]]; do
       fi
       ATE_ATENET_ROUTER="$1"
       ;;
+    # Value captured in the pre-scan above; consumed here so the `*)` branch
+    # does not reject it.
+    --egress-extproc-service=*) ;;
+    --egress-extproc-service) shift ;;
 
     --deploy-ate-system) deploy_ate_system ;;
     --setup-csi)
