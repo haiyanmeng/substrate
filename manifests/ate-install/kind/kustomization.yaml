@@ -27,6 +27,10 @@ resources:
   - ./atelet
   - ../atenet-dns.yaml
   - ../atenet-egress.yaml
+  # Not optional alongside atenet-egress: the gateway's mitm_listener calls
+  # extprocd fail-closed, so an install without it answers every decrypted
+  # egress request with a 500.
+  - ../atenet-egress-extproc.yaml
   - ../atenet-router.yaml
   - ../valkey.yaml
   - ../pod-certificate-controller.yaml

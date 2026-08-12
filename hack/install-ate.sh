@@ -471,6 +471,7 @@ deploy_ate_system() {
   run_kubectl rollout status deployment/ate-controller -n ate-system --timeout=120s
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
   run_kubectl rollout status deployment/atenet-egress -n ate-system --timeout=120s
+  run_kubectl rollout status deployment/atenet-egress-extproc -n ate-system --timeout=120s
   run_kubectl rollout status statefulset/valkey-cluster -n ate-system --timeout=120s
   run_kubectl rollout status daemonset/atelet -n ate-system --timeout=120s
 }
@@ -557,6 +558,12 @@ deploy_atenet() {
     || create_egress_mitm_ca_pool_secret
 
   run_ko apply -f manifests/ate-install/atenet-dns.yaml
+  # Before the gateway, and waited on. The gateway's mitm_listener calls
+  # extprocd with failure_mode_allow: false, so a gateway that comes up first
+  # answers every decrypted request with a 500 until this Deployment has ready
+  # endpoints -- an outage that looks like an egress policy denial.
+  run_ko apply -f manifests/ate-install/atenet-egress-extproc.yaml
+  run_kubectl rollout status deployment/atenet-egress-extproc -n ate-system --timeout=120s
   run_ko apply -f manifests/ate-install/atenet-egress.yaml
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
   run_kubectl rollout status deployment/atenet-egress -n ate-system --timeout=120s

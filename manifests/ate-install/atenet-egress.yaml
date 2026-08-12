@@ -236,6 +236,43 @@ data:
                       cluster: egress_forward_proxy
                       timeout: 30s
               http_filters:
+              # The inner checkpoint. First in the chain, before the
+              # destination is resolved: a denial here costs no DNS lookup and
+              # no upstream connection. See the anchor comment on the
+              # inner_ext_proc_server cluster below for what this filter can
+              # see and why it is a separate processor.
+              - name: envoy.filters.http.ext_proc
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                  # Separates extprocd's counters from the CONNECT
+                  # checkpoint's, which are http.egress_connect.ext_proc.*.
+                  # These land under http.mitm_http.inner.ext_proc.*.
+                  stat_prefix: inner
+                  grpc_service:
+                    envoy_grpc:
+                      cluster_name: inner_ext_proc_server
+                    timeout: 2s
+                  # Fail closed, and match the CONNECT checkpoint's budget
+                  # rather than the 5s the contract doc quotes for an operator
+                  # filter: two processors on the same request path with
+                  # different timeouts make a slow denial hard to attribute.
+                  failure_mode_allow: false
+                  message_timeout: 2s
+                  # No mutation_rules. Ordinary header mutations stay permitted
+                  # on purpose -- this filter is where credential injection
+                  # would land, and it returns nothing today. What is already
+                  # forbidden by default is the part that would matter:
+                  # allow_all_routing is false, so extprocd cannot rewrite
+                  # :authority and redirect the request somewhere the SNI was
+                  # never policed for.
+                  disable_clear_route_cache: true
+                  processing_mode:
+                    request_header_mode: SEND
+                    response_header_mode: SKIP
+                    request_body_mode: NONE
+                    response_body_mode: NONE
+                    request_trailer_mode: SKIP
+                    response_trailer_mode: SKIP
               # Re-resolves the destination from the tunnelled request's own
               # Host header rather than reusing the CONNECT authority. This is
               # what stops a client pointing SNI at an allowed name while the
@@ -368,6 +405,40 @@ data:
                       body:
                         inline_string: "egress denied: destination is not in the egress allowlist\n"
               http_filters:
+              # The same inner checkpoint as the TLS chain, and a byte-identical
+              # config. Both chains, so that speaking plaintext is not a way
+              # around it: the route match above and this filter are
+              # independent controls, and an actor that could reach a name over
+              # HTTP but not HTTPS would have found the cheapest possible
+              # bypass.
+              #
+              # extprocd sees the same header shape here as on the TLS chain --
+              # Envoy's HTTP/1 codec folds Host into :authority before any http
+              # filter runs -- so one policy covers both legs. What differs is
+              # everything around it: no minted leaf and no
+              # REQUESTED_SERVER_NAME to cross-check the authority against, so
+              # on this leg the authority is the only statement of destination
+              # there is.
+              - name: envoy.filters.http.ext_proc
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                  # Lands under http.mitm_cleartext.inner.ext_proc.*, so the
+                  # two chains' counters stay apart.
+                  stat_prefix: inner
+                  grpc_service:
+                    envoy_grpc:
+                      cluster_name: inner_ext_proc_server
+                    timeout: 2s
+                  failure_mode_allow: false
+                  message_timeout: 2s
+                  disable_clear_route_cache: true
+                  processing_mode:
+                    request_header_mode: SEND
+                    response_header_mode: SKIP
+                    request_body_mode: NONE
+                    response_body_mode: NONE
+                    request_trailer_mode: SKIP
+                    response_trailer_mode: SKIP
               # Same reasoning as the TLS chain: resolve from the request's own
               # Host, so the name that was policed is the name that is dialled.
               - name: envoy.filters.http.dynamic_forward_proxy
@@ -450,6 +521,49 @@ data:
                   socket_address:
                     address: 127.0.0.1
                     port_value: 50051
+      # ext_proc gRPC server for the INNER checkpoint = extprocd, a separate
+      # Deployment (manifests/ate-install/atenet-egress-extproc.yaml) rather
+      # than another sidecar. It is called once per HTTP request on every
+      # tunnel, not once per tunnel, so its load tracks request rate and it has
+      # to scale apart from the gateway.
+      #
+      # What that checkpoint sees, and does not:
+      #   * The real hostname, method, and path -- none of which exist at the
+      #     CONNECT checkpoint, where the authority is always an IP:port
+      #     because atunnel takes the destination from SO_ORIGINAL_DST.
+      #   * No client certificate: mitm_listener has no validation_context, so
+      #     there is no XFCC on this leg.
+      #   * No trustworthy identity at all, yet. Identity has to cross as
+      #     filter_state['ate.actor'], which needs set_filter_state on the
+      #     front door and an internal_upstream transport socket on
+      #     mitm_internal; neither is wired. Any x-ate-* header arriving here
+      #     was written by the actor inside its own tunnel.
+      #
+      # A DNS cluster, not a STATIC one: this is a Service, and STRICT_DNS
+      # re-resolves it, so a rescheduled extprocd pod is picked up without an
+      # Envoy restart. The h2c protocol options are required -- ext_proc is
+      # gRPC and this hop has no transport socket, so it is cleartext HTTP/2
+      # inside the cluster network.
+      - name: inner_ext_proc_server
+        type: STRICT_DNS
+        lb_policy: ROUND_ROBIN
+        connect_timeout: 1s
+        dns_lookup_family: V4_ONLY
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            explicit_http_config:
+              http2_protocol_options: {}
+        load_assignment:
+          cluster_name: inner_ext_proc_server
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: atenet-egress-extproc.ate-system.svc.cluster.local
+                    port_value: 50051
+
       # The only cluster that dials the internet. Reached from the MITM leg, so
       # the host it resolves comes from the decrypted request's own Host header
       # rather than from the CONNECT authority.
