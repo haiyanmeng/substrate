@@ -191,7 +191,14 @@ data:
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
         filter_chains:
-        - filter_chain_match:
+          # Named so ext_proc can read it back as xds.filter_chain_name, the
+          # same mechanism the front door uses. Must match TLSFilterChainName
+          # in cmd/extprocd/internal/inner/inner.go: extprocd injects
+          # credentials only on this chain, because only this one re-originates
+          # over TLS. Renaming it here without updating the constant fails
+          # closed -- nothing is injected.
+        - name: mitm_tls
+          filter_chain_match:
             transport_protocol: tls
           filters:
           - name: envoy.filters.network.http_connection_manager
@@ -252,6 +259,14 @@ data:
                     envoy_grpc:
                       cluster_name: inner_ext_proc_server
                     timeout: 2s
+                  # The one thing on this request extprocd can trust. Every
+                  # header inside the tunnel was written by the actor --
+                  # including x-forwarded-proto, which Envoy turns into
+                  # :scheme, so even "this arrived over TLS" is forgeable from
+                  # the headers alone. Envoy asserts the chain name, and
+                  # credential injection is gated on it.
+                  request_attributes:
+                  - xds.filter_chain_name
                   # Fail closed, and match the CONNECT checkpoint's budget
                   # rather than the 5s the contract doc quotes for an operator
                   # filter: two processors on the same request path with
@@ -259,12 +274,15 @@ data:
                   failure_mode_allow: false
                   message_timeout: 2s
                   # No mutation_rules. Ordinary header mutations stay permitted
-                  # on purpose -- this filter is where credential injection
-                  # would land, and it returns nothing today. What is already
-                  # forbidden by default is the part that would matter:
-                  # allow_all_routing is false, so extprocd cannot rewrite
-                  # :authority and redirect the request somewhere the SNI was
-                  # never policed for.
+                  # because this filter uses them: extprocd sets Authorization
+                  # on requests to GitHub, and the default rules allow that
+                  # while still refusing :-prefixed pseudo-headers and host.
+                  # Verified against Envoy 1.37.5 -- the mutation is applied,
+                  # and an Authorization the actor set inside its own tunnel is
+                  # replaced rather than appended to. What is already forbidden
+                  # by default is the part that would matter: allow_all_routing
+                  # is false, so extprocd cannot rewrite :authority and redirect
+                  # the request somewhere the SNI was never policed for.
                   disable_clear_route_cache: true
                   processing_mode:
                     request_header_mode: SEND
@@ -337,7 +355,12 @@ data:
         # it is the difference between an actor reaching an arbitrary host over
         # HTTP and having to speak TLS to do it -- but do not read it as the
         # gateway's egress policy.
-        - filter_chain_match:
+          # Named for the same reason, and the name matters most here: this is
+          # the chain extprocd must NOT inject on. egress_forward_proxy_cleartext
+          # has no upstream TLS, so a credential added here leaves the pod in
+          # the clear.
+        - name: mitm_cleartext
+          filter_chain_match:
             transport_protocol: raw_buffer
           filters:
           - name: envoy.filters.network.http_connection_manager
@@ -429,6 +452,13 @@ data:
                     envoy_grpc:
                       cluster_name: inner_ext_proc_server
                     timeout: 2s
+                  # Requested on this chain too, and not as symmetry for its own
+                  # sake: without it the attribute is absent, extprocd reads an
+                  # empty chain name, and "empty" would have to be interpreted.
+                  # With it, this leg positively identifies itself as the one
+                  # that must not receive a credential.
+                  request_attributes:
+                  - xds.filter_chain_name
                   failure_mode_allow: false
                   message_timeout: 2s
                   disable_clear_route_cache: true

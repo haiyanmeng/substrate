@@ -34,6 +34,11 @@
 // Identity therefore has to cross as filter state (filter_state['ate.actor']),
 // which is not wired yet. Until it is, a Policy can decide only on where the
 // request is going, not on who is sending it.
+//
+// The one input here the actor cannot forge is the filter chain name Envoy
+// attaches as an attribute. Everything else — including :scheme, which Envoy
+// derives from the client's own x-forwarded-proto on a plaintext connection —
+// is downstream of bytes the workload wrote. See TLSFilterChainName.
 package inner
 
 import (
@@ -61,6 +66,64 @@ const DenyDetails = "extprocd_egress_policy_denied"
 // the workload turns the deny path into a way to enumerate that policy.
 const denyBody = "egress denied: destination is not permitted by egress policy\n"
 
+// TLSFilterChainName is mitm_listener's TLS chain: the leg where Envoy minted
+// a leaf for the SNI, terminated the actor's TLS, and re-originates over TLS
+// through egress_forward_proxy. Must match the filter chain name in
+// manifests/ate-install/atenet-egress.yaml, which also has to ask for the
+// attribute via request_attributes.
+//
+// This is the only trustworthy statement of "this request will leave the pod
+// encrypted", and credential injection depends on it. The obvious alternative,
+// req.Scheme == "https", is not one: on the cleartext chain Envoy derives
+// :scheme from x-forwarded-proto, which the actor sets inside its own tunnel.
+// Verified against Envoy 1.37.5 — a plaintext request carrying
+// "X-Forwarded-Proto: https" arrives at ext_proc as :scheme https, while the
+// chain name still reads mitm_cleartext.
+//
+// Renaming the chain in the manifest without updating this fails closed: the
+// name stops matching, and nothing is injected. So does forgetting
+// request_attributes, which makes the attribute absent and the name empty.
+const TLSFilterChainName = "mitm_tls"
+
+// filterChainNameAttribute is the CEL attribute carrying the chain name. Same
+// value as extproc.FilterChainNameAttribute in the CONNECT checkpoint, not
+// imported from it: that package is the atenet router's, and a dependency from
+// this binary to it would pull the whole ate API client in for one string.
+const filterChainNameAttribute = "xds.filter_chain_name"
+
+// authorizationHeader is the header credential injection writes.
+const authorizationHeader = "authorization"
+
+// githubToken is the GitHub personal access token extprocd presents to GitHub
+// on an actor's behalf, so that the actor never holds it: the workload makes an
+// unauthenticated request and the gateway adds the credential on the decrypted
+// leg, where the actor cannot read it back.
+//
+// HARDCODED, AND EMPTY IN THE REPOSITORY. Paste a PAT here to demo it, and do
+// not commit that. An empty value is not a broken config — GitHubToken returns
+// a no-op injector, so a fresh checkout adds no header at all rather than
+// sending "Bearer " to github.com.
+//
+// This is the wrong place for a real deployment and it is worth saying why,
+// because the failure is quiet. A token in the source is in every clone, every
+// image layer, and every fork; it cannot be rotated without a rebuild; and it
+// is the same token for every actor, so the gateway's access log is the only
+// record of who used it. The production answer is a mounted Secret read at
+// request time, which rotates in place and can be scoped per actor once
+// filter_state['ate.actor'] is wired.
+const githubToken = ""
+
+// githubTokenHosts are the only destinations the token is ever sent to.
+//
+// Exact names, not a suffix match on "github.com". A suffix match would also
+// cover pages.github.com and every user-controlled *.github.io style name that
+// resolves under it, and the cost of being wrong here is not a failed request,
+// it is a PAT handed to a host that asked for one.
+var githubTokenHosts = map[string]struct{}{
+	"api.github.com": {},
+	"github.com":     {},
+}
+
 // Request is everything the inner checkpoint can see about one tunnelled
 // request. Constructed from the ext_proc RequestHeaders message; a Policy gets
 // this rather than the protobuf so it cannot accidentally depend on the parts
@@ -86,6 +149,14 @@ type Request struct {
 	// names the actor may have set inside its own tunnel — see the package
 	// comment before reading one.
 	Headers map[string]string
+
+	// FilterChain is the mitm_listener chain Envoy accepted this request on,
+	// read from the xds.filter_chain_name attribute. Empty when the gateway did
+	// not ask for the attribute.
+	//
+	// The only field here the actor cannot influence, and therefore the only
+	// one safe to gate a credential on. Compare against TLSFilterChainName.
+	FilterChain string
 }
 
 // Host is Authority with any port removed and the name lower-cased, which is
@@ -174,19 +245,98 @@ func DenyHosts(hosts []string) (Policy, error) {
 	}), nil
 }
 
+// Header is one request header extprocd sets before the request is forwarded.
+type Header struct {
+	Name  string
+	Value string
+}
+
+// Injector adds credentials to a request the Policy already allowed.
+//
+// Separate from Policy on purpose. A Policy answers whether a request may
+// leave; an Injector answers what the gateway adds to it on the way out. Fusing
+// them would put the credential on the deny path, where the one thing that must
+// never happen is a token reaching a destination the policy just refused.
+//
+// An Injector must return nothing unless it is certain of the destination AND
+// of the leg. See GitHubToken for what "certain" costs.
+type Injector interface {
+	Inject(ctx context.Context, req *Request) []Header
+}
+
+// InjectorFunc adapts a function to Injector.
+type InjectorFunc func(ctx context.Context, req *Request) []Header
+
+// Inject implements Injector.
+func (f InjectorFunc) Inject(ctx context.Context, req *Request) []Header {
+	return f(ctx, req)
+}
+
+// NoInjection adds nothing to any request.
+func NoInjection() Injector {
+	return InjectorFunc(func(context.Context, *Request) []Header { return nil })
+}
+
+// GitHubToken returns the injector for the hardcoded githubToken, or
+// NoInjection when that constant is empty.
+func GitHubToken() Injector { return githubTokenInjector(githubToken) }
+
+// GitHubTokenConfigured reports whether a token is compiled in. Only so the
+// startup log can say so: "no Authorization header appeared" and "the constant
+// is empty" look identical from the actor's side, and from GitHub's.
+func GitHubTokenConfigured() bool { return strings.TrimSpace(githubToken) != "" }
+
+// githubTokenInjector is GitHubToken with the token as a parameter, so tests
+// can exercise it without a real credential in the repository.
+//
+// Two conditions, both required, neither sufficient:
+//
+//   - The request arrived on TLSFilterChainName. On the cleartext chain the
+//     request re-originates through egress_forward_proxy_cleartext, which has
+//     no upstream TLS — injecting there would put the PAT on the wire in the
+//     clear, to a destination the actor chose.
+//   - The destination is in githubTokenHosts, matched on Host so that a port or
+//     a difference in case cannot dodge it.
+//
+// The header is set, not appended, so an Authorization the actor wrote inside
+// its own tunnel is replaced rather than joined. Appending would let the actor
+// prepend a credential of its own and take its chances on which one GitHub
+// reads first.
+func githubTokenInjector(token string) Injector {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return NoInjection()
+	}
+	value := "Bearer " + token
+	return InjectorFunc(func(_ context.Context, req *Request) []Header {
+		if req.FilterChain != TLSFilterChainName {
+			return nil
+		}
+		if _, ok := githubTokenHosts[req.Host()]; !ok {
+			return nil
+		}
+		return []Header{{Name: authorizationHeader, Value: value}}
+	})
+}
+
 // Server is the ext_proc gRPC service extprocd serves to the egress gateway's
 // mitm_listener.
 type Server struct {
-	policy Policy
-	logger *slog.Logger
+	policy   Policy
+	injector Injector
+	logger   *slog.Logger
 }
 
-// NewServer builds the service. A nil logger discards.
-func NewServer(policy Policy, logger *slog.Logger) *Server {
+// NewServer builds the service. A nil injector injects nothing; a nil logger
+// discards.
+func NewServer(policy Policy, injector Injector, logger *slog.Logger) *Server {
+	if injector == nil {
+		injector = NoInjection()
+	}
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &Server{policy: policy, logger: logger}
+	return &Server{policy: policy, injector: injector, logger: logger}
 }
 
 // Process implements the ExternalProcessor service.
@@ -221,7 +371,7 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 func (s *Server) respond(ctx context.Context, req *extprocv3.ProcessingRequest) (*extprocv3.ProcessingResponse, error) {
 	switch msg := req.GetRequest().(type) {
 	case *extprocv3.ProcessingRequest_RequestHeaders:
-		return s.processRequestHeaders(ctx, msg.RequestHeaders), nil
+		return s.processRequestHeaders(ctx, msg.RequestHeaders, filterChainName(req)), nil
 
 	// The remaining kinds are all configured SKIP or NONE on the filter, so
 	// none of them should arrive. Answer each with the matching empty response
@@ -257,9 +407,14 @@ func (s *Server) respond(ctx context.Context, req *extprocv3.ProcessingRequest) 
 	}
 }
 
-// processRequestHeaders runs one request past the policy.
-func (s *Server) processRequestHeaders(ctx context.Context, headers *extprocv3.HttpHeaders) *extprocv3.ProcessingResponse {
-	req := requestFromHeaders(headers)
+// processRequestHeaders runs one request past the policy, then past the
+// injector.
+//
+// Policy first. A denied request never reaches the injector, so there is no
+// ordering in which a credential is attached to a request that is about to be
+// refused.
+func (s *Server) processRequestHeaders(ctx context.Context, headers *extprocv3.HttpHeaders, filterChain string) *extprocv3.ProcessingResponse {
+	req := requestFromHeaders(headers, filterChain)
 	decision := s.policy.Evaluate(ctx, req)
 
 	if !decision.Allow {
@@ -277,30 +432,80 @@ func (s *Server) processRequestHeaders(ctx context.Context, headers *extprocv3.H
 		slog.String("method", req.Method),
 		slog.String("path", req.Path),
 	)
-	// An empty CommonResponse, with no header_mutation. The filter's mutation
-	// rules do permit ordinary header mutations — that headroom is what makes
-	// this the seam credential injection would land at — but nothing is
-	// injected today, and a mutation returned by accident would be applied.
+
+	common := &extprocv3.CommonResponse{}
+	if injected := s.injector.Inject(ctx, req); len(injected) > 0 {
+		common.HeaderMutation = &extprocv3.HeaderMutation{SetHeaders: setHeaders(injected)}
+		// Names only. The value is the credential, and an access log is a much
+		// less guarded artifact than the Secret it came from.
+		s.logger.InfoContext(ctx, "credential injected",
+			slog.String("host", req.Host()),
+			slog.String("chain", req.FilterChain),
+			slog.Any("headers", headerNames(injected)),
+		)
+	}
 	return &extprocv3.ProcessingResponse{
 		Response: &extprocv3.ProcessingResponse_RequestHeaders{
-			RequestHeaders: &extprocv3.HeadersResponse{Response: &extprocv3.CommonResponse{}},
+			RequestHeaders: &extprocv3.HeadersResponse{Response: common},
 		},
 	}
 }
 
+// setHeaders converts injected headers to the ext_proc mutation.
+//
+// OVERWRITE_IF_EXISTS_OR_ADD is load-bearing and is not the default: the
+// zero AppendAction is APPEND_IF_EXISTS_OR_ADD, which on a request that already
+// carries an actor-written Authorization produces two values rather than one
+// and leaves which one the upstream honours up to the upstream.
+func setHeaders(headers []Header) []*corev3.HeaderValueOption {
+	options := make([]*corev3.HeaderValueOption, 0, len(headers))
+	for _, header := range headers {
+		options = append(options, &corev3.HeaderValueOption{
+			// RawValue rather than Value, matching denyResponse: newer Envoy
+			// drops Value.
+			Header:       &corev3.HeaderValue{Key: header.Name, RawValue: []byte(header.Value)},
+			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+		})
+	}
+	return options
+}
+
+// headerNames lists the injected header names for the log.
+func headerNames(headers []Header) []string {
+	names := make([]string, 0, len(headers))
+	for _, header := range headers {
+		names = append(names, header.Name)
+	}
+	return names
+}
+
 // requestFromHeaders projects the ext_proc header map onto a Request.
-func requestFromHeaders(headers *extprocv3.HttpHeaders) *Request {
+func requestFromHeaders(headers *extprocv3.HttpHeaders, filterChain string) *Request {
 	all := make(map[string]string)
 	for _, header := range headers.GetHeaders().GetHeaders() {
 		all[strings.ToLower(header.GetKey())] = headerValue(header)
 	}
 	return &Request{
-		Method:    all[":method"],
-		Authority: authorityOf(all),
-		Path:      all[":path"],
-		Scheme:    all[":scheme"],
-		Headers:   all,
+		Method:      all[":method"],
+		Authority:   authorityOf(all),
+		Path:        all[":path"],
+		Scheme:      all[":scheme"],
+		Headers:     all,
+		FilterChain: filterChain,
 	}
+}
+
+// filterChainName returns the xds.filter_chain_name attribute Envoy attached,
+// or "" when the gateway did not request it. The attributes map is keyed by the
+// ext_proc filter's name within the HCM chain, which this binary should not
+// have to know, so scan every entry.
+func filterChainName(req *extprocv3.ProcessingRequest) string {
+	for _, attributes := range req.GetAttributes() {
+		if value, ok := attributes.GetFields()[filterChainNameAttribute]; ok {
+			return value.GetStringValue()
+		}
+	}
+	return ""
 }
 
 // authorityOf prefers :authority and falls back to host.

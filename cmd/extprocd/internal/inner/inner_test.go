@@ -24,6 +24,7 @@ import (
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 // fakeStream plays Envoy: it hands the server a fixed list of messages, then
@@ -71,11 +72,32 @@ func rawHeaders(pairs map[string]string) *extprocv3.ProcessingRequest {
 	}
 }
 
-// process runs one request through a server and returns the single response.
+// onChain stamps a message with the xds.filter_chain_name attribute the way
+// Envoy does when the filter asks for it: keyed by the ext_proc filter's name
+// within the HCM chain, which the server must not depend on.
+func onChain(req *extprocv3.ProcessingRequest, name string) *extprocv3.ProcessingRequest {
+	req.Attributes = map[string]*structpb.Struct{
+		"envoy.filters.http.ext_proc": {
+			Fields: map[string]*structpb.Value{
+				filterChainNameAttribute: structpb.NewStringValue(name),
+			},
+		},
+	}
+	return req
+}
+
+// process runs one request through a server that injects nothing.
 func process(t *testing.T, policy Policy, req *extprocv3.ProcessingRequest) *extprocv3.ProcessingResponse {
 	t.Helper()
+	return processWith(t, policy, nil, req)
+}
+
+// processWith runs one request through a server and returns the single
+// response.
+func processWith(t *testing.T, policy Policy, injector Injector, req *extprocv3.ProcessingRequest) *extprocv3.ProcessingResponse {
+	t.Helper()
 	stream := &fakeStream{incoming: []*extprocv3.ProcessingRequest{req}}
-	if err := NewServer(policy, nil).Process(stream); err != nil {
+	if err := NewServer(policy, injector, nil).Process(stream); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
 	if len(stream.sent) != 1 {
@@ -95,10 +117,10 @@ func TestProcessAllows(t *testing.T) {
 	if !ok {
 		t.Fatalf("allow returned %T, want a RequestHeaders response", resp.GetResponse())
 	}
-	// An allow must carry no mutation. The filter's rules permit ordinary
-	// header mutations so that credential injection can land here later, which
-	// means a mutation returned by accident would actually be applied rather
-	// than rejected.
+	// An allow from a server with no injector must carry no mutation. The
+	// filter's rules permit ordinary header mutations -- that is what makes
+	// credential injection work at all -- so a mutation returned by accident
+	// would be applied rather than rejected.
 	if mutation := headers.RequestHeaders.GetResponse().GetHeaderMutation(); mutation != nil {
 		t.Errorf("allow carried a header mutation: %v", mutation)
 	}
@@ -190,7 +212,7 @@ func TestRequestFromHeadersReadsRawValueAndValue(t *testing.T) {
 		{Key: "X-Custom", RawValue: []byte("kept")},
 	}}
 
-	req := requestFromHeaders(&extprocv3.HttpHeaders{Headers: headers})
+	req := requestFromHeaders(&extprocv3.HttpHeaders{Headers: headers}, TLSFilterChainName)
 
 	if req.Method != "POST" {
 		t.Errorf("Method = %q, want POST", req.Method)
@@ -220,7 +242,7 @@ func TestRequestFromHeadersFallsBackToHost(t *testing.T) {
 			{Key: ":method", RawValue: []byte("GET")},
 			{Key: "host", RawValue: []byte("cleartext.example.com")},
 		},
-	}})
+	}}, "mitm_cleartext")
 
 	if req.Authority != "cleartext.example.com" {
 		t.Errorf("Authority = %q, want the Host header", req.Authority)
@@ -308,7 +330,7 @@ func TestProcessAnswersEachMessageKindInKind(t *testing.T) {
 // without a response is the fail-closed outcome: Envoy reports it as a 500.
 func TestProcessRefusesAnUnknownMessageKind(t *testing.T) {
 	stream := &fakeStream{incoming: []*extprocv3.ProcessingRequest{{}}}
-	if err := NewServer(AllowAll(), nil).Process(stream); err == nil {
+	if err := NewServer(AllowAll(), nil, nil).Process(stream); err == nil {
 		t.Fatal("Process accepted a ProcessingRequest with no message set, want an error")
 	}
 	if len(stream.sent) != 0 {
@@ -321,7 +343,7 @@ func TestProcessHandlesMultipleMessagesAndEOF(t *testing.T) {
 		rawHeaders(map[string]string{":authority": "a.example.com"}),
 		rawHeaders(map[string]string{":authority": "b.example.com"}),
 	}}
-	if err := NewServer(AllowAll(), nil).Process(stream); err != nil {
+	if err := NewServer(AllowAll(), nil, nil).Process(stream); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
 	if len(stream.sent) != 2 {
@@ -331,4 +353,184 @@ func TestProcessHandlesMultipleMessagesAndEOF(t *testing.T) {
 
 func typeName(v any) string {
 	return fmt.Sprintf("%T", v)
+}
+
+// --- credential injection -------------------------------------------------
+
+// injectedAuthorization returns the Authorization value a response sets, and
+// whether it sets one at all.
+func injectedAuthorization(t *testing.T, resp *extprocv3.ProcessingResponse) (string, bool) {
+	t.Helper()
+	headers, ok := resp.GetResponse().(*extprocv3.ProcessingResponse_RequestHeaders)
+	if !ok {
+		t.Fatalf("response was %T, want RequestHeaders", resp.GetResponse())
+	}
+	for _, option := range headers.RequestHeaders.GetResponse().GetHeaderMutation().GetSetHeaders() {
+		if option.GetHeader().GetKey() != authorizationHeader {
+			continue
+		}
+		// The mutation must overwrite. Appending to an Authorization the actor
+		// already set leaves two values on the request and the choice between
+		// them to GitHub.
+		if action := option.GetAppendAction(); action != corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD {
+			t.Errorf("append_action = %v, want OVERWRITE_IF_EXISTS_OR_ADD", action)
+		}
+		return string(option.GetHeader().GetRawValue()), true
+	}
+	return "", false
+}
+
+// The whole point: the actor sends an unauthenticated request and the token is
+// added on the decrypted leg, where the workload cannot read it back.
+func TestGitHubTokenInjectsOnTheTLSChain(t *testing.T) {
+	for _, host := range []string{"api.github.com", "github.com", "API.GitHub.com", "github.com:443", "github.com."} {
+		t.Run(host, func(t *testing.T) {
+			resp := processWith(t, AllowAll(), githubTokenInjector("pat-test"), onChain(rawHeaders(map[string]string{
+				":method":    "GET",
+				":authority": host,
+				":path":      "/user",
+				":scheme":    "https",
+			}), TLSFilterChainName))
+
+			value, ok := injectedAuthorization(t, resp)
+			if !ok {
+				t.Fatalf("no Authorization header injected for %q", host)
+			}
+			if value != "Bearer pat-test" {
+				t.Errorf("Authorization = %q, want %q", value, "Bearer pat-test")
+			}
+		})
+	}
+}
+
+// The credential leak this design is built to prevent. The cleartext chain
+// re-originates through egress_forward_proxy_cleartext, which has no upstream
+// TLS, so a token injected here goes onto the network in the clear.
+//
+// The actor's forged x-forwarded-proto is the attack: it makes Envoy report
+// :scheme https on a plaintext request, so a processor that gated on the scheme
+// would inject. Gating on the Envoy-asserted chain name does not.
+func TestGitHubTokenRefusesTheCleartextChain(t *testing.T) {
+	resp := processWith(t, AllowAll(), githubTokenInjector("pat-test"), onChain(rawHeaders(map[string]string{
+		":method":           "GET",
+		":authority":        "api.github.com",
+		":path":             "/user",
+		":scheme":           "https",
+		"x-forwarded-proto": "https",
+	}), "mitm_cleartext"))
+
+	if value, ok := injectedAuthorization(t, resp); ok {
+		t.Fatalf("token injected on the cleartext chain: %q", value)
+	}
+}
+
+// An absent attribute means the gateway did not ask for it. That is a config
+// error, and the safe reading of it is "not the TLS chain".
+func TestGitHubTokenRefusesAnAbsentFilterChain(t *testing.T) {
+	resp := processWith(t, AllowAll(), githubTokenInjector("pat-test"), rawHeaders(map[string]string{
+		":method":    "GET",
+		":authority": "api.github.com",
+		":path":      "/user",
+		":scheme":    "https",
+	}))
+
+	if value, ok := injectedAuthorization(t, resp); ok {
+		t.Fatalf("token injected with no filter chain attribute: %q", value)
+	}
+}
+
+// Every host that is not GitHub, including the ones a suffix match on
+// "github.com" would wrongly cover.
+func TestGitHubTokenRefusesOtherHosts(t *testing.T) {
+	for _, host := range []string{
+		"example.com",
+		"raw.githubusercontent.com",
+		"evil.github.com",
+		"github.com.evil.example",
+		"notgithub.com",
+	} {
+		t.Run(host, func(t *testing.T) {
+			resp := processWith(t, AllowAll(), githubTokenInjector("pat-test"), onChain(rawHeaders(map[string]string{
+				":method":    "GET",
+				":authority": host,
+				":path":      "/",
+				":scheme":    "https",
+			}), TLSFilterChainName))
+
+			if value, ok := injectedAuthorization(t, resp); ok {
+				t.Fatalf("token injected for %q: %q", host, value)
+			}
+		})
+	}
+}
+
+// A denied request must never carry the credential. Policy runs before the
+// injector, so the response is an ImmediateResponse with no mutation at all --
+// but the ordering is the property under test, not the response type.
+func TestGitHubTokenNotInjectedOnADeniedRequest(t *testing.T) {
+	policy, err := DenyHosts([]string{"api.github.com"})
+	if err != nil {
+		t.Fatalf("DenyHosts: %v", err)
+	}
+	resp := processWith(t, policy, githubTokenInjector("pat-test"), onChain(rawHeaders(map[string]string{
+		":method":    "GET",
+		":authority": "api.github.com",
+		":path":      "/user",
+		":scheme":    "https",
+	}), TLSFilterChainName))
+
+	immediate, ok := resp.GetResponse().(*extprocv3.ProcessingResponse_ImmediateResponse)
+	if !ok {
+		t.Fatalf("denied request returned %T, want an ImmediateResponse", resp.GetResponse())
+	}
+	for _, option := range immediate.ImmediateResponse.GetHeaders().GetSetHeaders() {
+		if option.GetHeader().GetKey() == authorizationHeader {
+			t.Fatalf("denial carried an Authorization header")
+		}
+	}
+}
+
+// An empty token is the committed state of githubToken, and it must produce no
+// header rather than "Bearer ", which reads as a malformed credential at the
+// destination instead of as an unconfigured gateway here.
+func TestGitHubTokenEmptyInjectsNothing(t *testing.T) {
+	for _, token := range []string{"", "   "} {
+		resp := processWith(t, AllowAll(), githubTokenInjector(token), onChain(rawHeaders(map[string]string{
+			":method":    "GET",
+			":authority": "api.github.com",
+			":path":      "/user",
+			":scheme":    "https",
+		}), TLSFilterChainName))
+
+		if value, ok := injectedAuthorization(t, resp); ok {
+			t.Fatalf("empty token %q injected %q", token, value)
+		}
+	}
+}
+
+// The shipped binary must not inject anything, because the constant is empty.
+// This is the test that fails if a real PAT is ever committed.
+func TestGitHubTokenIsNotCommitted(t *testing.T) {
+	if githubToken != "" {
+		t.Fatal("githubToken is non-empty: a credential is committed to the repository")
+	}
+	if GitHubTokenConfigured() {
+		t.Error("GitHubTokenConfigured() = true, want false for a checkout with no token")
+	}
+}
+
+// Envoy keys the attributes map by the ext_proc filter's name in the HCM chain.
+// The server must not depend on that name.
+func TestFilterChainNameIgnoresTheAttributeMapKey(t *testing.T) {
+	req := rawHeaders(map[string]string{":authority": "api.github.com"})
+	req.Attributes = map[string]*structpb.Struct{
+		"some.other.filter.name": {
+			Fields: map[string]*structpb.Value{
+				filterChainNameAttribute: structpb.NewStringValue(TLSFilterChainName),
+			},
+		},
+	}
+	if got := filterChainName(req); got != TLSFilterChainName {
+		t.Errorf("filterChainName = %q, want %q", got, TLSFilterChainName)
+	}
 }

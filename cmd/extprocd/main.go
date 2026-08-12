@@ -97,13 +97,17 @@ func run(ctx context.Context) error {
 	defer lis.Close()
 
 	grpcServer := grpc.NewServer()
-	extprocv3.RegisterExternalProcessorServer(grpcServer, inner.NewServer(policy, logger))
+	extprocv3.RegisterExternalProcessorServer(grpcServer, inner.NewServer(policy, inner.GitHubToken(), logger))
 
 	logger.Info("extprocd listening",
 		slog.String("address", lis.Addr().String()),
 		// Logged as the effective list, so the one line an operator reads to
 		// see what this processor refuses cannot be mistaken for "nothing".
 		slog.Any("deny_hosts", *denyHosts),
+		// Whether a token is compiled in. Without this line, "the constant is
+		// empty" and "the request did not match the GitHub hosts" are the same
+		// observation from outside: no Authorization header, and a 401.
+		slog.Bool("github_token", inner.GitHubTokenConfigured()),
 	)
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)

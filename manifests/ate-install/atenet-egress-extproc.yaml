@@ -77,6 +77,15 @@ spec:
         # and turning one on should be a visible change here rather than
         # something this Deployment did by existing. Add --deny-host=NAME
         # (repeatable) to refuse specific destinations.
+        #
+        # Credential injection has no flag, on purpose. extprocd can add a
+        # GitHub PAT to requests bound for api.github.com and github.com, so
+        # that the actor never holds the token -- but the token is the
+        # githubToken constant in cmd/extprocd/internal/inner/inner.go, empty in
+        # the repository and set by editing and rebuilding. Check the startup
+        # log line's github_token field to see whether the running image has
+        # one. A flag or an env var here would put the credential in this
+        # manifest, which is the one place it must not be.
         ports:
         - name: extproc
           containerPort: 50051
