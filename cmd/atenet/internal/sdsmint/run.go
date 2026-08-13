@@ -32,7 +32,6 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/atenet/internal/sdsmint/certauth"
 	"github.com/agent-substrate/substrate/internal/localca"
-	"github.com/agent-substrate/substrate/internal/serverboot"
 )
 
 func run(ctx context.Context, cfg config) error {
@@ -52,46 +51,18 @@ func run(ctx context.Context, cfg config) error {
 		return err
 	}
 
-	signer, err := loadSigner(cfg.CAPoolPath, cfg.CAID, certauth.Options{KeyRotation: cfg.LeafCertTTL})
+	signer, err := loadSigner(cfg.CAPoolPath, cfg.CAID)
 	if err != nil {
 		return err
 	}
 
-	// Instruments exist only when something exports them. A nil *metrics
-	// no-ops every call site, which also keeps enabled() from paying for the
-	// proto.Size of each response nobody will read.
-	var counters *metrics
-	if cfg.MetricsAddr != "" {
-		mp, err := serverboot.InitMetrics(ctx, serviceName)
-		if err != nil {
-			return fmt.Errorf("initializing metrics: %w", err)
-		}
-		defer serverboot.ShutdownProvider("MeterProvider", mp.Shutdown)
-		if counters, err = newMetrics(mp); err != nil {
-			return err
-		}
-	}
-
 	// Named m because minter is the type.
 	m, err := newMinter(signer, minterOptions{
-		TTL:           cfg.LeafCertTTL,
-		CacheCapacity: cfg.LeafCacheSize,
-		Logger:        logger,
-		Metrics:       counters,
+		TTL:    cfg.LeafCertTTL,
+		Logger: logger,
 	})
 	if err != nil {
 		return fmt.Errorf("building minter: %w", err)
-	}
-
-	if cfg.MetricsAddr != "" {
-		if err := serveHTTP(logger, "metrics", cfg.MetricsAddr, metricsHandler()); err != nil {
-			return err
-		}
-	}
-	if cfg.PprofAddr != "" {
-		if err := serveHTTP(logger, "pprof", cfg.PprofAddr, pprofHandler()); err != nil {
-			return err
-		}
 	}
 
 	lis, err := listen(cfg.UDSPath)
@@ -103,9 +74,7 @@ func run(ctx context.Context, cfg config) error {
 	grpcServer := grpc.NewServer()
 	secretservice.RegisterSecretDiscoveryServiceServer(grpcServer, newServer(m, serverOptions{
 		Logger:      logger,
-		TTL:         cfg.LeafCertTTL,
 		IdleTimeout: cfg.Idle,
-		Metrics:     counters,
 	}))
 
 	logger.Info("sdsmint listening",
@@ -156,7 +125,7 @@ func newLogger(level string) (*slog.Logger, error) {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})), nil
 }
 
-func loadSigner(poolPath, id string, opts certauth.Options) (*certauth.Signer, error) {
+func loadSigner(poolPath, id string) (*certauth.Signer, error) {
 	poolBytes, err := os.ReadFile(poolPath)
 	if err != nil {
 		return nil, fmt.Errorf("reading CA pool %s: %w", poolPath, err)
@@ -165,7 +134,7 @@ func loadSigner(poolPath, id string, opts certauth.Options) (*certauth.Signer, e
 	if err != nil {
 		return nil, fmt.Errorf("parsing CA pool %s: %w", poolPath, err)
 	}
-	signer, err := certauth.New(pool, id, opts)
+	signer, err := certauth.New(pool, id)
 	if err != nil {
 		return nil, fmt.Errorf("loading CA from %s: %w", poolPath, err)
 	}

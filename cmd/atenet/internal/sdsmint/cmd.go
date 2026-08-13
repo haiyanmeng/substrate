@@ -22,15 +22,12 @@ import (
 )
 
 type config struct {
-	UDSPath       string
-	CAPoolPath    string
-	CAID          string
-	LeafCertTTL   time.Duration
-	LeafCacheSize int
-	Idle          time.Duration
-	LogLevel      string
-	MetricsAddr   string
-	PprofAddr     string
+	UDSPath     string
+	CAPoolPath  string
+	CAID        string
+	LeafCertTTL time.Duration
+	Idle        time.Duration
+	LogLevel    string
 }
 
 func NewSdsmintCmd() *cobra.Command {
@@ -47,12 +44,9 @@ func NewSdsmintCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.UDSPath, "uds-path", "", "unix socket to listen on; required, and the only transport offered, because leaf private keys transit this channel")
 	cmd.Flags().StringVar(&cfg.CAPoolPath, "ca-pool-path", "", "path to a localca pool JSON holding the MITM CA, the format substrate mounts its other CAs in")
 	cmd.Flags().StringVar(&cfg.CAID, "ca-id", "", "which CA in the pool to sign with; empty takes the first")
-	cmd.Flags().DurationVar(&cfg.LeafCertTTL, "leaf-cert-ttl", defaultTTL, "leaf certificate lifetime; also sets the rotation period, which is ~2/3 of it")
-	cmd.Flags().IntVar(&cfg.LeafCacheSize, "leaf-cache-size", 1000, "maximum number of cached leaves")
-	cmd.Flags().DurationVar(&cfg.Idle, "idle", 0, "withdraw a secret the proxy has not re-requested in this long, so the live set can shrink; 0 holds every name for the life of the stream")
+	cmd.Flags().DurationVar(&cfg.LeafCertTTL, "leaf-cert-ttl", defaultTTL, "leaf certificate lifetime; nothing renews a leaf in place, so this is how long a host keeps working after it is first reached unless --idle brings it back sooner")
+	cmd.Flags().DurationVar(&cfg.Idle, "idle", 0, "withdraw a secret the proxy has not re-requested in this long, so the live set can shrink and the name is re-minted on its next handshake; keep it under --leaf-cert-ttl or leaves expire before they are withdrawn. 0 holds every name for the life of the stream")
 	cmd.Flags().StringVar(&cfg.LogLevel, "log-level", "info", "one of debug, info, warn, error")
-	cmd.Flags().StringVar(&cfg.MetricsAddr, "metrics-addr", "", "TCP address to serve Prometheus /metrics and /healthz on; empty disables both and leaves OTLP as the only export path")
-	cmd.Flags().StringVar(&cfg.PprofAddr, "pprof-addr", "", "TCP address to serve /debug/pprof on")
 
 	return cmd
 }
@@ -63,15 +57,6 @@ func (c config) validateTTL() error {
 	ttl := c.LeafCertTTL
 	if ttl <= 0 {
 		return fmt.Errorf("--leaf-cert-ttl must be positive, got %s", ttl)
-	}
-
-	// Rotation is unconditional, so a TTL short enough to floor it is always an
-	// error rather than only one when a flag turned rotation on. The band below
-	// refuses everything this catches and more; this runs first only because it
-	// names the specific thing that breaks.
-	if scheduled := time.Duration(float64(ttl) * rotateFraction); scheduled < minRotateInterval {
-		return fmt.Errorf("--leaf-cert-ttl %s is too short: rotation belongs at %s but is floored at %s, so --leaf-cert-ttl no longer sets the rotation period and at %s or below a leaf expires before its replacement is pushed; use --leaf-cert-ttl of at least %s",
-			ttl, scheduled, minRotateInterval, minRotateInterval, time.Duration(float64(minRotateInterval)/rotateFraction).Round(time.Millisecond))
 	}
 
 	// The band outside which --leaf-cert-ttl is refused. Both edges are cases
@@ -86,7 +71,7 @@ func (c config) validateTTL() error {
 	case ttl < minSensibleTTL:
 		return fmt.Errorf("--leaf-cert-ttl %s is below %s; leaves are back-dated 5m for clock skew, so most of each certificate's validity would already be in the past and --leaf-cert-ttl would not describe how long clients accept it", ttl, minSensibleTTL)
 	case ttl > maxSensibleTTL:
-		return fmt.Errorf("--leaf-cert-ttl %s is above %s; a leaf key would stay valid that long and the cache would hand the same one out for half of it, which is not what short-lived MITM leaves are for", ttl, maxSensibleTTL)
+		return fmt.Errorf("--leaf-cert-ttl %s is above %s; nothing renews a leaf in place, so a name minted once would stay valid that long, which is not what short-lived MITM leaves are for", ttl, maxSensibleTTL)
 	}
 	return nil
 }

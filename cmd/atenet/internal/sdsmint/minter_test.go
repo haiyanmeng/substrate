@@ -23,7 +23,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"testing/synctest"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/atenet/internal/sdsmint/certauth"
@@ -46,7 +45,7 @@ func testSigner(t *testing.T) *certauth.Signer {
 	if err != nil {
 		t.Fatalf("generating test CA: %v", err)
 	}
-	signer, err := certauth.New(&localca.Pool{CAs: []*localca.CA{ca}}, "", certauth.Options{KeyRotation: time.Hour})
+	signer, err := certauth.New(&localca.Pool{CAs: []*localca.CA{ca}}, "")
 	if err != nil {
 		t.Fatalf("certauth.New: %v", err)
 	}
@@ -65,100 +64,32 @@ func testMinter(t *testing.T, opts minterOptions) *minter {
 	return m
 }
 
-func TestMinterCachesByHost(t *testing.T) {
+// TestMinterMintsPerCall pins that the minter holds nothing between calls. It
+// used to cache by host, and the SDS layer is written on the assumption that
+// it no longer does: pack reads cert.Serial as the resource version, so two
+// mints of one name have to look like two versions to Envoy.
+func TestMinterMintsPerCall(t *testing.T) {
 	m := testMinter(t, minterOptions{TTL: time.Minute})
 	ctx := context.Background()
 
 	first, err := m.certificate(ctx, "a.example")
 	if err != nil {
-		t.Fatalf("first GetCertificate: %v", err)
+		t.Fatalf("first certificate: %v", err)
 	}
 	second, err := m.certificate(ctx, "a.example")
 	if err != nil {
-		t.Fatalf("second GetCertificate: %v", err)
+		t.Fatalf("second certificate: %v", err)
 	}
-
-	if first.Serial != second.Serial {
-		t.Errorf("cache miss on the second call: serials %s != %s", first.Serial, second.Serial)
+	if first.Serial == second.Serial {
+		t.Errorf("both calls returned serial %s; the minter is holding onto leaves", first.Serial)
 	}
 
 	other, err := m.certificate(ctx, "b.example")
 	if err != nil {
-		t.Fatalf("GetCertificate for a different host: %v", err)
+		t.Fatalf("certificate for a different host: %v", err)
 	}
 	if other.Serial == first.Serial {
 		t.Error("different hosts were served the same certificate")
-	}
-}
-
-func TestMinterRemintsAfterTTL(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		// The production TTL. Nothing here needs a short one any more: the wait
-		// below is on the fake clock.
-		m := testMinter(t, minterOptions{TTL: defaultTTL})
-		ctx := context.Background()
-
-		first, err := m.certificate(ctx, "a.example")
-		if err != nil {
-			t.Fatalf("GetCertificate: %v", err)
-		}
-		time.Sleep(defaultTTL)
-		second, err := m.certificate(ctx, "a.example")
-		if err != nil {
-			t.Fatalf("GetCertificate after TTL: %v", err)
-		}
-
-		if first.Serial == second.Serial {
-			t.Error("cached certificate was served after its TTL expired")
-		}
-	})
-}
-
-// TestRotationOutlivesCacheReuse states the ordering the two independently
-// chosen clocks have to obey. reuseFraction is the one carrying the burden:
-// rotation refreshes through the cache, so it is this constant that has to
-// stay below deltastream.go's.
-func TestRotationOutlivesCacheReuse(t *testing.T) {
-	if !(reuseFraction < rotateFraction && rotateFraction < 1.0) {
-		t.Fatalf("reuseFraction (%v) < rotateFraction (%v) < 1 is violated; rotation "+
-			"refreshes via the minter cache, so inverting these makes every rotation "+
-			"tick a no-op until the leaf has already expired", reuseFraction, rotateFraction)
-	}
-}
-
-// TestMinterForgetDropsTheCachedLeaf is the minter's half of idle withdrawal:
-// that Forget actually releases, rather than merely being called. The sweep
-// that calls it is TestWithdrawalReleasesTheMinterCache's subject.
-func TestMinterForgetDropsTheCachedLeaf(t *testing.T) {
-	m := testMinter(t, minterOptions{TTL: time.Minute})
-	ctx := context.Background()
-
-	first, err := m.certificate(ctx, "a.example")
-	if err != nil {
-		t.Fatalf("GetCertificate: %v", err)
-	}
-	again, err := m.certificate(ctx, "a.example")
-	if err != nil {
-		t.Fatalf("GetCertificate: %v", err)
-	}
-	if again.Serial != first.Serial {
-		t.Fatalf("second call minted a new leaf (%s -> %s); the cache is not working, so this test cannot show anything",
-			first.Serial, again.Serial)
-	}
-
-	if !m.forget("a.example") {
-		t.Error("Forget reported nothing held for a name that was just cached")
-	}
-	if m.forget("a.example") {
-		t.Error("Forget reported a hit on a name it had already released")
-	}
-
-	after, err := m.certificate(ctx, "a.example")
-	if err != nil {
-		t.Fatalf("GetCertificate after Forget: %v", err)
-	}
-	if after.Serial == first.Serial {
-		t.Errorf("still serving serial %s after Forget; the leaf was not released", after.Serial)
 	}
 }
 
@@ -184,26 +115,8 @@ func TestMinterRefusesNonHostnames(t *testing.T) {
 	}
 }
 
-func TestMinterEvictsToCap(t *testing.T) {
-	m := testMinter(t, minterOptions{
-		TTL:           time.Minute,
-		CacheCapacity: 4,
-	})
-	ctx := context.Background()
-
-	for i := range 12 {
-		if _, err := m.certificate(ctx, fmt.Sprintf("h%d.example", i)); err != nil {
-			t.Fatalf("GetCertificate: %v", err)
-		}
-	}
-
-	if size := m.cache.len(); size > 4 {
-		t.Errorf("cache holds %d entries, want at most the cap of 4", size)
-	}
-}
-
 func TestMinterIsConcurrencySafe(t *testing.T) {
-	m := testMinter(t, minterOptions{TTL: time.Minute, CacheCapacity: 8})
+	m := testMinter(t, minterOptions{TTL: time.Minute})
 	ctx := context.Background()
 
 	var wg sync.WaitGroup

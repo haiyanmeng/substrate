@@ -18,6 +18,9 @@
 package certauth
 
 import (
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
@@ -33,14 +36,17 @@ import (
 type Signer struct {
 	pool   *localca.Pool
 	active *localca.CA
-	keys   *leafKeys
-}
 
-// Options configures a Signer.
-type Options struct {
-	// KeyRotation is how long one leaf keypair is handed out before it is
-	// replaced. Zero or less means 15 minutes.
-	KeyRotation time.Duration
+	// key is the keypair every leaf this Signer issues is bound to, and keyPEM
+	// its serialized form. One keypair for the life of the process: the leaves
+	// are short-lived and never leave the pod, and a per-leaf key would cost a
+	// keygen on the handshake path for a secret that is already scoped to a
+	// single SNI on a single proxy.
+	//
+	// keyPEM is rendered once here rather than once per mint, and every
+	// MintedCert hands out the same slice. Nothing may write to it.
+	key    crypto.Signer
+	keyPEM []byte
 }
 
 // New builds a Signer over pool, signing with the CA named by id. An empty id
@@ -48,7 +54,7 @@ type Options struct {
 //
 // The whole pool is retained, not just the selected entry: see the Signer
 // fields.
-func New(pool *localca.Pool, id string, opts Options) (*Signer, error) {
+func New(pool *localca.Pool, id string) (*Signer, error) {
 	active, err := selectCA(pool, id)
 	if err != nil {
 		return nil, err
@@ -56,14 +62,22 @@ func New(pool *localca.Pool, id string, opts Options) (*Signer, error) {
 	if err := active.Validate(); err != nil {
 		return nil, fmt.Errorf("ca pool: CA %q: %w", active.ID, err)
 	}
-	if opts.KeyRotation <= 0 {
-		opts.KeyRotation = 15 * time.Minute
-	}
-	keys, err := newLeafKeys(opts.KeyRotation, time.Now())
+	// Generated at startup rather than on first use, so that a mint never pays
+	// for a keygen and one that cannot succeed fails before the server binds.
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("generating leaf key: %w", err)
 	}
-	return &Signer{pool: pool, active: active, keys: keys}, nil
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling leaf key: %w", err)
+	}
+	return &Signer{
+		pool:   pool,
+		active: active,
+		key:    key,
+		keyPEM: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}),
+	}, nil
 }
 
 // selectCA picks the entry to sign with. An empty id takes the first.
@@ -118,7 +132,7 @@ type MintedCert struct {
 }
 
 // Sign issues a leaf certificate for host, signed by the CA's root key and
-// bound to the keypair the Signer is currently handing out.
+// bound to the Signer's leaf keypair.
 func (s *Signer) Sign(host string, ttl time.Duration) (*MintedCert, error) {
 	if host == "" {
 		return nil, errors.New("empty host")
@@ -126,10 +140,6 @@ func (s *Signer) Sign(host string, ttl time.Duration) (*MintedCert, error) {
 
 	ca := s.active
 	now := time.Now()
-	key, err := s.keys.at(now)
-	if err != nil {
-		return nil, fmt.Errorf("leaf key for %q: %w", host, err)
-	}
 
 	notAfter := now.Add(ttl)
 	if notAfter.After(ca.RootCertificate.NotAfter) {
@@ -153,7 +163,7 @@ func (s *Signer) Sign(host string, ttl time.Duration) (*MintedCert, error) {
 		tmpl.DNSNames = []string{host}
 	}
 
-	leafDER, err := x509.CreateCertificate(rand.Reader, tmpl, ca.RootCertificate, key.signer.Public(), ca.SigningKey)
+	leafDER, err := x509.CreateCertificate(rand.Reader, tmpl, ca.RootCertificate, s.key.Public(), ca.SigningKey)
 	if err != nil {
 		return nil, fmt.Errorf("signing leaf for %q: %w", host, err)
 	}
@@ -174,9 +184,9 @@ func (s *Signer) Sign(host string, ttl time.Duration) (*MintedCert, error) {
 
 	return &MintedCert{
 		CertChainPEM: chain,
-		// Shared with every other leaf issued against this key, rendered once
-		// when the key was generated. Read-only, like the rest of MintedCert.
-		PrivateKeyPEM: key.pem,
+		// Shared with every other leaf this Signer issues, rendered once in
+		// New. Read-only, like the rest of MintedCert.
+		PrivateKeyPEM: s.keyPEM,
 		NotAfter:      notAfter,
 		Serial:        leaf.SerialNumber.Text(16),
 	}, nil

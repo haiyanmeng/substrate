@@ -29,49 +29,28 @@ import (
 // errHostNotAllowed is returned when a requested hostname will not be minted.
 var errHostNotAllowed = errors.New("host not allowed")
 
-// minter returns a leaf certificate for a hostname, minting one if needed, and
-// caches what it mints. It is safe for concurrent use.
+// minter returns a leaf certificate for a hostname. It holds nothing between
+// calls: every call that gets past checkHostSyntax mints. The caching that
+// matters is Envoy's, which keeps an on-demand secret for the life of the
+// subscription, so a second mint for the same host only happens when the data
+// plane has genuinely lost the first. It is safe for concurrent use.
 type minter struct {
 	signer *certauth.Signer
 	ttl    time.Duration
-	// reuseInterval is how long a minted leaf may be served from cache: shorter than
-	// ttl, so that a cache hit never hands back a nearly-dead certificate and
-	// so that the rotation ticker always finds a stale entry. See
-	// reuseFraction.
-	reuseInterval time.Duration
-	log           *slog.Logger
-	metrics       *metrics
-	// cache does its own locking, which is what keeps signing off the lock:
-	// a miss returns before Sign is called and put takes the lock again after.
-	cache *certCache
+	log    *slog.Logger
 }
 
 // minterOptions configures newMinter.
 type minterOptions struct {
 	// TTL is the leaf lifetime.
-	TTL time.Duration
-	// CacheCapacity bounds the cache. Zero means 256.
-	CacheCapacity int
-	Logger        *slog.Logger
-	Metrics       *metrics
+	TTL    time.Duration
+	Logger *slog.Logger
 }
 
 // defaultTTL for leaf cert lifetime.
 const defaultTTL = 15 * time.Minute
 
-// reuseFraction is how much of a leaf's lifetime the cache will hand it out
-// for. A cached leaf handed out at the very end of its life is worse than a
-// cache miss: the caller gets a certificate that is about to stop verifying.
-//
-// It must stay strictly below deltastream.go's rotateFraction. The rotation
-// ticker refreshes by calling Certificate, so if the cache were still
-// willing to serve the old leaf at rotation time the tick would be a no-op and
-// the leaf would not actually be replaced until it had already expired. Half
-// against two thirds leaves a comfortable margin; equality would be a race.
-// TestRotationNeverServesAnExpiredLeaf is what fails if this inverts.
-const reuseFraction = 0.5
-
-// newMinter builds a caching minter over signer.
+// newMinter builds a minter over signer.
 func newMinter(signer *certauth.Signer, opts minterOptions) (*minter, error) {
 	if signer == nil {
 		return nil, errors.New("nil signer")
@@ -79,27 +58,20 @@ func newMinter(signer *certauth.Signer, opts minterOptions) (*minter, error) {
 	if opts.TTL <= 0 {
 		opts.TTL = defaultTTL
 	}
-	if opts.CacheCapacity <= 0 {
-		opts.CacheCapacity = 256
-	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
 	return &minter{
-		signer:        signer,
-		ttl:           opts.TTL,
-		reuseInterval: time.Duration(float64(opts.TTL) * reuseFraction),
-		log:           opts.Logger,
-		metrics:       opts.Metrics,
-		cache:         newCertCache(opts.CacheCapacity),
+		signer: signer,
+		ttl:    opts.TTL,
+		log:    opts.Logger,
 	}, nil
 }
 
-// certificate returns a fresh-or-cached leaf for host. It returns an error
-// wrapping errHostNotAllowed if host is not a name this will mint for.
+// certificate mints a leaf for host. It returns an error wrapping
+// errHostNotAllowed if host is not a name this will mint for.
 func (m *minter) certificate(ctx context.Context, host string) (*certauth.MintedCert, error) {
 	if err := checkHostSyntax(host); err != nil {
-		m.metrics.recordDenial(ctx)
 		m.log.WarnContext(ctx, "certificate request denied",
 			slog.String("host", host),
 			slog.String("reason", err.Error()),
@@ -108,22 +80,10 @@ func (m *minter) certificate(ctx context.Context, host string) (*certauth.Minted
 		return nil, fmt.Errorf("%w: %w", errHostNotAllowed, err)
 	}
 
-	now := time.Now()
-
-	cached, ok := m.cache.get(host, now)
-	if ok {
-		m.metrics.recordCacheHit(ctx)
-		return cached, nil
-	}
-
 	cert, err := m.signer.Sign(host, m.ttl)
 	if err != nil {
 		return nil, err
 	}
-	signed := time.Now()
-	m.metrics.recordMint(ctx, signed.Sub(now))
-
-	m.cache.put(host, cert, now.Add(m.reuseInterval))
 
 	if m.log.Enabled(ctx, slog.LevelInfo) {
 		m.log.InfoContext(ctx, "certificate issued",
@@ -133,14 +93,6 @@ func (m *minter) certificate(ctx context.Context, host string) (*certauth.Minted
 		)
 	}
 	return cert, nil
-}
-
-// forget releases the cached leaf for host, reporting whether one was actually
-// held. The SDS server calls it when it withdraws a name from the data plane,
-// so the certificate is dropped on both sides rather than lingering here until
-// capacity or its reuse deadline pushes it out.
-func (m *minter) forget(host string) bool {
-	return m.cache.forget(host)
 }
 
 // checkHostSyntax checks whether host is a valid DNS name or IP address.

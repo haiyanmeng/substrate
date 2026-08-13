@@ -29,9 +29,6 @@ func testServer(t *testing.T, opts serverOptions) *server {
 	if opts.Logger == nil {
 		opts.Logger = quietLogger()
 	}
-	if opts.TTL <= 0 {
-		opts.TTL = time.Minute
-	}
-	m := testMinter(t, minterOptions{TTL: opts.TTL})
+	m := testMinter(t, minterOptions{TTL: defaultTTL})
 	return newServer(m, opts)
 }

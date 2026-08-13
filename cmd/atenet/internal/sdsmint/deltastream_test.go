@@ -279,13 +279,17 @@ func TestDeltaSecretsBareAckSendsNothing(t *testing.T) {
 	})
 }
 
-func TestDeltaSecretsRotationPushesNewVersion(t *testing.T) {
+// TestDeltaSecretsNeverPushesUnprompted pins the shape of the server after
+// rotation was removed: with no idle timeout, a subscribe is answered once and
+// then the stream is silent for the whole life of the leaf and beyond. Nothing
+// re-mints a name in place, so a leaf expires under a live subscription --
+// that is a known consequence of the removal, not an accident, and this is
+// where it is written down.
+func TestDeltaSecretsNeverPushesUnprompted(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// Envoy has no TTL of its own for an on-demand secret, so the server has
-		// to push a replacement or the leaf silently expires under a live
-		// subscription.
+		// The TTL testServer's minter is built with.
 		const ttl = defaultTTL
-		srv := testServer(t, serverOptions{TTL: ttl})
+		srv := testServer(t, serverOptions{})
 		stream, stop := startServer(t, srv)
 		defer func() {
 			if err := stop(); err != nil {
@@ -297,139 +301,21 @@ func TestDeltaSecretsRotationPushesNewVersion(t *testing.T) {
 			TypeUrl:                secretTypeURL,
 			ResourceNamesSubscribe: []string{"a.example"},
 		}
-		first := stream.nextResponse(t)
-		firstVersion := first.GetResources()[0].GetVersion()
+		stream.nextResponse(t)
 
-		// One tick is enough; the second is slack. This test only cares that the
-		// version moves, not when -- the timing relationship itself is
-		// TestRotationNeverServesAnExpiredLeaf's job.
-		deadline := time.After(2 * rotateInterval(ttl))
-		for {
-			select {
-			case resp := <-stream.sent:
-				if len(resp.GetResources()) == 0 {
-					continue
-				}
-				if resp.GetResources()[0].GetVersion() != firstVersion {
-					if resp.GetResources()[0].GetName() != "a.example" {
-						t.Fatalf("rotated resource name = %q, want a.example", resp.GetResources()[0].GetName())
-					}
-					return // rotation observed
-				}
-			case <-deadline:
-				t.Fatal("no rotation push with a new version arrived")
-			}
-		}
+		// Well past the point where the leaf has expired. Free on a fake clock.
+		time.Sleep(2 * ttl)
+		stream.quiet(t, "after the only subscribed leaf had expired")
 	})
 }
 
-// push is one observed rotation push: when it landed on the stream, which
-// certificate it carried, and when that certificate stops being valid.
-type push struct {
-	at       time.Time
-	serial   string
-	notAfter time.Time
-}
-
-// TestRotationNeverServesAnExpiredLeaf pins down the interaction between two
-// clocks that were chosen independently: the rotation ticker (2/3 of TTL) and
-// the minter's cache entry lifetime (a full TTL).
-//
-// Envoy holds whatever leaf we last pushed until we push another one -- it has
-// no expiry of its own for an on-demand secret. So the invariant that matters
-// is not "we tick often enough", it is "every leaf is replaced before its own
-// notAfter". This test collects the push timeline and checks exactly that.
-func TestRotationNeverServesAnExpiredLeaf(t *testing.T) {
+// TestDeltaSecretsUnsubscribeDropsTheName checks that an unsubscribe actually
+// removes the name from the stream's set rather than merely being accepted.
+// The idle sweep is what makes that observable: a name the server still held
+// would be withdrawn once it aged out, and a name it has forgotten cannot be.
+func TestDeltaSecretsUnsubscribeDropsTheName(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// The production default. Nothing pushes back on the TTL any more:
-		// the server's 1s rotation floor and x509's one-second notAfter
-		// granularity are what used to rule out a short TTL, and on a fake
-		// clock waiting out a long one is free.
-		const ttl = defaultTTL
-		// Rotation fires at 10m and 20m, so this covers two of them. Under the
-		// pre-fix behavior the tick at 10m was a cache hit that re-sent the old
-		// leaf, and the replacement did not arrive until 20m -- five minutes
-		// after that leaf had expired. That is the case this window is sized to
-		// catch.
-		const observe = 25 * time.Minute
-
-		srv := testServer(t, serverOptions{TTL: ttl})
-		stream, stop := startServer(t, srv)
-		defer func() {
-			if err := stop(); err != nil {
-				t.Errorf("DeltaSecrets returned %v", err)
-			}
-		}()
-
-		stream.requests <- &discovery.DeltaDiscoveryRequest{
-			TypeUrl:                secretTypeURL,
-			ResourceNamesSubscribe: []string{"a.example"},
-		}
-
-		var pushes []push
-		deadline := time.After(observe)
-	collect:
-		for {
-			select {
-			case resp := <-stream.sent:
-				for _, res := range resp.GetResources() {
-					if res.GetName() != "a.example" {
-						continue
-					}
-					leaf := leafFromResource(t, res)
-					pushes = append(pushes, push{
-						at:       time.Now(),
-						serial:   res.GetVersion(),
-						notAfter: leaf.NotAfter,
-					})
-				}
-			case <-deadline:
-				break collect
-			}
-		}
-
-		if len(pushes) < 2 {
-			t.Fatalf("only %d pushes in %v; expected the initial mint plus at least one rotation", len(pushes), observe)
-		}
-
-		// Report the timeline unconditionally: when this test fails the shape of
-		// the failure is the finding, not the fact of it.
-		start := pushes[0].at
-		for i, p := range pushes {
-			t.Logf("push %d at t+%-8v serial=%s valid until t+%v",
-				i, p.at.Sub(start).Round(time.Millisecond), p.serial,
-				p.notAfter.Sub(start).Round(time.Millisecond))
-		}
-
-		// Each leaf is served from the moment it is pushed until the next push
-		// replaces it. If the next push lands after the current leaf's notAfter,
-		// Envoy served an expired certificate for the difference.
-		var worst time.Duration
-		for i := 0; i < len(pushes)-1; i++ {
-			if gap := pushes[i+1].at.Sub(pushes[i].notAfter); gap > worst {
-				worst = gap
-			}
-		}
-		if worst > 0 {
-			t.Errorf("served an expired leaf for %v: a push landed that long after the "+
-				"previous leaf's notAfter (TTL %v, rotation interval %v)",
-				worst.Round(time.Millisecond), ttl, time.Duration(float64(ttl)*rotateFraction))
-		}
-
-		// The last leaf we pushed must still have been valid when we stopped
-		// watching, or the run ended inside a staleness window the loop above
-		// cannot see (there is no "next push" to measure against).
-		if last := pushes[len(pushes)-1]; last.notAfter.Before(time.Now()) {
-			t.Errorf("the most recently pushed leaf (serial %s) expired %v ago and nothing has replaced it",
-				last.serial, time.Since(last.notAfter).Round(time.Millisecond))
-		}
-	})
-}
-
-func TestDeltaSecretsUnsubscribeStopsRotation(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		const ttl = defaultTTL
-		srv := testServer(t, serverOptions{TTL: ttl})
+		srv := testServer(t, serverOptions{IdleTimeout: testIdle})
 		stream, stop := startServer(t, srv)
 		defer func() {
 			if err := stop(); err != nil {
@@ -448,20 +334,19 @@ func TestDeltaSecretsUnsubscribeStopsRotation(t *testing.T) {
 			ResourceNamesUnsubscribe: []string{"a.example"},
 		}
 
-		// Drain anything already queued, then sit through two rotation ticks
-		// that must produce nothing.
 		stream.drain()
-		time.Sleep(2 * rotateInterval(ttl))
-		stream.quiet(t, "for a name that was unsubscribed")
+		expectNoRemoval(t, stream, withdrawWait)
 	})
 }
 
+// TestDeltaSecretsSeedsFromInitialResourceVersions covers the reconnect path.
+// A replayed name has to land in the stream's set, or the server would treat
+// it as unknown: an unsubscribe would match nothing and the idle sweep could
+// never reach it. The sweep is what makes adoption observable -- an unadopted
+// name is never withdrawn, because the server does not know it exists.
 func TestDeltaSecretsSeedsFromInitialResourceVersions(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// On reconnect Envoy replays what it already holds. The server must adopt
-		// that state so rotation covers those names without re-pushing them.
-		const ttl = defaultTTL
-		srv := testServer(t, serverOptions{TTL: ttl})
+		srv := testServer(t, serverOptions{IdleTimeout: testIdle})
 		stream, stop := startServer(t, srv)
 		defer func() {
 			if err := stop(); err != nil {
@@ -477,16 +362,7 @@ func TestDeltaSecretsSeedsFromInitialResourceVersions(t *testing.T) {
 		// No immediate response: nothing was subscribed in this request.
 		stream.quiet(t, "in reply to a replay-only request")
 
-		// But the resumed name must still get rotated.
-		select {
-		case resp := <-stream.sent:
-			names := resourceNames(resp)
-			if len(names) != 1 || names[0] != "resumed.example" {
-				t.Fatalf("rotation covered %v, want [resumed.example]", names)
-			}
-		case <-time.After(2 * rotateInterval(ttl)):
-			t.Fatal("resumed subscription was never rotated")
-		}
+		awaitRemoval(t, stream, "resumed.example", withdrawWait)
 	})
 }
 
@@ -567,8 +443,8 @@ const testIdle = 4 * time.Second
 const withdrawWait = 10 * testIdle
 
 // awaitRemoval waits for a response withdrawing name, returning how long it
-// took. Resources arriving in the meantime are ignored -- with rotation on,
-// pushes and withdrawals share the stream.
+// took. Resources arriving in the meantime are ignored: a sweep can land
+// between a subscribe and the mints answering it.
 func awaitRemoval(t *testing.T, stream *fakeDeltaStream, name string, within time.Duration) time.Duration {
 	t.Helper()
 	start := time.Now()
@@ -608,8 +484,7 @@ func expectNoRemoval(t *testing.T, stream *fakeDeltaStream, within time.Duration
 // goes away on its own.
 func TestIdleNameIsWithdrawn(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		counters, collect := newTestMetrics(t)
-		srv := testServer(t, serverOptions{IdleTimeout: testIdle, Metrics: counters})
+		srv := testServer(t, serverOptions{IdleTimeout: testIdle})
 		stream, stop := startServer(t, srv)
 		defer func() {
 			if err := stop(); err != nil {
@@ -625,9 +500,6 @@ func TestIdleNameIsWithdrawn(t *testing.T) {
 		if len(resp.GetResources()) != 1 {
 			t.Fatalf("initial response carried %d resources, want 1", len(resp.GetResources()))
 		}
-		if got := metricValue(t, collect(), namesActiveMetric); got != 1 {
-			t.Fatalf("%s = %v after the subscribe, want 1", namesActiveMetric, got)
-		}
 
 		took := awaitRemoval(t, stream, "a.example", withdrawWait)
 		t.Logf("withdrawn %v after the subscribe (idle timeout %v)", took.Round(time.Millisecond), testIdle)
@@ -637,18 +509,6 @@ func TestIdleNameIsWithdrawn(t *testing.T) {
 		// this from reclamation into churn.
 		if took < testIdle {
 			t.Errorf("withdrawn after %v, before the %v idle timeout elapsed", took, testIdle)
-		}
-
-		got := collect()
-		for key, want := range map[string]float64{
-			namesActiveMetric:                       0,
-			idleWithdrawnMetric + "|count":          1, // one sweep withdrew something
-			idleWithdrawnMetric + "|sum":            1, // and it withdrew one name
-			responseEntriesMetric + "|kind=removal": 1,
-		} {
-			if v := metricValue(t, got, key); v != want {
-				t.Errorf("%s = %v, want %v", key, v, want)
-			}
 		}
 	})
 }
@@ -743,39 +603,11 @@ func TestResyncKeepsANameAlive(t *testing.T) {
 	})
 }
 
-// TestRotationDoesNotKeepAnIdleNameAlive is the interaction that would quietly
-// defeat the whole thing. Rotation walks every live name and re-mints it; if
-// that counted as activity, no server would ever reclaim anything and the idle
-// timeout would look like it worked while doing nothing.
-func TestRotationDoesNotKeepAnIdleNameAlive(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		// Rotation fires at 2/3 TTL, floored at 1s, so a 2s TTL puts ticks at
-		// 1.3s, 2.7s and 4s -- three of them ahead of the 5s withdrawal. That
-		// ordering is the test: with nothing rotating before the sweep there is
-		// no interaction here to observe.
-		srv := testServer(t, serverOptions{
-			TTL:         2 * time.Second,
-			IdleTimeout: testIdle,
-		})
-		stream, stop := startServer(t, srv)
-		defer func() {
-			if err := stop(); err != nil {
-				t.Errorf("DeltaSecrets returned %v", err)
-			}
-		}()
-
-		stream.requests <- &discovery.DeltaDiscoveryRequest{
-			TypeUrl:                secretTypeURL,
-			ResourceNamesSubscribe: []string{"a.example"},
-		}
-		stream.nextResponse(t)
-		awaitRemoval(t, stream, "a.example", withdrawWait)
-	})
-}
-
-// TestWithdrawnNameIsServedAgainOnRequest is the safety property. Withdrawal
-// must cost a re-fetch and nothing more: a host that gets busy again after a
-// quiet hour has to work, or reclamation is an outage with a schedule.
+// TestWithdrawnNameIsServedAgainOnRequest is the safety property, and with
+// rotation gone it is also the refresh path: withdrawal must cost a re-fetch
+// and nothing more, or reclamation is an outage with a schedule. A host that
+// gets busy again after a quiet hour has to work, and a host in continuous use
+// only ever gets a new certificate this way.
 func TestWithdrawnNameIsServedAgainOnRequest(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		srv := testServer(t, serverOptions{IdleTimeout: testIdle})
@@ -813,76 +645,6 @@ func TestWithdrawnNameIsServedAgainOnRequest(t *testing.T) {
 				t.Fatalf("re-minted leaf does not cover a.example: %v", err)
 			}
 			return
-		}
-	})
-}
-
-// TestWithdrawalReleasesTheMinterCache checks that reclamation is not
-// one-sided. Withdrawing from Envoy while the signer keeps the leaf cached
-// moves the memory rather than releasing it.
-//
-// It reads the minter's cache rather than counting Forget calls: the sweep
-// forgets before it sends, so by the time the client sees the removal the
-// release has already happened, and the cache is what the release is for.
-func TestWithdrawalReleasesTheMinterCache(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		m := testMinter(t, minterOptions{TTL: time.Minute})
-		srv := newServer(m, serverOptions{
-			Logger:      quietLogger(),
-			TTL:         time.Minute,
-			IdleTimeout: testIdle,
-		})
-		stream, stop := startServer(t, srv)
-		defer func() {
-			if err := stop(); err != nil {
-				t.Errorf("DeltaSecrets returned %v", err)
-			}
-		}()
-
-		stream.requests <- &discovery.DeltaDiscoveryRequest{
-			TypeUrl:                secretTypeURL,
-			ResourceNamesSubscribe: []string{"a.example"},
-		}
-		stream.nextResponse(t)
-		awaitRemoval(t, stream, "a.example", withdrawWait)
-
-		if got := m.cache.len(); got != 0 {
-			t.Errorf("minter still holds %d leaves after the only subscribed name was withdrawn; want 0", got)
-		}
-	})
-}
-
-// TestStreamCloseReleasesTheMinterCache is the other half of that reclamation.
-// Rotation and the idle sweep both run per stream, so a name still subscribed
-// when the connection drops is reachable by neither: nothing re-fetches it and
-// nothing sweeps it, and its leaf would sit in the shared minter cache until
-// capacity evicted it.
-func TestStreamCloseReleasesTheMinterCache(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		m := testMinter(t, minterOptions{TTL: time.Minute})
-		// No idle timeout: the sweep must not be what does the releasing here.
-		srv := newServer(m, serverOptions{
-			Logger: quietLogger(),
-			TTL:    time.Minute,
-		})
-		stream, stop := startServer(t, srv)
-
-		stream.requests <- &discovery.DeltaDiscoveryRequest{
-			TypeUrl:                secretTypeURL,
-			ResourceNamesSubscribe: []string{"a.example", "b.example"},
-		}
-		stream.nextResponse(t)
-
-		if got := m.cache.len(); got == 0 {
-			t.Fatal("nothing was cached, so this test cannot show a release")
-		}
-
-		if err := stop(); err != nil {
-			t.Errorf("DeltaSecrets returned %v", err)
-		}
-
-		if got := m.cache.len(); got != 0 {
-			t.Errorf("minter still holds %d leaves after the stream closed; want 0", got)
 		}
 	})
 }

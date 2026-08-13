@@ -38,11 +38,6 @@ func TestValidateTTL(t *testing.T) {
 		{name: "zero", ttl: 0, wantErr: true},
 		{name: "negative", ttl: -time.Minute, wantErr: true},
 
-		// Short enough that rotation would be floored, so a pushed leaf could
-		// already have expired. Rotation is unconditional, so there is no
-		// longer a variant of this that is merely a bad idea.
-		{name: "below the rotation floor", ttl: time.Second, wantErr: true},
-
 		// Outside the band. These used to start the server with a warning; a
 		// TTL that no longer means what it says is now refused outright.
 		{name: "short", ttl: 30 * time.Second, wantErr: true},
@@ -54,68 +49,6 @@ func TestValidateTTL(t *testing.T) {
 				t.Errorf("validateTTL(ttl=%s) = %v; want an error = %v", tc.ttl, err, tc.wantErr)
 			}
 		})
-	}
-}
-
-// TestValidateTTLRejectsExactlyTheFlooredRange pins the error boundary to the
-// clamp it is protecting rather than to a hard-coded duration, so that moving
-// minRotateInterval or rotateFraction cannot leave the check guarding the
-// wrong range.
-// TestValidateTTLNeverAcceptsAFlooredRotation pins the relationship between the
-// accepted band and minRotateInterval. Nothing validateTTL lets through may have
-// its rotation interval clamped, or --leaf-cert-ttl would stop setting the
-// rotation period and a leaf could expire before its replacement is pushed.
-//
-// The band floor is a minute and flooring happens below ~1.5s, so this holds by
-// a wide margin today. It is checked anyway because the two bounds are set
-// independently, in different functions, and nothing else would notice if the
-// floor were lowered to where they overlap.
-func TestValidateTTLNeverAcceptsAFlooredRotation(t *testing.T) {
-	// A millisecond either side of the point where rotateFraction*ttl crosses
-	// minRotateInterval. Both are refused now -- the one below by the rotation
-	// check, the one above by the band -- so the interesting assertion is that
-	// the boundary still lands where rotateInterval says it does.
-	boundary := time.Duration(float64(minRotateInterval) / rotateFraction)
-	if got := rotateInterval(boundary - time.Millisecond); got != minRotateInterval {
-		t.Errorf("rotateInterval(%s) = %s; want it floored at %s", boundary-time.Millisecond, got, minRotateInterval)
-	}
-	for _, ttl := range []time.Duration{boundary - time.Millisecond, boundary + time.Millisecond} {
-		if err := (config{LeafCertTTL: ttl}).validateTTL(); err == nil {
-			t.Errorf("validateTTL(ttl=%s) = nil; a TTL near the rotation floor is far below the accepted band", ttl)
-		}
-	}
-
-	// The smallest TTL that is accepted has to clear the floor on its own.
-	const smallestAccepted = time.Minute
-	if err := (config{LeafCertTTL: smallestAccepted}).validateTTL(); err != nil {
-		t.Fatalf("validateTTL(ttl=%s) = %v; want the band floor accepted", smallestAccepted, err)
-	}
-	if got := rotateInterval(smallestAccepted); got == minRotateInterval {
-		t.Errorf("rotateInterval(%s) = %s, the floor; the shortest accepted TTL must not clamp rotation", smallestAccepted, got)
-	}
-}
-
-// TestAcceptedTTLsKeepTheRotationWindow checks the ordering the rotation
-// design rests on, for every TTL run will accept: cache reuse
-// ends, then the ticker fires, then the leaf expires.
-func TestAcceptedTTLsKeepTheRotationWindow(t *testing.T) {
-	for _, ttl := range []time.Duration{
-		time.Minute, // the shortest run accepts
-		5 * time.Minute,
-		defaultTTL,
-		24 * time.Hour, // validateTTL's ceiling
-	} {
-		if err := (config{LeafCertTTL: ttl}).validateTTL(); err != nil {
-			t.Fatalf("validateTTL(ttl=%s) = %v; the case is supposed to be an accepted one", ttl, err)
-		}
-		reuse := time.Duration(float64(ttl) * reuseFraction)
-		rotate := rotateInterval(ttl)
-		if rotate <= reuse {
-			t.Errorf("ttl %s: rotation at %s is not after cache reuse ends at %s, so a tick would find a fresh entry and hand back the same leaf instead of re-minting", ttl, rotate, reuse)
-		}
-		if rotate >= ttl {
-			t.Errorf("ttl %s: rotation at %s is not before the leaf expires, so the replacement arrives after the leaf it replaces is already dead", ttl, rotate)
-		}
 	}
 }
 

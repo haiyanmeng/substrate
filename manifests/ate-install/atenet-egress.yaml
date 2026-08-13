@@ -485,14 +485,6 @@ spec:
     metadata:
       labels:
         app: atenet-egress
-      # sdsmint's port, not ext-proc's :9090: the annotation names one port per
-      # pod, and sdsmint is the container whose live-secret and rotation
-      # counters are the scaling signal this deployment is tuned against.
-      # ext-proc reaches the collector over OTLP like the rest of the router
-      # does.
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "9091"
     spec:
       serviceAccountName: atenet-egress
       # sdsmint and envoy containers must share a UID: sdsmint creates the SDS socket mode
@@ -528,51 +520,41 @@ spec:
         - "--uds-path=/var/run/sdsmint/sdsmint.sock"
         - "--ca-pool-path=/run/ca-state/mitm-pool.json"
         - "--ca-id=mitm"
-        # --leaf-cert-ttl is the single biggest CPU lever in this file. Rotation is
-        # per-stream, not one shared tick, and fires at 2/3 of the TTL, so the
-        # steady-state cost with no traffic at all is N live secrets divided by
-        # that period: at 15m, N/600 signatures per second -- 17/s at the
-        # 10,000-name target.
-        #
-        # The measurements behind that are from 5m, where the period is 200s:
-        # a measured 507/s at 100,000 names, costing 1.28 cores here and 0.73
-        # in Envoy applying the pushes, and a first-contact handshake for a
-        # cold name at 5.65s median while that rotation was sustained. The cost
-        # is linear in the period, so 15m is a third of each of those figures
-        # -- but they are scaled, not re-measured, so re-run the load test
-        # before treating the 100k numbers as a budget.
-        #
-        # Note this bounds rotation, not validity: leaves are back-dated 5m for
-        # clock skew and NotAfter is ttl past issuance, so the window a client
-        # will accept is ttl+5m. See Signer.Sign in
+        # --leaf-cert-ttl bounds how long one leaf is usable, not how long a
+        # host keeps working: nothing renews a leaf in place. Note it does not
+        # bound validity exactly either -- leaves are back-dated 5m for clock
+        # skew and NotAfter is ttl past issuance, so the window a client will
+        # accept is ttl+5m. See Signer.Sign in
         # cmd/atenet/internal/sdsmint/certauth.
         - "--leaf-cert-ttl=15m"
-        - "--idle=30m"
-        # Just above the target live-secret count, deliberately. A cache
-        # smaller than the live set does nothing -- every entry is evicted
-        # before it can be reused -- and the case it exists for is the one
-        # where that hurts most: when Envoy reconnects it replays its whole
-        # subscription set at once, and a cache that covers the set turns that
-        # thundering herd from N signatures into N lookups. The memory it costs
-        # is already inside the per-secret figure quoted in the header.
-        - "--leaf-cache-size=11000"
-        # Bound on every interface, unlike --pprof-addr below, because the
-        # scrape comes from off-pod and hits the pod IP. Nothing secret is on
-        # this endpoint: it is counters and histograms of names, not names.
-        - "--metrics-addr=:9091"
-        # Loopback only. /debug/pprof/heap dumps the address space of the one
-        # container holding the MITM CA private key, so this stays reachable
-        # only through a port-forward or an exec.
-        - "--pprof-addr=127.0.0.1:6060"
+        # This has to stay UNDER --leaf-cert-ttl, and nothing in sdsmint
+        # enforces it. The idle sweep is the only thing that refreshes a
+        # certificate now: a withdrawal makes Envoy drop the secret, so the
+        # next handshake for that name subscribes again and is minted afresh.
+        # Set it above the TTL and every name spends the difference holding an
+        # expired leaf, failing handshakes, with nothing on either side to
+        # notice. 10m against 15m leaves 5m of slack for a sweep that is late
+        # by up to a quarter of this window.
+        #
+        # It is also the CPU lever, because it sets the re-mint period: the
+        # steady-state cost is N live secrets divided by it, so 10,000 names at
+        # 10m is ~17 signatures a second. The load-test figures the resources
+        # below are drawn from were measured against per-stream rotation at a
+        # 200s period -- 507/s at 100,000 names, 1.28 cores here and 0.73 in
+        # Envoy applying the pushes. The mechanism is gone but the arithmetic
+        # is the same shape and the cost is still linear in the period; they
+        # are scaled, not re-measured, so re-run the load test before treating
+        # any of it as a budget.
+        - "--idle=10m"
         - "--log-level=info"
         env:
         # Go's nearest thing to Envoy's fixed_heap, and it is not as close as
         # it looks. It bounds the GARBAGE, not the live set: almost everything
-        # resident here is reachable -- three goroutine stacks per subscription,
-        # their timers, and the cert cache -- and no amount of GC pressure
-        # reclaims a live subscription. What it does buy is real though, because
-        # rotation allocates hard, and a soft ceiling meaningfully trims the
-        # peak RSS that churn produces. Set below the container limit so the
+        # resident here is reachable -- three goroutine stacks per subscription
+        # and their timers -- and no amount of GC pressure reclaims a live
+        # subscription. What it does buy is real though, because minting
+        # allocates hard, and a soft ceiling meaningfully trims the peak RSS
+        # that churn produces. Set below the container limit so the
         # collector starts working before the kernel starts killing. If sdsmint
         # ever reaches this figure with a genuinely live heap it will thrash the
         # GC and then OOM anyway; that is the missing shed path described in the
@@ -581,8 +563,8 @@ spec:
           value: "640MiB"
         # Both of these scale with the live secret count, not with request rate.
         #
-        # memory  ~44,750 B per live secret x 10,000 => ~427 MiB, plus the
-        #         11,000-entry cache, against a 768Mi limit. That limit is 0.85
+        # memory  ~44,750 B per live secret x 10,000 => ~427 MiB, against a
+        #         768Mi limit. That limit is 0.85
         #         x Envoy's fixed_heap, which is the ordering invariant from the
         #         header reduced to one number: at the ~13,200 names where Envoy
         #         starts refusing, this container is at 73% and still alive. See
@@ -593,16 +575,15 @@ spec:
         #         MiB does not fail to schedule, it schedules onto a node it
         #         will later destabilise. Understating it is how this pod takes
         #         its neighbours down with it.
-        # cpu     ~126 mcore is the measured floor at 10k with no traffic at
-        #         all: 50 rotations a second, mostly time inside the P-256
-        #         signer. A single mint is the ~600us the PoC measured, so a
-        #         500/s burst of cold names is another 0.3 core on top -- which
-        #         is why this is requested and not limited. Throttling the
-        #         signer turns a CPU shortage into handshake timeouts across
-        #         every cold SNI at once.
-        ports:
-        - name: metrics
-          containerPort: 9091
+        # cpu     ~126 mcore was the measured floor at 10k with no traffic at
+        #         all, when 50 re-mints a second ran on a rotation ticker;
+        #         --idle now sets that rate instead and at 10m it is a third of
+        #         it, mostly time inside the P-256 signer either way. A single
+        #         mint is the ~600us the PoC measured, so a 500/s burst of cold
+        #         names is another 0.3 core on top -- which is why this is
+        #         requested and not limited. Throttling the signer turns a CPU
+        #         shortage into handshake timeouts across every cold SNI at
+        #         once.
         resources:
           requests:
             cpu: 200m

@@ -57,18 +57,17 @@ func testRoot(t *testing.T, commonName string, lifetime time.Duration) *localca.
 // inPool wraps entries the way a mounted pool Secret presents them.
 func inPool(t *testing.T, id string, entries ...*localca.CA) *Signer {
 	t.Helper()
-	signer, err := New(&localca.Pool{CAs: entries}, id, Options{})
+	signer, err := New(&localca.Pool{CAs: entries}, id)
 	if err != nil {
 		t.Fatalf("New(%q): %v", id, err)
 	}
 	return signer
 }
 
-// testSigner builds a Signer whose keypair will not rotate for the length of a
-// test, so two mints in one test share a key unless the test says otherwise.
+// testSigner builds a Signer over a single-entry pool.
 func testSigner(t *testing.T, ca *localca.CA) *Signer {
 	t.Helper()
-	signer, err := New(&localca.Pool{CAs: []*localca.CA{ca}}, "", Options{KeyRotation: time.Hour})
+	signer, err := New(&localca.Pool{CAs: []*localca.CA{ca}}, "")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -245,7 +244,7 @@ func TestNewRejectsANonCACertificate(t *testing.T) {
 
 	if _, err := New(&localca.Pool{CAs: []*localca.CA{
 		{ID: "mitm", RootCertificate: leaf, SigningKey: ca.SigningKey},
-	}}, "", Options{}); err == nil {
+	}}, ""); err == nil {
 		t.Fatal("New accepted a non-CA certificate")
 	}
 }
@@ -272,7 +271,7 @@ func TestNewRejectsAMismatchedKey(t *testing.T) {
 	// failure otherwise surfaces at the first handshake rather than at load.
 	// localca.CA.Validate is what catches it; this pins that New asks.
 	mismatched := &localca.CA{ID: "mismatched", RootCertificate: a.RootCertificate, SigningKey: b.SigningKey}
-	if _, err := New(&localca.Pool{CAs: []*localca.CA{mismatched}}, "", Options{}); err == nil {
+	if _, err := New(&localca.Pool{CAs: []*localca.CA{mismatched}}, ""); err == nil {
 		t.Fatal("New accepted a key that does not match the certificate")
 	}
 }
@@ -365,7 +364,7 @@ func TestNewRoundTrip(t *testing.T) {
 		t.Fatalf("Unmarshal: %v", err)
 	}
 
-	signer, err := New(pool, "", Options{})
+	signer, err := New(pool, "")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -393,7 +392,7 @@ func TestNewSelectsByID(t *testing.T) {
 	}
 	pool := &localca.Pool{CAs: entries}
 
-	signer, err := New(pool, "second", Options{})
+	signer, err := New(pool, "second")
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -402,7 +401,7 @@ func TestNewSelectsByID(t *testing.T) {
 	}
 
 	// An empty ID takes the first, which is what a single-CA pool relies on.
-	signer, err = New(pool, "", Options{})
+	signer, err = New(pool, "")
 	if err != nil {
 		t.Fatalf("New(''): %v", err)
 	}
@@ -411,7 +410,7 @@ func TestNewSelectsByID(t *testing.T) {
 	}
 
 	// A typo in --ca-id must not silently fall back to some other CA.
-	if _, err := New(pool, "third", Options{}); err == nil {
+	if _, err := New(pool, "third"); err == nil {
 		t.Fatal("New accepted an unknown CA ID")
 	}
 }
@@ -446,10 +445,10 @@ func TestAnchorsCoversTheWholePool(t *testing.T) {
 }
 
 func TestNewRejectsAnEmptyPool(t *testing.T) {
-	if _, err := New(&localca.Pool{}, "", Options{}); err == nil {
+	if _, err := New(&localca.Pool{}, ""); err == nil {
 		t.Fatal("New accepted an empty pool")
 	}
-	if _, err := New(nil, "", Options{}); err == nil {
+	if _, err := New(nil, ""); err == nil {
 		t.Fatal("New accepted a nil pool")
 	}
 }

@@ -43,18 +43,14 @@ const secretTypeURL = "type.googleapis.com/envoy.extensions.transport_sockets.tl
 // left to the embedded Unimplemented, so an Envoy configured with anything
 // other than DELTA_GRPC fails immediately and visibly. It used to be
 // implemented, and that was worse than not having it: SotW has no removal
-// channel, so a refused name could only be expressed by omission, and none of
-// what makes this server safe -- refusal, idle withdrawal, per-stream
-// reclamation through minter.forget, or a single metric -- existed on that
-// path. A misconfigured api_type served certificates and silently ran with all
-// of it switched off.
+// channel, so a refused name could only be expressed by omission, and neither
+// refusal nor idle withdrawal existed on that path. A misconfigured api_type
+// served certificates and silently ran with both switched off.
 type server struct {
 	secretservice.UnimplementedSecretDiscoveryServiceServer
 
-	minter  *minter
-	log     *slog.Logger
-	metrics *metrics
-	ttl     time.Duration
+	minter *minter
+	log    *slog.Logger
 	// idleTimeout, if positive, is how long a name may sit without the client
 	// asking for it before the server withdraws it. Zero disables reclamation
 	// and the live set only grows.
@@ -78,16 +74,11 @@ type server struct {
 // serverOptions configures newServer.
 type serverOptions struct {
 	Logger *slog.Logger
-	// TTL must match the minter's leaf TTL for rotation timing to be right.
-	TTL time.Duration
 	// IdleTimeout, if positive, withdraws a name the client has not asked for
 	// in that long. Zero -- the default -- means names are held for the life
 	// of the stream, which is what makes an on-demand deployment's live set
 	// monotonically increasing.
 	IdleTimeout time.Duration
-	// Metrics, if non-nil, counts streams, subscriptions, response sizes and
-	// rotation cost.
-	Metrics *metrics
 }
 
 // newServer builds an SDS server over m.
@@ -95,14 +86,9 @@ func newServer(m *minter, opts serverOptions) *server {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	if opts.TTL <= 0 {
-		opts.TTL = defaultTTL
-	}
 	return &server{
 		minter:      m,
 		log:         opts.Logger,
-		metrics:     opts.Metrics,
-		ttl:         opts.TTL,
 		idleTimeout: opts.IdleTimeout,
 	}
 }
