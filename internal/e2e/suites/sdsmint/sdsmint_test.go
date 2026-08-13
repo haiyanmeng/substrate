@@ -110,8 +110,8 @@ const (
 //
 // Every SNI is qualified with the probe's namespace, which is fresh per run, so
 // each is a name Envoy has never subscribed to. Reusing one would be served
-// from Envoy's live secret set (--idle is 30m) and the test would pass without
-// sdsmint having minted anything.
+// from Envoy's live secret set and the test would pass without sdsmint having
+// minted anything.
 func TestSdsmintMintsALeafPerSNI(t *testing.T) {
 	ctx := context.Background()
 
@@ -296,9 +296,10 @@ type probeClient struct {
 }
 
 // uniqueSNI qualifies suffix with the probe's namespace, producing a name no
-// earlier run has asked the gateway for. Envoy keeps a minted secret live for
-// --idle (30m), so an SNI a previous run used comes back from its secret set
-// without sdsmint minting anything, and the test passes having tested nothing.
+// earlier run has asked the gateway for. Nothing withdraws a secret any more,
+// so Envoy holds every name it has ever been given for the life of its process:
+// an SNI a previous run used comes back from its secret set without sdsmint
+// minting anything, and the test passes having tested nothing.
 func (c *probeClient) uniqueSNI(suffix string) string {
 	return c.ns + "-" + suffix
 }

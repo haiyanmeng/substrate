@@ -29,29 +29,34 @@
 //	              A freshly minted leaf. The handshake resumes.
 //	  Envoy -> ack: response_nonce 1
 //
-//	sdsmint -> removed ["api.example.com"]                      nonce 2
-//	              Unprompted, after --idle without Envoy mentioning the name;
-//	              see withdrawIdle.
-//	  Envoy -> ack: response_nonce 2
-//
 // Three things about that exchange are worth holding onto.
 //
 // Envoy talks first, and then stops. After the opening subscribe it caches the
 // on-demand secret and never asks again, so nothing the client does will
 // prompt a second look at a name. This server does not push replacement leaves
-// either: a leaf reaches its notAfter under a live subscription and stays
-// there, and handshakes for that SNI fail until something removes the secret
-// from Envoy's cache.
+// either, so a leaf reaches its notAfter under a live subscription and stays
+// there.
 //
-// The idle sweep is that something, and with rotation gone it is the only
-// thing that refreshes a leaf. A withdrawal makes Envoy drop the secret, so
-// the next handshake for the name subscribes afresh and gets a new
-// certificate. Nothing renews a name in place. That puts a requirement on the
-// flags that nothing in the code enforces: --idle has to be shorter than
-// --leaf-cert-ttl, or a name is withdrawn only after its leaf has already
-// expired and every handshake in between fails. With --idle unset, no name is
-// ever refreshed and --leaf-cert-ttl is simply how long a host keeps working
-// after it is first reached.
+// Nothing notices when it does. Envoy goes on serving the expired leaf and the
+// handshake still completes; it neither refuses the stale secret nor
+// re-subscribes. On the far side, an actor cannot object, because nothing in
+// the cluster trusts the MITM anchor and an actor speaking TLS through the
+// gateway has verification switched off -- an expired leaf is indistinguishable
+// from a fresh one. So --leaf-cert-ttl bounds nothing by itself. Measured
+// against Envoy 1.37.5 by poc/sdsmint/expiry, which watched one name serve the
+// same leaf for 91s past its notAfter across 17 successful handshakes; that
+// harness is also where a change to this paragraph should be re-checked.
+//
+// So nothing here refreshes a leaf. Rotation is gone and so is the idle sweep
+// that replaced it; a name is minted once, on its first subscribe, and keeps
+// that certificate until Envoy forgets it. --leaf-cert-ttl is therefore
+// decorative from this server's side: it stamps a notAfter that nothing on
+// either end enforces.
+//
+// Nor does a reconnect help. Envoy replays what it still holds as
+// initial_resource_versions and this server adopts it, so the secret survives
+// the stream that delivered it; only an Envoy restart, or an unsubscribe when
+// the configuration referencing a secret goes away, gets a name minted again.
 //
 // A request is a bundle, not a command. One message can carry subscribes,
 // unsubscribes, an error_detail, and -- on the first message after a
@@ -63,11 +68,11 @@
 //
 // handle applies those parts in order; see the methods it dispatches to.
 //
-// Removal is why this is DELTA_GRPC. A refused name and an idle name are both
-// answered with removed_resources, which state-of-the-world SDS has no way to
-// express -- there, "gone" and "not in this snapshot" look identical. For a
-// refusal the removal is the point: Envoy fails the paused handshake, which is
-// the intended outcome for an SNI that is not a hostname.
+// Removal is why this is DELTA_GRPC. A refused name is answered with
+// removed_resources, which state-of-the-world SDS has no way to express --
+// there, "gone" and "not in this snapshot" look identical. The removal is the
+// point: Envoy fails the paused handshake, which is the intended outcome for an
+// SNI that is not a hostname.
 //
 // Every response carries a nonce, and the next request echoes it as
 // response_nonce. A request that also carries error_detail is a NACK of that
@@ -83,7 +88,6 @@ import (
 	"io"
 	"log/slog"
 	"sync"
-	"time"
 
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	secretservice "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
@@ -100,45 +104,13 @@ func (s *server) DeltaSecrets(stream secretservice.SecretDiscoveryService_DeltaS
 	st := &deltaStream{
 		srv:      s,
 		stream:   stream,
-		names:    make(map[string]*nameEntry),
+		names:    make(map[string]struct{}),
 		sendCh:   make(chan *discovery.DeltaDiscoveryResponse, 8),
 		sendErr:  make(chan error, 1),
 		sendDone: make(chan struct{}),
 	}
 
 	go st.sendLoop(ctx)
-
-	var idleTicker *time.Ticker
-	var idleC <-chan time.Time
-	if s.idleTimeout > 0 {
-		// A name goes idle silently and is only noticed on the next tick, so
-		// the interval is how late a withdrawal can be. Taking a fraction of
-		// the window keeps that lateness proportional to the timeout the
-		// operator configured rather than to a fixed guess, which would be
-		// either too coarse for a short timeout or pure wakeups for a long
-		// one. The bounds are where proportionality stops paying: under the
-		// floor the loop spins for nothing, over the ceiling a name outlives
-		// its timeout by longer than is worth the wait.
-		const (
-			idleSweepDivisor = 4
-			minSweepInterval = 250 * time.Millisecond
-			maxSweepInterval = 30 * time.Second
-		)
-		interval := s.idleTimeout / idleSweepDivisor
-		if interval < minSweepInterval {
-			interval = minSweepInterval
-		}
-		if interval > maxSweepInterval {
-			interval = maxSweepInterval
-		}
-		idleTicker = time.NewTicker(interval)
-		defer idleTicker.Stop()
-		idleC = idleTicker.C
-		s.log.DebugContext(ctx, "idle sweep armed",
-			slog.Duration("idle_timeout", s.idleTimeout),
-			slog.Duration("sweep_interval", interval),
-		)
-	}
 
 	recvCh := make(chan *discovery.DeltaDiscoveryRequest)
 	recvErrCh := make(chan error, 1)
@@ -174,10 +146,6 @@ func (s *server) DeltaSecrets(stream secretservice.SecretDiscoveryService_DeltaS
 				return nil
 			}
 			return err
-		case <-idleC:
-			if err := st.withdrawIdle(ctx); err != nil {
-				return err
-			}
 		case req := <-recvCh:
 			if err := st.handle(ctx, req); err != nil {
 				return err
@@ -200,17 +168,11 @@ type deltaStream struct {
 
 	mu sync.Mutex
 	// names is the client's subscription set. Delta xDS is stateful per
-	// stream; this is that state.
-	names map[string]*nameEntry
-}
-
-// nameEntry is the state for one name the client subscribes.
-type nameEntry struct {
-	// lastTouched is when the client last asked for this name. Two things
-	// count as asking: a subscribe, and listing the name in
-	// initial_resource_versions, which is how Envoy says what it still holds
-	// when a stream reconnects.
-	lastTouched time.Time
+	// stream; this is that state. Membership is the whole of it -- the server
+	// keeps nothing per name, because nothing it could keep would be read.
+	// The versions Envoy replays on a reconnect are not retained either; see
+	// handleInitialResourceVersions.
+	names map[string]struct{}
 }
 
 // handle applies one request from the client.
@@ -245,31 +207,30 @@ func (d *deltaStream) logNACK(ctx context.Context, req *discovery.DeltaDiscovery
 
 // handleInitialResourceVersions adopts what the client says it already holds.
 // On a stream reconnect Envoy replays its whole set this way, and a server that
-// ignored it would treat every one of those names as unknown: the live count
-// would be short, an unsubscribe would match nothing, and the idle sweep could
-// never reach them. The replayed versions themselves are not kept; see
-// nameEntry.
+// ignored it would treat every one of those names as unknown, so an unsubscribe
+// would match nothing.
+//
+// The replayed versions themselves are dropped. A version here is the serial of
+// a leaf this server minted, and there is nothing to compare it against: the
+// server holds no copy of what it issued and would not re-mint on a mismatch if
+// it did.
 func (d *deltaStream) handleInitialResourceVersions(replayed map[string]string) {
 	if len(replayed) == 0 {
 		return
 	}
 
-	now := time.Now()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for name := range replayed {
-		if e, known := d.names[name]; known {
-			e.lastTouched = now
-			continue
-		}
-		d.names[name] = &nameEntry{lastTouched: now}
+		d.names[name] = struct{}{}
 	}
 }
 
 // handleUnsubscribe drops names the client has explicitly given up. This is the
-// rare path: Envoy volunteers an unsubscribe when the configuration referencing
-// a secret goes away, not when it simply stops using one. A name it quietly
-// stops asking about is withdrawIdle's job.
+// rare path, and now the only one that shrinks the live set: Envoy volunteers
+// an unsubscribe when the configuration referencing a secret goes away, not
+// when it simply stops using one. A name it quietly stops asking about is held
+// for the life of the stream.
 func (d *deltaStream) handleUnsubscribe(names []string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -279,26 +240,14 @@ func (d *deltaStream) handleUnsubscribe(names []string) {
 }
 
 // handleSubscribe mints a leaf for every name the client asked for and sends
-// the batch. A name it already holds is refreshed rather than skipped, because
-// a subscribe is also the only thing that keeps a name off the idle sweep.
+// the batch. A name it already holds is minted again rather than skipped: Envoy
+// only re-subscribes to something it has dropped, so a repeat subscribe is a
+// request for a certificate, not a duplicate to be suppressed.
 func (d *deltaStream) handleSubscribe(ctx context.Context, names []string) error {
 	if len(names) == 0 {
 		// A bare ACK, or an unsubscribe-only request. Nothing to send.
 		return nil
 	}
-
-	// A subscribe is the only signal the client ever sends about a name it
-	// already holds, so it is the only thing that can keep one alive. Stamp
-	// them all up front, in one pass, because the mint loop below cannot hold
-	// the lock.
-	now := time.Now()
-	d.mu.Lock()
-	for _, name := range names {
-		if e, known := d.names[name]; known {
-			e.lastTouched = now
-		}
-	}
-	d.mu.Unlock()
 
 	var resources []*discovery.Resource
 	var removed []string
@@ -325,52 +274,6 @@ func (d *deltaStream) handleSubscribe(ctx context.Context, names []string) error
 	return d.send(ctx, resources, removed)
 }
 
-// withdrawIdle returns names the client has stopped asking about.
-//
-// This is the only thing that ever shrinks the live set, and the only thing
-// that ever gets a name a fresh certificate: nothing renews a leaf in place, so
-// a withdrawal is what makes Envoy drop the secret and subscribe again on the
-// next handshake. Without it a proxy that has seen a host once holds one
-// certificate for it until the stream dies, expiry included -- the subscription
-// is not refcounted against traffic, has no expiry of its own, and Envoy never
-// volunteers that it is finished with a name.
-func (d *deltaStream) withdrawIdle(ctx context.Context) error {
-	if d.srv.idleTimeout <= 0 {
-		return nil
-	}
-	// maxWithdrawPerSweep bounds how many names one sweep pulls back.
-	const maxWithdrawPerSweep = 1024
-	cutoff := time.Now().Add(-d.srv.idleTimeout)
-
-	var expired []string
-	capped := false
-	d.mu.Lock()
-	for name, e := range d.names {
-		if !e.lastTouched.Before(cutoff) {
-			continue
-		}
-		if len(expired) >= maxWithdrawPerSweep {
-			capped = true
-			break
-		}
-		expired = append(expired, name)
-	}
-	d.mu.Unlock()
-
-	if len(expired) == 0 {
-		return nil
-	}
-
-	d.srv.log.InfoContext(ctx, "withdrawing idle secrets",
-		slog.Int("withdrawn", len(expired)),
-		slog.Duration("idle_for", d.srv.idleTimeout),
-		slog.Bool("capped", capped),
-	)
-
-	// send does the bookkeeping: it drops these from d.names.
-	return d.send(ctx, nil, expired)
-}
-
 // pack wraps a minted cert as a versioned delta Resource and records the name
 // as subscribed.
 func (d *deltaStream) pack(name string, cert *certauth.MintedCert) (*discovery.Resource, error) {
@@ -384,9 +287,7 @@ func (d *deltaStream) pack(name string, cert *certauth.MintedCert) (*discovery.R
 	version := cert.Serial
 
 	d.mu.Lock()
-	if _, known := d.names[name]; !known {
-		d.names[name] = &nameEntry{lastTouched: time.Now()}
-	}
+	d.names[name] = struct{}{}
 	d.mu.Unlock()
 
 	return &discovery.Resource{Name: name, Version: version, Resource: body}, nil
@@ -417,8 +318,7 @@ func (d *deltaStream) send(ctx context.Context, resources []*discovery.Resource,
 // sendLoop drains sendCh onto the stream. gRPC forbids concurrent Send on a
 // stream, so everything is funneled through this one goroutine; sendCh's
 // buffer is what keeps a slow client from stalling the select loop in
-// DeltaSecrets, which would hold up idle sweeps and incoming requests behind
-// a write.
+// DeltaSecrets, which would hold up incoming requests behind a write.
 //
 // It stops on the first send failure and hands it to sendErr, which is what
 // DeltaSecrets returns; a full sendErr means a failure is already on its way

@@ -18,7 +18,6 @@ import (
 	"log/slog"
 	"strconv"
 	"sync/atomic"
-	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
@@ -43,18 +42,14 @@ const secretTypeURL = "type.googleapis.com/envoy.extensions.transport_sockets.tl
 // left to the embedded Unimplemented, so an Envoy configured with anything
 // other than DELTA_GRPC fails immediately and visibly. It used to be
 // implemented, and that was worse than not having it: SotW has no removal
-// channel, so a refused name could only be expressed by omission, and neither
-// refusal nor idle withdrawal existed on that path. A misconfigured api_type
-// served certificates and silently ran with both switched off.
+// channel, so a refused name could only be expressed by omission and the
+// refusal did not exist on that path at all. A misconfigured api_type served
+// certificates and silently ran with it switched off.
 type server struct {
 	secretservice.UnimplementedSecretDiscoveryServiceServer
 
 	minter *minter
 	log    *slog.Logger
-	// idleTimeout, if positive, is how long a name may sit without the client
-	// asking for it before the server withdraws it. Zero disables reclamation
-	// and the live set only grows.
-	idleTimeout time.Duration
 
 	// nonce numbers the responses this server sends. Every xDS response needs
 	// one: the client echoes it back as response_nonce, which is what makes a
@@ -74,11 +69,6 @@ type server struct {
 // serverOptions configures newServer.
 type serverOptions struct {
 	Logger *slog.Logger
-	// IdleTimeout, if positive, withdraws a name the client has not asked for
-	// in that long. Zero -- the default -- means names are held for the life
-	// of the stream, which is what makes an on-demand deployment's live set
-	// monotonically increasing.
-	IdleTimeout time.Duration
 }
 
 // newServer builds an SDS server over m.
@@ -87,9 +77,8 @@ func newServer(m *minter, opts serverOptions) *server {
 		opts.Logger = slog.Default()
 	}
 	return &server{
-		minter:      m,
-		log:         opts.Logger,
-		idleTimeout: opts.IdleTimeout,
+		minter: m,
+		log:    opts.Logger,
 	}
 }
 

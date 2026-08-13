@@ -26,7 +26,6 @@ type config struct {
 	CAPoolPath  string
 	CAID        string
 	LeafCertTTL time.Duration
-	Idle        time.Duration
 	LogLevel    string
 }
 
@@ -44,8 +43,7 @@ func NewSdsmintCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.UDSPath, "uds-path", "", "unix socket to listen on; required, and the only transport offered, because leaf private keys transit this channel")
 	cmd.Flags().StringVar(&cfg.CAPoolPath, "ca-pool-path", "", "path to a localca pool JSON holding the MITM CA, the format substrate mounts its other CAs in")
 	cmd.Flags().StringVar(&cfg.CAID, "ca-id", "", "which CA in the pool to sign with; empty takes the first")
-	cmd.Flags().DurationVar(&cfg.LeafCertTTL, "leaf-cert-ttl", defaultTTL, "leaf certificate lifetime; nothing renews a leaf in place, so this is how long a host keeps working after it is first reached unless --idle brings it back sooner")
-	cmd.Flags().DurationVar(&cfg.Idle, "idle", 0, "withdraw a secret the proxy has not re-requested in this long, so the live set can shrink and the name is re-minted on its next handshake; keep it under --leaf-cert-ttl or leaves expire before they are withdrawn. 0 holds every name for the life of the stream")
+	cmd.Flags().DurationVar(&cfg.LeafCertTTL, "leaf-cert-ttl", defaultTTL, "leaf certificate lifetime; nothing renews a leaf in place and nothing rejects an expired one, so a name keeps its first leaf for the life of the stream and this bounds nothing by itself")
 	cmd.Flags().StringVar(&cfg.LogLevel, "log-level", "info", "one of debug, info, warn, error")
 
 	return cmd

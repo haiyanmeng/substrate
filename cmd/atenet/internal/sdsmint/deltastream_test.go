@@ -20,6 +20,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"io"
+	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -97,15 +98,6 @@ func (f *fakeDeltaStream) quiet(t *testing.T, whileDoing string) {
 	case resp := <-f.sent:
 		t.Fatalf("server sent %v %s", resourceNames(resp), whileDoing)
 	default:
-	}
-}
-
-// drain empties whatever is already queued. Pair it with a Wait, or it races
-// the sender it is trying to get ahead of.
-func (f *fakeDeltaStream) drain() {
-	synctest.Wait()
-	for len(f.sent) > 0 {
-		<-f.sent
 	}
 }
 
@@ -280,11 +272,12 @@ func TestDeltaSecretsBareAckSendsNothing(t *testing.T) {
 }
 
 // TestDeltaSecretsNeverPushesUnprompted pins the shape of the server after
-// rotation was removed: with no idle timeout, a subscribe is answered once and
-// then the stream is silent for the whole life of the leaf and beyond. Nothing
-// re-mints a name in place, so a leaf expires under a live subscription --
-// that is a known consequence of the removal, not an accident, and this is
-// where it is written down.
+// rotation and the idle sweep were both removed: a subscribe is answered once
+// and then the stream is silent for the whole life of the leaf and beyond. The
+// server never speaks first. Nothing re-mints a name in place, so a leaf
+// expires under a live subscription and Envoy goes on serving it -- that is a
+// known consequence of the removals, not an accident, and this is where it is
+// written down.
 func TestDeltaSecretsNeverPushesUnprompted(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		// The TTL testServer's minter is built with.
@@ -309,44 +302,68 @@ func TestDeltaSecretsNeverPushesUnprompted(t *testing.T) {
 	})
 }
 
-// TestDeltaSecretsUnsubscribeDropsTheName checks that an unsubscribe actually
-// removes the name from the stream's set rather than merely being accepted.
-// The idle sweep is what makes that observable: a name the server still held
-// would be withdrawn once it aged out, and a name it has forgotten cannot be.
-func TestDeltaSecretsUnsubscribeDropsTheName(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		srv := testServer(t, serverOptions{IdleTimeout: testIdle})
-		stream, stop := startServer(t, srv)
-		defer func() {
-			if err := stop(); err != nil {
-				t.Errorf("DeltaSecrets returned %v", err)
-			}
-		}()
-
-		stream.requests <- &discovery.DeltaDiscoveryRequest{
-			TypeUrl:                secretTypeURL,
-			ResourceNamesSubscribe: []string{"a.example"},
-		}
-		stream.nextResponse(t)
-
-		stream.requests <- &discovery.DeltaDiscoveryRequest{
-			TypeUrl:                  secretTypeURL,
-			ResourceNamesUnsubscribe: []string{"a.example"},
-		}
-
-		stream.drain()
-		expectNoRemoval(t, stream, withdrawWait)
-	})
+// heldNames returns a copy of the stream's subscription set.
+//
+// These two tests reach into deltaStream directly because there is no longer
+// anything to watch from outside. The set used to be observable through the
+// idle sweep -- a name the server still held was eventually withdrawn, and one
+// it had forgotten never was -- and with the sweep gone nothing reads
+// membership at all. Driving the handlers is the only way left to pin the
+// bookkeeping, so that is what these do.
+func heldNames(d *deltaStream) []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	held := make([]string, 0, len(d.names))
+	for name := range d.names {
+		held = append(held, name)
+	}
+	slices.Sort(held)
+	return held
 }
 
-// TestDeltaSecretsSeedsFromInitialResourceVersions covers the reconnect path.
-// A replayed name has to land in the stream's set, or the server would treat
-// it as unknown: an unsubscribe would match nothing and the idle sweep could
-// never reach it. The sweep is what makes adoption observable -- an unadopted
-// name is never withdrawn, because the server does not know it exists.
+func newTestStream() *deltaStream {
+	return &deltaStream{names: make(map[string]struct{})}
+}
+
+// TestDeltaSecretsUnsubscribeDropsTheName checks that an unsubscribe actually
+// removes the name from the stream's set rather than merely being accepted.
+// With the sweep gone this is the only thing that ever shrinks the set.
+func TestDeltaSecretsUnsubscribeDropsTheName(t *testing.T) {
+	d := newTestStream()
+	d.handleInitialResourceVersions(map[string]string{"a.example": "1", "b.example": "1"})
+
+	d.handleUnsubscribe([]string{"a.example"})
+
+	if got, want := heldNames(d), []string{"b.example"}; !slices.Equal(got, want) {
+		t.Errorf("after unsubscribing a.example the set is %v, want %v", got, want)
+	}
+}
+
+// TestDeltaSecretsSeedsFromInitialResourceVersions covers the reconnect path. A
+// replayed name has to land in the stream's set, or the server would treat it
+// as unknown and a later unsubscribe would match nothing.
 func TestDeltaSecretsSeedsFromInitialResourceVersions(t *testing.T) {
+	d := newTestStream()
+
+	d.handleInitialResourceVersions(map[string]string{"resumed.example": "old-version"})
+
+	if got, want := heldNames(d), []string{"resumed.example"}; !slices.Equal(got, want) {
+		t.Errorf("replayed set is %v, want %v", got, want)
+	}
+
+	// Adopting a name must not be confused with serving it: a replay says Envoy
+	// already holds a leaf, so re-minting one would be pure churn.
+	if got := heldNames(newTestStream()); len(got) != 0 {
+		t.Errorf("a fresh stream starts holding %v, want nothing", got)
+	}
+}
+
+// TestDeltaSecretsReplayOnlyRequestIsSilent is the wire half of the above: a
+// request carrying nothing but initial_resource_versions is bookkeeping, and
+// answering it would push leaves Envoy did not ask for.
+func TestDeltaSecretsReplayOnlyRequestIsSilent(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		srv := testServer(t, serverOptions{IdleTimeout: testIdle})
+		srv := testServer(t, serverOptions{})
 		stream, stop := startServer(t, srv)
 		defer func() {
 			if err := stop(); err != nil {
@@ -359,10 +376,7 @@ func TestDeltaSecretsSeedsFromInitialResourceVersions(t *testing.T) {
 			InitialResourceVersions: map[string]string{"resumed.example": "old-version"},
 		}
 
-		// No immediate response: nothing was subscribed in this request.
 		stream.quiet(t, "in reply to a replay-only request")
-
-		awaitRemoval(t, stream, "resumed.example", withdrawWait)
 	})
 }
 
@@ -430,92 +444,12 @@ func TestDeltaSecretsSurvivesNack(t *testing.T) {
 	})
 }
 
-// The idle sweep, withdrawIdle's half of the file.
-//
-// The sweep interval is idleSweepDivisor per window, floored at 250ms, so any
-// window under a second lands on the floor instead of the divisor. These tests
-// run on a fake clock, so a window long enough to keep the divisor in play
-// costs nothing: 4s means sweeps every 1s and a withdrawal at 5s.
-const testIdle = 4 * time.Second
-
-// withdrawWait bounds a wait for the sweep. Generous, because fake time makes
-// it free, and the only run that spends it is one that is already failing.
-const withdrawWait = 10 * testIdle
-
-// awaitRemoval waits for a response withdrawing name, returning how long it
-// took. Resources arriving in the meantime are ignored: a sweep can land
-// between a subscribe and the mints answering it.
-func awaitRemoval(t *testing.T, stream *fakeDeltaStream, name string, within time.Duration) time.Duration {
-	t.Helper()
-	start := time.Now()
-	deadline := time.After(within)
-	for {
-		select {
-		case resp := <-stream.sent:
-			for _, got := range resp.GetRemovedResources() {
-				if got == name {
-					return time.Since(start)
-				}
-			}
-		case <-deadline:
-			t.Fatalf("%q was never withdrawn within %v", name, within)
-			return 0
-		}
-	}
-}
-
-// expectNoRemoval fails if anything is withdrawn during the window.
-func expectNoRemoval(t *testing.T, stream *fakeDeltaStream, within time.Duration) {
-	t.Helper()
-	deadline := time.After(within)
-	for {
-		select {
-		case resp := <-stream.sent:
-			if r := resp.GetRemovedResources(); len(r) > 0 {
-				t.Fatalf("unexpected withdrawal of %v", r)
-			}
-		case <-deadline:
-			return
-		}
-	}
-}
-
-// TestIdleNameIsWithdrawn is the core of it: a name nobody asks about again
-// goes away on its own.
-func TestIdleNameIsWithdrawn(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		srv := testServer(t, serverOptions{IdleTimeout: testIdle})
-		stream, stop := startServer(t, srv)
-		defer func() {
-			if err := stop(); err != nil {
-				t.Errorf("DeltaSecrets returned %v", err)
-			}
-		}()
-
-		stream.requests <- &discovery.DeltaDiscoveryRequest{
-			TypeUrl:                secretTypeURL,
-			ResourceNamesSubscribe: []string{"a.example"},
-		}
-		resp := stream.nextResponse(t)
-		if len(resp.GetResources()) != 1 {
-			t.Fatalf("initial response carried %d resources, want 1", len(resp.GetResources()))
-		}
-
-		took := awaitRemoval(t, stream, "a.example", withdrawWait)
-		t.Logf("withdrawn %v after the subscribe (idle timeout %v)", took.Round(time.Millisecond), testIdle)
-
-		// Early withdrawal would mean the name was reclaimed while the client
-		// was arguably still interested, which is the failure mode that turns
-		// this from reclamation into churn.
-		if took < testIdle {
-			t.Errorf("withdrawn after %v, before the %v idle timeout elapsed", took, testIdle)
-		}
-	})
-}
-
-// TestIdleWithdrawalIsOffByDefault pins the default down, because it is the
-// difference between this PoC's measured behavior and the new one.
-func TestIdleWithdrawalIsOffByDefault(t *testing.T) {
+// TestResubscribeIsMintedAgain is what is left of the refresh path. Envoy only
+// re-subscribes to a name it has dropped, so a repeat subscribe is a request
+// for a certificate and must be answered with a freshly minted one rather than
+// suppressed as a duplicate. With rotation and the idle sweep both gone this is
+// the only way a name ever gets a new leaf.
+func TestResubscribeIsMintedAgain(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		srv := testServer(t, serverOptions{})
 		stream, stop := startServer(t, srv)
@@ -525,126 +459,36 @@ func TestIdleWithdrawalIsOffByDefault(t *testing.T) {
 			}
 		}()
 
-		stream.requests <- &discovery.DeltaDiscoveryRequest{
+		subscribe := &discovery.DeltaDiscoveryRequest{
 			TypeUrl:                secretTypeURL,
 			ResourceNamesSubscribe: []string{"a.example"},
 		}
-		stream.nextResponse(t)
-		expectNoRemoval(t, stream, 4*testIdle)
-	})
-}
 
-// TestSubscribeKeepsANameAlive checks the one signal a client has. Envoy
-// re-subscribes when it needs a name it does not hold; if that did not reset
-// the clock, a name could be withdrawn moments after being asked for.
-func TestSubscribeKeepsANameAlive(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		srv := testServer(t, serverOptions{IdleTimeout: testIdle})
-		stream, stop := startServer(t, srv)
-		defer func() {
-			if err := stop(); err != nil {
-				t.Errorf("DeltaSecrets returned %v", err)
-			}
-		}()
-
-		stream.requests <- &discovery.DeltaDiscoveryRequest{
-			TypeUrl:                secretTypeURL,
-			ResourceNamesSubscribe: []string{"a.example"},
-		}
-		stream.nextResponse(t)
-
-		// Re-subscribe comfortably inside the window, for longer than the
-		// window itself, then assert nothing was withdrawn along the way.
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			for i := 0; i < 8; i++ {
-				time.Sleep(testIdle / 3)
-				select {
-				case stream.requests <- &discovery.DeltaDiscoveryRequest{
-					TypeUrl:                secretTypeURL,
-					ResourceNamesSubscribe: []string{"a.example"},
-				}:
-				case <-time.After(time.Second):
-					return
-				}
-			}
-		}()
-		expectNoRemoval(t, stream, 3*testIdle)
-		<-done
-	})
-}
-
-// TestResyncKeepsANameAlive covers the reconnect path. Envoy replays its live
-// set in initial_resource_versions on a new stream; the names in that replay
-// are names it is still holding, so the fresh stream must not immediately
-// withdraw them.
-func TestResyncKeepsANameAlive(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		srv := testServer(t, serverOptions{IdleTimeout: testIdle})
-		stream, stop := startServer(t, srv)
-		defer func() {
-			if err := stop(); err != nil {
-				t.Errorf("DeltaSecrets returned %v", err)
-			}
-		}()
-
-		stream.requests <- &discovery.DeltaDiscoveryRequest{
-			TypeUrl:                  secretTypeURL,
-			InitialResourceVersions:  map[string]string{"a.example": "1"},
-			ResourceNamesSubscribe:   nil,
-			ResourceNamesUnsubscribe: nil,
-		}
-
-		// It should survive the first sweep after the replay, then age out like
-		// anything else: the replay is a touch, not a lease.
-		expectNoRemoval(t, stream, testIdle/2)
-		awaitRemoval(t, stream, "a.example", withdrawWait)
-	})
-}
-
-// TestWithdrawnNameIsServedAgainOnRequest is the safety property, and with
-// rotation gone it is also the refresh path: withdrawal must cost a re-fetch
-// and nothing more, or reclamation is an outage with a schedule. A host that
-// gets busy again after a quiet hour has to work, and a host in continuous use
-// only ever gets a new certificate this way.
-func TestWithdrawnNameIsServedAgainOnRequest(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		srv := testServer(t, serverOptions{IdleTimeout: testIdle})
-		stream, stop := startServer(t, srv)
-		defer func() {
-			if err := stop(); err != nil {
-				t.Errorf("DeltaSecrets returned %v", err)
-			}
-		}()
-
-		stream.requests <- &discovery.DeltaDiscoveryRequest{
-			TypeUrl:                secretTypeURL,
-			ResourceNamesSubscribe: []string{"a.example"},
-		}
+		stream.requests <- subscribe
 		first := stream.nextResponse(t)
 		if len(first.GetResources()) != 1 {
 			t.Fatalf("initial response carried %d resources, want 1", len(first.GetResources()))
 		}
-		awaitRemoval(t, stream, "a.example", withdrawWait)
 
-		stream.requests <- &discovery.DeltaDiscoveryRequest{
-			TypeUrl:                secretTypeURL,
-			ResourceNamesSubscribe: []string{"a.example"},
+		stream.requests <- subscribe
+		second := stream.nextResponse(t)
+		if len(second.GetResources()) != 1 {
+			t.Fatalf("re-subscribe was answered with %d resources, want 1", len(second.GetResources()))
 		}
-		for {
-			resp := stream.nextResponse(t)
-			if len(resp.GetResources()) == 0 {
-				continue
-			}
-			if got := resp.GetResources()[0].GetName(); got != "a.example" {
-				t.Fatalf("re-fetch returned %q, want a.example", got)
-			}
-			leaf := leafFromResource(t, resp.GetResources()[0])
-			if err := leaf.VerifyHostname("a.example"); err != nil {
-				t.Fatalf("re-minted leaf does not cover a.example: %v", err)
-			}
-			return
+
+		if got := second.GetResources()[0].GetName(); got != "a.example" {
+			t.Fatalf("re-subscribe returned %q, want a.example", got)
+		}
+		leaf := leafFromResource(t, second.GetResources()[0])
+		if err := leaf.VerifyHostname("a.example"); err != nil {
+			t.Fatalf("re-minted leaf does not cover a.example: %v", err)
+		}
+
+		// A new leaf, not the first one handed back. The version is the serial,
+		// so an unchanged version here would mean Envoy sees no update and goes
+		// on serving whatever it already had.
+		if v1, v2 := first.GetResources()[0].GetVersion(), second.GetResources()[0].GetVersion(); v1 == v2 {
+			t.Errorf("re-subscribe returned the same version %s; the name was not minted again", v1)
 		}
 	})
 }

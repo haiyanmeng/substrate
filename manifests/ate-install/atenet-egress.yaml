@@ -520,32 +520,30 @@ spec:
         - "--uds-path=/var/run/sdsmint/sdsmint.sock"
         - "--ca-pool-path=/run/ca-state/mitm-pool.json"
         - "--ca-id=mitm"
-        # --leaf-cert-ttl bounds how long one leaf is usable, not how long a
-        # host keeps working: nothing renews a leaf in place. Note it does not
-        # bound validity exactly either -- leaves are back-dated 5m for clock
-        # skew and NotAfter is ttl past issuance, so the window a client will
-        # accept is ttl+5m. See Signer.Sign in
+        # --leaf-cert-ttl stamps a notAfter and nothing else. It does not bound
+        # how long a host keeps working, and as of the removal of rotation and
+        # the idle sweep it does not bound how long a leaf is served either:
+        # nothing here renews a leaf in place and nothing withdraws one, so a
+        # name minted on its first handshake keeps that certificate until Envoy
+        # forgets it -- in practice, until this pod or the Envoy beside it
+        # restarts.
+        #
+        # Expiry is not self-correcting. Envoy goes on serving the expired leaf
+        # and the handshake still completes, and actors cannot object because
+        # they reach the gateway with verification off -- nothing in the cluster
+        # trusts the MITM anchor. Watched happen against Envoy 1.37.5 in
+        # poc/sdsmint/expiry: one name served the same leaf for 91s past its
+        # notAfter across 17 successful handshakes.
+        #
+        # So this number currently buys containment if the leaf key leaks and
+        # the holder is somewhere that DOES verify, and nothing else. Restarting
+        # the sidecar is the only thing that re-mints.
+        #
+        # It also does not bound validity exactly: leaves are back-dated 5m for
+        # clock skew and NotAfter is ttl past issuance, so the window a client
+        # would accept is ttl+5m. See Signer.Sign in
         # cmd/atenet/internal/sdsmint/certauth.
         - "--leaf-cert-ttl=15m"
-        # This has to stay UNDER --leaf-cert-ttl, and nothing in sdsmint
-        # enforces it. The idle sweep is the only thing that refreshes a
-        # certificate now: a withdrawal makes Envoy drop the secret, so the
-        # next handshake for that name subscribes again and is minted afresh.
-        # Set it above the TTL and every name spends the difference holding an
-        # expired leaf, failing handshakes, with nothing on either side to
-        # notice. 10m against 15m leaves 5m of slack for a sweep that is late
-        # by up to a quarter of this window.
-        #
-        # It is also the CPU lever, because it sets the re-mint period: the
-        # steady-state cost is N live secrets divided by it, so 10,000 names at
-        # 10m is ~17 signatures a second. The load-test figures the resources
-        # below are drawn from were measured against per-stream rotation at a
-        # 200s period -- 507/s at 100,000 names, 1.28 cores here and 0.73 in
-        # Envoy applying the pushes. The mechanism is gone but the arithmetic
-        # is the same shape and the cost is still linear in the period; they
-        # are scaled, not re-measured, so re-run the load test before treating
-        # any of it as a budget.
-        - "--idle=10m"
         - "--log-level=info"
         env:
         # Go's nearest thing to Envoy's fixed_heap, and it is not as close as
@@ -576,14 +574,16 @@ spec:
         #         will later destabilise. Understating it is how this pod takes
         #         its neighbours down with it.
         # cpu     ~126 mcore was the measured floor at 10k with no traffic at
-        #         all, when 50 re-mints a second ran on a rotation ticker;
-        #         --idle now sets that rate instead and at 10m it is a third of
-        #         it, mostly time inside the P-256 signer either way. A single
-        #         mint is the ~600us the PoC measured, so a 500/s burst of cold
-        #         names is another 0.3 core on top -- which is why this is
-        #         requested and not limited. Throttling the signer turns a CPU
-        #         shortage into handshake timeouts across every cold SNI at
-        #         once.
+        #         all, when 50 re-mints a second ran on a rotation ticker. That
+        #         steady-state cost is now zero: nothing re-mints, so a name
+        #         costs one signature ever and an idle gateway signs nothing.
+        #         The request is sized for the burst instead. A single mint is
+        #         the ~600us the PoC measured, so a 500/s wave of cold names is
+        #         ~0.3 core -- which is why this is requested and not limited.
+        #         Throttling the signer turns a CPU shortage into handshake
+        #         timeouts across every cold SNI at once. Left at 200m rather
+        #         than trimmed to the new floor because the burst, not the
+        #         steady state, is what this has to absorb.
         resources:
           requests:
             cpu: 200m

@@ -73,8 +73,7 @@ func run(ctx context.Context, cfg config) error {
 
 	grpcServer := grpc.NewServer()
 	secretservice.RegisterSecretDiscoveryServiceServer(grpcServer, newServer(m, serverOptions{
-		Logger:      logger,
-		IdleTimeout: cfg.Idle,
+		Logger: logger,
 	}))
 
 	logger.Info("sdsmint listening",
