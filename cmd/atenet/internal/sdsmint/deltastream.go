@@ -1,0 +1,246 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Delta SDS: the stateful, per-connection half of the server.
+// - https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol#xds-protocol-delta
+// - https://www.envoyproxy.io/docs/envoy/latest/configuration/security/secret
+package sdsmint
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+
+	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	secretservice "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
+
+	"github.com/agent-substrate/substrate/cmd/atenet/internal/sdsmint/certauth"
+)
+
+// DeltaSecrets is what DELTA_GRPC drives. It is a long-lived loop that mints
+// incrementally rather than serving a fixed snapshot.
+func (s *server) DeltaSecrets(stream secretservice.SecretDiscoveryService_DeltaSecretsServer) error {
+	ctx := stream.Context()
+
+	st := &deltaStream{
+		srv:      s,
+		stream:   stream,
+		sendCh:   make(chan *discovery.DeltaDiscoveryResponse, 8),
+		sendErr:  make(chan error, 1),
+		sendDone: make(chan struct{}),
+	}
+
+	go st.sendLoop(ctx)
+
+	recvCh := make(chan *discovery.DeltaDiscoveryRequest)
+	recvErrCh := make(chan error, 1)
+	go func() {
+		for {
+			req, err := stream.Recv()
+			if err != nil {
+				recvErrCh <- err
+				return
+			}
+			select {
+			case recvCh <- req:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Wait for send thread to finish before exiting.
+	defer func() {
+		close(st.sendCh)
+		<-st.sendDone
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-st.sendErr:
+			return err
+		case err := <-recvErrCh:
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		case req := <-recvCh:
+			if err := st.handle(ctx, req); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// deltaStream is the per-connection plumbing for a DeltaSecrets stream.
+//
+// Despite delta xDS being the stateful variant, there is no subscription set
+// here. This server tracked one until the resource TTL made it pointless:
+// refresh is Envoy's timer now, so nothing on this side ever needs to know what
+// a stream is holding. What is left is a send queue, and no shared mutable
+// state at all -- handle runs on one goroutine and sendLoop owns the stream.
+type deltaStream struct {
+	srv    *server
+	stream secretservice.SecretDiscoveryService_DeltaSecretsServer
+
+	// sendCh queues responses for sendLoop. sendErr carries the first send
+	// failure back to DeltaSecrets, and sendDone closes once the loop has
+	// stopped touching the stream.
+	sendCh   chan *discovery.DeltaDiscoveryResponse
+	sendErr  chan error
+	sendDone chan struct{}
+}
+
+// handle applies one request from the client.
+func (d *deltaStream) handle(ctx context.Context, req *discovery.DeltaDiscoveryRequest) error {
+	if url := req.GetTypeUrl(); url != "" && url != secretTypeURL {
+		return fmt.Errorf("unexpected type_url %q on the SDS stream", url)
+	}
+
+	// A request carrying error_detail is a NACK of whatever we last sent, and
+	// only that: it brings no subscription changes to apply.
+	if req.GetErrorDetail() != nil {
+		d.logNACK(ctx, req)
+		return nil
+	}
+
+	// initial_resource_versions and resource_names_unsubscribe are read off the
+	// wire and dropped; see the package comment for why neither needs acting on.
+	return d.handleSubscribe(ctx, req.GetResourceNamesSubscribe())
+}
+
+// logNACK records that Envoy rejected the last response. Nothing is resent: the
+// server has no second thing to offer for the name, and a retry loop against a
+// client that is rejecting on principle is worse than the failure.
+func (d *deltaStream) logNACK(ctx context.Context, req *discovery.DeltaDiscoveryRequest) {
+	ed := req.GetErrorDetail()
+	d.srv.log.ErrorContext(ctx, "envoy NACKed an SDS response",
+		slog.String("message", ed.GetMessage()),
+		slog.Int("code", int(ed.GetCode())),
+		slog.String("nonce", req.GetResponseNonce()),
+	)
+}
+
+// handleSubscribe mints a leaf for every name the client asked for and sends
+// the batch. A name this stream already holds is minted again rather than
+// skipped. Envoy re-subscribes in two cases and both want a certificate: after
+// a resource TTL dropped the secret and a handshake needs it back, and on the
+// first request of a new stream, where it re-subscribes to everything it holds.
+// Suppressing the repeat would leave the second case with nothing.
+func (d *deltaStream) handleSubscribe(ctx context.Context, names []string) error {
+	if len(names) == 0 {
+		// A bare ACK, or an unsubscribe-only request. Nothing to send.
+		return nil
+	}
+
+	var resources []*discovery.Resource
+	var removed []string
+
+	for _, name := range names {
+		cert, err := d.srv.minter.certificate(ctx, name)
+		if err != nil {
+			// Refused. Tell Envoy the name does not exist; the paused
+			// handshake for that SNI then fails, which is the intended
+			// outcome for something that is not a hostname.
+			removed = append(removed, name)
+			continue
+		}
+		res, err := d.pack(name, cert)
+		if err != nil {
+			return err
+		}
+		resources = append(resources, res)
+	}
+
+	if len(resources) == 0 && len(removed) == 0 {
+		return nil
+	}
+	return d.send(ctx, resources, removed)
+}
+
+// pack wraps a minted cert as a versioned delta Resource.
+func (d *deltaStream) pack(name string, cert *certauth.MintedCert) (*discovery.Resource, error) {
+	secret := toSecret(name, cert)
+	body, err := anypb.New(secret)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling secret for %q: %w", name, err)
+	}
+	// The serial changes on every mint, so it is a natural resource version:
+	// every mint looks like a new version to Envoy.
+	version := cert.Serial
+
+	return &discovery.Resource{
+		Name:     name,
+		Version:  version,
+		Resource: body,
+		// Envoy starts a timer per resource when it receives one and drops the
+		// resource when that timer fires. That drop is the whole refresh
+		// mechanism: the next handshake for the name finds nothing cached and
+		// re-subscribes, and this server mints again. Stamped on every response
+		// rather than the first, because a resource that arrives with no ttl
+		// has its timer cleared and is then held for good.
+		Ttl: durationpb.New(d.srv.resourceTTL),
+	}, nil
+}
+
+func (d *deltaStream) send(ctx context.Context, resources []*discovery.Resource, removed []string) error {
+	resp := &discovery.DeltaDiscoveryResponse{
+		TypeUrl:          secretTypeURL,
+		Resources:        resources,
+		RemovedResources: removed,
+		Nonce:            d.srv.nextNonce(),
+	}
+
+	select {
+	case d.sendCh <- resp:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// sendLoop drains sendCh onto the stream. gRPC forbids concurrent Send on a
+// stream, so everything is funneled through this one goroutine; sendCh's
+// buffer is what keeps a slow client from stalling the select loop in
+// DeltaSecrets, which would hold up incoming requests behind a write.
+//
+// It stops on the first send failure and hands it to sendErr, which is what
+// DeltaSecrets returns; a full sendErr means a failure is already on its way
+// back, so the second one is dropped rather than blocking the exit.
+func (d *deltaStream) sendLoop(ctx context.Context) {
+	defer close(d.sendDone)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case resp, ok := <-d.sendCh:
+			if !ok {
+				return
+			}
+			if err := d.stream.Send(resp); err != nil {
+				select {
+				case d.sendErr <- err:
+				default:
+				}
+				return
+			}
+		}
+	}
+}
