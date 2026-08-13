@@ -137,6 +137,27 @@ data:
                     response_body_mode: NONE
                     request_trailer_mode: SKIP
                     response_trailer_mode: SKIP
+              # An operator's own ext_proc filter is inserted at the marker
+              # below when hack/install-ate.sh runs with
+              # --egress-extproc-service; nothing is inserted without it.
+              #
+              # The position is the point. It sits after substrate's filter, so
+              # it can only ever narrow the decision: substrate denies with an
+              # immediate_response, which ends the filter chain before the
+              # operator's processor is consulted, and the operator's own denial
+              # is an immediate_response honored the same way. Neither can widen
+              # the other, by construction. It sits before the router so a
+              # denial still short-circuits.
+              #
+              # This whole envoy.yaml is one string in a ConfigMap, which is why
+              # the injection is a text splice rather than a kustomize patch --
+              # kustomize cannot reach inside a block scalar. The upside is that
+              # these comments survive `kubectl kustomize` (they are string
+              # content, not YAML comments), so the marker is stable through
+              # every overlay. Do not reword the marker line: install-ate.sh
+              # matches on it. Its indentation may move; the injector reuses
+              # whatever indentation it finds.
+              # ate:egress-extproc-filter
               - name: envoy.filters.http.dynamic_forward_proxy
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
@@ -168,6 +189,11 @@ data:
                   socket_address:
                     address: 127.0.0.1
                     port_value: 50051
+      # The cluster backing the operator's ext_proc filter is inserted at the
+      # marker below, by the same --egress-extproc-service splice. See the note
+      # on the filter marker above for why this is a splice and not a patch, and
+      # do not reword the marker line.
+      # ate:egress-extproc-cluster
       # Dials the terminated-CONNECT target (IP:port from the authority). atunnel
       # always sends an IP:port, so DNS resolution is effectively a passthrough.
       - name: egress_forward_proxy
