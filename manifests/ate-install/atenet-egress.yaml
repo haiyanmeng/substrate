@@ -520,26 +520,23 @@ spec:
         - "--uds-path=/var/run/sdsmint/sdsmint.sock"
         - "--ca-pool-path=/run/ca-state/mitm-pool.json"
         - "--ca-id=mitm"
-        # --leaf-cert-ttl stamps a notAfter and nothing else. It does not bound
-        # how long a host keeps working, and as of the removal of rotation and
-        # the idle sweep it does not bound how long a leaf is served either:
-        # nothing here renews a leaf in place and nothing withdraws one, so a
-        # name minted on its first handshake keeps that certificate until Envoy
-        # forgets it -- in practice, until this pod or the Envoy beside it
-        # restarts.
+        # --leaf-cert-ttl sets two things at once. It stamps the leaf's notAfter,
+        # and sdsmint derives the xDS resource TTL from it at half its length --
+        # so at 15m, Envoy drops each cached secret after 7m30s and the next
+        # handshake for that name re-mints. That drop is the only thing that
+        # replaces a leaf: nothing pushes, and rotation and the idle sweep are
+        # both gone. Cost follows traffic, since a name nobody asks for is
+        # dropped and never minted again.
         #
-        # Expiry is not self-correcting. Envoy goes on serving the expired leaf
-        # and the handshake still completes, and actors cannot object because
-        # they reach the gateway with verification off -- nothing in the cluster
-        # trusts the MITM anchor. Watched happen against Envoy 1.37.5 in
-        # poc/sdsmint/expiry: one name served the same leaf for 91s past its
-        # notAfter across 17 successful handshakes.
+        # Do not reach for a longer TTL to cut minting. The two move together,
+        # and the failure mode at the far end is silent: without the resource
+        # TTL, Envoy holds a secret indefinitely, serves the leaf past its
+        # notAfter, and the handshake still completes -- actors cannot object
+        # because they reach the gateway with verification off, nothing in the
+        # cluster trusting the MITM anchor. Measured against Envoy 1.37.5 in
+        # poc/sdsmint/expiry, both with the TTL and without it.
         #
-        # So this number currently buys containment if the leaf key leaks and
-        # the holder is somewhere that DOES verify, and nothing else. Restarting
-        # the sidecar is the only thing that re-mints.
-        #
-        # It also does not bound validity exactly: leaves are back-dated 5m for
+        # It does not bound validity exactly: leaves are back-dated 5m for
         # clock skew and NotAfter is ttl past issuance, so the window a client
         # would accept is ttl+5m. See Signer.Sign in
         # cmd/atenet/internal/sdsmint/certauth.

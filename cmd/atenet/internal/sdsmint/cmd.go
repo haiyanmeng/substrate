@@ -43,7 +43,7 @@ func NewSdsmintCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.UDSPath, "uds-path", "", "unix socket to listen on; required, and the only transport offered, because leaf private keys transit this channel")
 	cmd.Flags().StringVar(&cfg.CAPoolPath, "ca-pool-path", "", "path to a localca pool JSON holding the MITM CA, the format substrate mounts its other CAs in")
 	cmd.Flags().StringVar(&cfg.CAID, "ca-id", "", "which CA in the pool to sign with; empty takes the first")
-	cmd.Flags().DurationVar(&cfg.LeafCertTTL, "leaf-cert-ttl", defaultTTL, "leaf certificate lifetime; nothing renews a leaf in place and nothing rejects an expired one, so a name keeps its first leaf for the life of the stream and this bounds nothing by itself")
+	cmd.Flags().DurationVar(&cfg.LeafCertTTL, "leaf-cert-ttl", defaultTTL, "leaf certificate lifetime; the xDS resource TTL is derived from it at half its length, so an actively used name is re-minted about twice per lifetime and an idle one is dropped and not minted again")
 	cmd.Flags().StringVar(&cfg.LogLevel, "log-level", "info", "one of debug, info, warn, error")
 
 	return cmd
@@ -69,7 +69,7 @@ func (c config) validateTTL() error {
 	case ttl < minSensibleTTL:
 		return fmt.Errorf("--leaf-cert-ttl %s is below %s; leaves are back-dated 5m for clock skew, so most of each certificate's validity would already be in the past and --leaf-cert-ttl would not describe how long clients accept it", ttl, minSensibleTTL)
 	case ttl > maxSensibleTTL:
-		return fmt.Errorf("--leaf-cert-ttl %s is above %s; nothing renews a leaf in place, so a name minted once would stay valid that long, which is not what short-lived MITM leaves are for", ttl, maxSensibleTTL)
+		return fmt.Errorf("--leaf-cert-ttl %s is above %s; a leaf is served until the resource TTL derived from this drops it, so a name in steady use would carry the same certificate for half of that, which is not what short-lived MITM leaves are for", ttl, maxSensibleTTL)
 	}
 	return nil
 }

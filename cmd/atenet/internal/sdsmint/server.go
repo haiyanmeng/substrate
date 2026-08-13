@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
@@ -51,6 +52,13 @@ type server struct {
 	minter *minter
 	log    *slog.Logger
 
+	// resourceTTL is the xDS TTL stamped on every resource this server sends:
+	// how long Envoy holds a secret before dropping it of its own accord. It is
+	// derived from the leaf lifetime rather than configured separately, so the
+	// two cannot be set into an order that does not work. See pack, which
+	// stamps it, for what Envoy does with it.
+	resourceTTL time.Duration
+
 	// nonce numbers the responses this server sends. Every xDS response needs
 	// one: the client echoes it back as response_nonce, which is what makes a
 	// later request recognizable as an ACK or NACK of a specific response
@@ -76,9 +84,18 @@ func newServer(m *minter, opts serverOptions) *server {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+
+	// Half the leaf lifetime. Envoy drops the secret when the TTL fires and the
+	// next handshake for that name re-subscribes, so a replacement is minted
+	// while the leaf it replaces is still valid. A TTL equal to the leaf
+	// lifetime would drop the secret at the moment the leaf died, leaving a
+	// window for a handshake to land on one already past its notAfter.
+	const refreshFraction = 2
+
 	return &server{
-		minter: m,
-		log:    opts.Logger,
+		minter:      m,
+		log:         opts.Logger,
+		resourceTTL: m.ttl / refreshFraction,
 	}
 }
 

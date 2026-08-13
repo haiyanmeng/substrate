@@ -31,9 +31,9 @@ var errHostNotAllowed = errors.New("host not allowed")
 
 // minter returns a leaf certificate for a hostname. It holds nothing between
 // calls: every call that gets past checkHostSyntax mints. The caching that
-// matters is Envoy's, which keeps an on-demand secret for the life of the
-// subscription, so a second mint for the same host only happens when the data
-// plane has genuinely lost the first. It is safe for concurrent use.
+// matters is Envoy's, which keeps an on-demand secret until the resource TTL
+// drops it, so a second mint for the same host only happens when the data plane
+// has genuinely lost the first. It is safe for concurrent use.
 type minter struct {
 	signer *certauth.Signer
 	ttl    time.Duration

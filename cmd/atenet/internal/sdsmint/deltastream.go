@@ -32,31 +32,36 @@
 // Three things about that exchange are worth holding onto.
 //
 // Envoy talks first, and then stops. After the opening subscribe it caches the
-// on-demand secret and never asks again, so nothing the client does will
-// prompt a second look at a name. This server does not push replacement leaves
-// either, so a leaf reaches its notAfter under a live subscription and stays
-// there.
+// on-demand secret and never asks again on its own, so nothing a client does
+// will prompt a second look at a name. This server does not push replacement
+// leaves either -- rotation is gone, and so is the idle sweep that replaced it.
 //
-// Nothing notices when it does. Envoy goes on serving the expired leaf and the
-// handshake still completes; it neither refuses the stale secret nor
-// re-subscribes. On the far side, an actor cannot object, because nothing in
-// the cluster trusts the MITM anchor and an actor speaking TLS through the
-// gateway has verification switched off -- an expired leaf is indistinguishable
-// from a fresh one. So --leaf-cert-ttl bounds nothing by itself. Measured
-// against Envoy 1.37.5 by poc/sdsmint/expiry, which watched one name serve the
-// same leaf for 91s past its notAfter across 17 successful handshakes; that
-// harness is also where a change to this paragraph should be re-checked.
+// What refreshes a leaf is the resource TTL. Every resource goes out stamped
+// with one (see pack), Envoy runs a timer per resource and drops the secret
+// when it fires, and the next handshake for that name finds nothing cached and
+// re-subscribes. That is the entire mechanism: the server holds no timer, no
+// goroutine and no per-name state, and the cost is proportional to traffic,
+// because a name nobody asks for is simply dropped and never minted again.
 //
-// So nothing here refreshes a leaf. Rotation is gone and so is the idle sweep
-// that replaced it; a name is minted once, on its first subscribe, and keeps
-// that certificate until Envoy forgets it. --leaf-cert-ttl is therefore
-// decorative from this server's side: it stamps a notAfter that nothing on
-// either end enforces.
+// This matters more than it looks, because the failure mode without it is
+// silent. Sending no ttl leaves Envoy holding the secret for good; it goes on
+// serving the leaf past its notAfter and the handshake still completes, since
+// it neither refuses a stale secret nor re-subscribes. An actor cannot object
+// either: nothing in the cluster trusts the MITM anchor, so an actor speaking
+// TLS through the gateway has verification switched off and an expired leaf is
+// indistinguishable from a fresh one. Nothing anywhere would report it.
 //
-// Nor does a reconnect help. Envoy replays what it still holds as
-// initial_resource_versions and this server adopts it, so the secret survives
-// the stream that delivered it; only an Envoy restart, or an unsubscribe when
-// the configuration referencing a secret goes away, gets a name minted again.
+// All of that -- the drop, the lazy re-subscribe, and what happens without a
+// ttl -- was measured against Envoy 1.37.5 by poc/sdsmint/expiry. A change to
+// these paragraphs should be re-checked there.
+//
+// A reconnect re-mints, all at once. Envoy's first request on a new stream
+// replays what it holds as initial_resource_versions and re-subscribes to the
+// whole set, so this server mints every held name together: restarting sdsmint
+// produced a fresh leaf for an active name about a second after the socket came
+// back, with no handshake to prompt it, and the TTL cadence resumed from there.
+// This is the one place minting is not proportional to traffic, and it scales
+// with how many names the Envoy beside it is holding.
 //
 // A request is a bundle, not a command. One message can carry subscribes,
 // unsubscribes, an error_detail, and -- on the first message after a
@@ -92,6 +97,7 @@ import (
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	secretservice "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/agent-substrate/substrate/cmd/atenet/internal/sdsmint/certauth"
 )
@@ -240,9 +246,11 @@ func (d *deltaStream) handleUnsubscribe(names []string) {
 }
 
 // handleSubscribe mints a leaf for every name the client asked for and sends
-// the batch. A name it already holds is minted again rather than skipped: Envoy
-// only re-subscribes to something it has dropped, so a repeat subscribe is a
-// request for a certificate, not a duplicate to be suppressed.
+// the batch. A name this stream already holds is minted again rather than
+// skipped. Envoy re-subscribes in two cases and both want a certificate: after
+// a resource TTL dropped the secret and a handshake needs it back, and on the
+// first request of a new stream, where it re-subscribes to everything it holds.
+// Suppressing the repeat would leave the second case with nothing.
 func (d *deltaStream) handleSubscribe(ctx context.Context, names []string) error {
 	if len(names) == 0 {
 		// A bare ACK, or an unsubscribe-only request. Nothing to send.
@@ -290,7 +298,18 @@ func (d *deltaStream) pack(name string, cert *certauth.MintedCert) (*discovery.R
 	d.names[name] = struct{}{}
 	d.mu.Unlock()
 
-	return &discovery.Resource{Name: name, Version: version, Resource: body}, nil
+	return &discovery.Resource{
+		Name:     name,
+		Version:  version,
+		Resource: body,
+		// Envoy starts a timer per resource when it receives one and drops the
+		// resource when that timer fires. That drop is the whole refresh
+		// mechanism: the next handshake for the name finds nothing cached and
+		// re-subscribes, and this server mints again. Stamped on every response
+		// rather than the first, because a resource that arrives with no ttl
+		// has its timer cleared and is then held for good.
+		Ttl: durationpb.New(d.srv.resourceTTL),
+	}, nil
 }
 
 func (d *deltaStream) send(ctx context.Context, resources []*discovery.Resource, removed []string) error {

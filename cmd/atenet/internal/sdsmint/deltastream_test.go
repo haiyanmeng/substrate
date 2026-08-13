@@ -212,6 +212,43 @@ func TestDeltaSecretsMintsSubscribedName(t *testing.T) {
 	})
 }
 
+// TestDeltaSecretsStampsResourceTTL covers the only thing that gets a name
+// re-minted. Envoy drops a resource when its TTL fires and re-subscribes on the
+// next handshake; nothing on this side pushes. A resource sent without a ttl is
+// held by Envoy for good, and the leaf inside it goes on being served long past
+// its notAfter -- see poc/sdsmint/expiry, which measured both.
+func TestDeltaSecretsStampsResourceTTL(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		srv := testServer(t, serverOptions{})
+		stream, stop := startServer(t, srv)
+		defer func() {
+			if err := stop(); err != nil {
+				t.Errorf("DeltaSecrets returned %v", err)
+			}
+		}()
+
+		stream.requests <- &discovery.DeltaDiscoveryRequest{
+			TypeUrl:                secretTypeURL,
+			ResourceNamesSubscribe: []string{"a.example"},
+		}
+
+		res := stream.nextResponse(t).GetResources()[0]
+		ttl := res.GetTtl()
+		if ttl == nil {
+			t.Fatal("resource carries no ttl; Envoy would hold this secret forever and serve the leaf past its notAfter")
+		}
+
+		// The invariant, rather than the exact fraction: the secret has to be
+		// dropped while the leaf it carries is still valid, so the handshake
+		// that re-subscribes is never the one served an expired leaf.
+		remaining := time.Until(leafFromResource(t, res).NotAfter)
+		if ttl.AsDuration() >= remaining {
+			t.Errorf("ttl %s is not shorter than the leaf's remaining validity %s; a handshake could land after the leaf expires but before Envoy drops it",
+				ttl.AsDuration(), remaining)
+		}
+	})
+}
+
 func TestDeltaSecretsWithdrawsRefusedName(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		srv := testServer(t, serverOptions{})
