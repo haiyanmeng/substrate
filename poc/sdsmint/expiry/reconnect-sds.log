@@ -1,0 +1,9 @@
+time=2026-08-13T09:04:36.587-04:00 level=INFO msg="sdsmint listening" network=unix address=./sdsmint.sock config="{UDSPath:./sdsmint.sock CAPoolPath:./pool.json CAID:mitm LeafCertTTL:1m0s LogLevel:debug}"
+time=2026-08-13T09:04:37.363-04:00 level=INFO msg="certificate issued" host=rc-7447.example.com serial=1e7cb57f29f850f9fa7fc6476a9c72de1bf29f16 not_after=2026-08-13T09:05:37.362-04:00
+time=2026-08-13T09:04:37.370-04:00 level=INFO msg="shutting down"
+time=2026-08-13T09:04:39.372-04:00 level=WARN msg="graceful shutdown timed out; closing open streams" grace=2s
+time=2026-08-13T09:04:41.418-04:00 level=INFO msg="sdsmint listening" network=unix address=./sdsmint.sock config="{UDSPath:./sdsmint.sock CAPoolPath:./pool.json CAID:mitm LeafCertTTL:1m0s LogLevel:debug}"
+time=2026-08-13T09:04:43.996-04:00 level=INFO msg="certificate issued" host=rc-7447.example.com serial=550645ce3f9c6dc292f606dd8b61e9699652bd38 not_after=2026-08-13T09:05:43.996-04:00
+time=2026-08-13T09:05:29.670-04:00 level=INFO msg="certificate issued" host=rc-7447.example.com serial=2b979d63eb66e8a5e2a7d3ed3ad0ce311a9e3242 not_after=2026-08-13T09:06:29.669-04:00
+time=2026-08-13T09:06:04.691-04:00 level=INFO msg="certificate issued" host=rc-7447.example.com serial=e7439b4f1a392c78bc94827d5e12589b69e503a not_after=2026-08-13T09:07:04.690-04:00
+time=2026-08-13T09:06:04.701-04:00 level=INFO msg="shutting down"

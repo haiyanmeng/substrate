@@ -1,0 +1,9 @@
+time=2026-08-13T08:59:05.003-04:00 level=INFO msg="sdsmint listening" network=unix address=./sdsmint.sock config="{UDSPath:./sdsmint.sock CAPoolPath:./pool.json CAID:mitm LeafCertTTL:1m0s LogLevel:debug}"
+time=2026-08-13T08:59:05.444-04:00 level=INFO msg="certificate issued" host=aged-5661.example.com serial=4e9d35eb6e0d4bbdb3c473307325210e51d1809e not_after=2026-08-13T09:00:05.443-04:00
+time=2026-08-13T08:59:35.537-04:00 level=INFO msg="certificate issued" host=aged-5661.example.com serial=35791f99a44a86b7928156791e6720360d1d9aed not_after=2026-08-13T09:00:35.536-04:00
+time=2026-08-13T09:00:05.625-04:00 level=INFO msg="certificate issued" host=aged-5661.example.com serial=7584d829f1e3f71072d393fc33f1f6f486b0ee9a not_after=2026-08-13T09:01:05.624-04:00
+time=2026-08-13T09:00:35.714-04:00 level=INFO msg="certificate issued" host=aged-5661.example.com serial=f248c556ec2742f965430511935016723b5203a not_after=2026-08-13T09:01:35.714-04:00
+time=2026-08-13T09:01:05.805-04:00 level=INFO msg="certificate issued" host=aged-5661.example.com serial=755bc39fc9a7ff01cfa12679af39ccc0a413a2b not_after=2026-08-13T09:02:05.804-04:00
+time=2026-08-13T09:01:35.891-04:00 level=INFO msg="certificate issued" host=aged-5661.example.com serial=16d418915b8d93679c7b2f6533c47c996efc5943 not_after=2026-08-13T09:02:35.891-04:00
+time=2026-08-13T09:01:45.921-04:00 level=INFO msg="certificate issued" host=control-31764.example.com serial=43f4161e01d099c111418ddea5359f553f771f80 not_after=2026-08-13T09:02:45.920-04:00
+time=2026-08-13T09:01:45.996-04:00 level=INFO msg="shutting down"

@@ -1,0 +1,17 @@
+# Built per run by run.sh. The repo's top-level /bin/ rule is root-anchored and
+# does not reach here, and one of these is a ~90M atenet.
+bin/
+
+# Also built per run: the CA pool and its root. pool.json carries the CA
+# SigningKeyPEM, so it is not something to commit even for a throwaway CA that
+# expires in 24h. genpool regenerates both on every run, which is the point --
+# see the note in README.md about the expired pool in ../__run.
+pool.json
+ca.pem
+
+# The socket sdsmint binds.
+sdsmint.sock
+
+# Left behind by `go build ./genpool` before run.sh started building into bin/.
+genpool/genpool
+probe/probe

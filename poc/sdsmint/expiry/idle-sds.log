@@ -1,0 +1,4 @@
+time=2026-08-13T09:02:45.715-04:00 level=INFO msg="sdsmint listening" network=unix address=./sdsmint.sock config="{UDSPath:./sdsmint.sock CAPoolPath:./pool.json CAID:mitm LeafCertTTL:1m0s LogLevel:debug}"
+time=2026-08-13T09:02:46.493-04:00 level=INFO msg="certificate issued" host=idle-22867.example.com serial=5a80f107e31fbf0bcc4618c2b48bc3a803ce1e07 not_after=2026-08-13T09:03:46.492-04:00
+time=2026-08-13T09:04:36.521-04:00 level=INFO msg="certificate issued" host=idle-22867.example.com serial=74f7efbce0ea7d6f45baddc45774cb34ac2b77d3 not_after=2026-08-13T09:05:36.520-04:00
+time=2026-08-13T09:04:36.527-04:00 level=INFO msg="shutting down"

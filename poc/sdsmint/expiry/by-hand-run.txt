@@ -1,0 +1,12 @@
+  idle: idle-22867.example.com   (--leaf-cert-ttl=1m -> resource ttl 30s)
+    one probe, then silence : 5a80f107e31f
+    ...110s of no traffic, nearly four TTL periods...
+    mints during that window: 1   <- 1 means idle names are dropped, not re-minted
+    probe again             : 74f7efbce0ea   <- a new serial means the drop happened and this re-subscribed
+
+  reconnect: rc-7447.example.com   (--leaf-cert-ttl=1m -> resource ttl 30s)
+    t=0s  before restart : 1e7cb57f29f8
+    t=~12s after restart : 550645ce3f9c   <- ttl cannot have fired yet
+    t=~52s past the ttl  : 2b979d63eb66   <- a new serial means the cadence resumed
+    t=~87s               : e7439b4f1a39
+    total mints          : 4

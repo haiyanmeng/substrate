@@ -1,0 +1,195 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Envoy for the leaf-expiry harness. Adapted from
+# poc/sdsmint/__run/internal-listener.yaml, which is the bootstrap that first
+# proved on_demand_secret works behind a CONNECT terminator on an internal
+# listener. Same two-listener shape as the deployed gateway in
+# manifests/ate-install/atenet-egress.yaml:
+#
+#   Listener A (127.0.0.1:18500) terminates HTTP CONNECT and routes the
+#   tunneled bytes into Listener B, an internal listener whose transport
+#   socket carries the on_demand_secret selector. The leaf is minted during the
+#   inner handshake against B.
+#
+# Two deliberate omissions relative to the deployed gateway, both to isolate
+# the one thing being measured:
+#
+#   No mTLS on the front door. The harness is not testing who may reach the
+#   gateway, and requiring an actor credential would mean standing up the
+#   actor-identity CA to ask a question about the MITM leaf.
+#
+#   No prefetch_secret_names. The PoC bootstrap prefetches its default name,
+#   which mints at boot and puts a leaf of unknown age in the cache before the
+#   harness has taken its t=0 reading. Every subscription here is one the
+#   harness caused.
+#
+# The dynamic_forward_proxy upstream is kept so the config is the deployed
+# shape, but nothing exercises it: Envoy completes the downstream handshake --
+# which is where the leaf is served -- before HCM ever looks for an upstream,
+# so the harness needs no DNS and no internet.
+
+node:
+  id: sdsmint-expiry
+  cluster: sdsmint-expiry
+
+admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 19000}
+
+bootstrap_extensions:
+- name: envoy.bootstrap.internal_listener
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.bootstrap.internal_listener.v3.InternalListener
+
+static_resources:
+  listeners:
+  # ---- Listener A: the front door ----
+  - name: connect_in
+    address:
+      socket_address: {address: 127.0.0.1, port_value: 18500}
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: connect_in
+          upgrade_configs: [{upgrade_type: CONNECT}]
+          route_config:
+            name: connect
+            virtual_hosts:
+            - name: all
+              domains: ["*"]
+              routes:
+              - match: {connect_matcher: {}}
+                route:
+                  cluster: mitm_internal
+                  upgrade_configs: [{upgrade_type: CONNECT, connect_config: {}}]
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  # ---- Listener B: the MITM leg ----
+  - name: mitm_listener
+    stat_prefix: mitm
+    internal_listener: {}
+    listener_filters:
+    - name: envoy.filters.listener.tls_inspector
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: mitm_http
+          route_config:
+            name: local
+            virtual_hosts:
+            - name: all
+              domains: ["*"]
+              routes:
+              - match: {prefix: "/"}
+                route:
+                  cluster: dynamic_forward_proxy
+                  timeout: 30s
+          http_filters:
+          - name: envoy.filters.http.dynamic_forward_proxy
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+              dns_cache_config: &dns_cache
+                name: egress_dns
+                dns_lookup_family: V4_ONLY
+                max_hosts: 1024
+                dns_cache_circuit_breaker:
+                  max_pending_requests: 128
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      transport_socket_connect_timeout: 5s
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            custom_tls_certificate_selector:
+              name: on-demand
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.cert_selectors.on_demand_secret.v3.Config
+                config_source:
+                  api_config_source:
+                    api_type: DELTA_GRPC
+                    transport_api_version: V3
+                    grpc_services:
+                    - envoy_grpc:
+                        cluster_name: sds_mint
+                certificate_mapper:
+                  name: sni
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.cert_mappers.sni.v3.SNI
+                    default_value: "default.mitm.example"
+          # Session resumption would let a second handshake skip the
+          # certificate entirely, which is precisely the reading the harness
+          # takes. Off, as it is in the deployed gateway.
+          disable_stateless_session_resumption: true
+          disable_stateful_session_resumption: true
+
+  clusters:
+  - name: mitm_internal
+    connect_timeout: 1s
+    load_assignment:
+      cluster_name: mitm_internal
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              envoy_internal_address:
+                server_listener_name: mitm_listener
+
+  - name: sds_mint
+    type: STATIC
+    connect_timeout: 1s
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
+    load_assignment:
+      cluster_name: sds_mint
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              pipe: {path: ./sdsmint.sock}
+
+  - name: dynamic_forward_proxy
+    connect_timeout: 10s
+    lb_policy: CLUSTER_PROVIDED
+    cluster_type:
+      name: envoy.clusters.dynamic_forward_proxy
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+        dns_cache_config: *dns_cache
+    upstream_http_protocol_options:
+      auto_sni: true
+      auto_san_validation: true
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        common_tls_context:
+          validation_context:
+            trusted_ca:
+              filename: /etc/ssl/certs/ca-certificates.crt

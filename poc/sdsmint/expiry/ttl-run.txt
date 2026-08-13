@@ -1,0 +1,60 @@
+building...
+wrote ./pool.json and ./ca.pem: CA "mitm" valid until 2026-08-14T12:59:04Z
+envoy: ../__run/envoy  version: f97695a50e11f5ff6719e129a466bf9204b64a7f/1.37.5/Clean/RELEASE/BoringSSL
+
+############################################################
+# scenario: ttl   --leaf-cert-ttl=1m
+#   SNI aged-5661.example.com
+############################################################
+
+       t  result
+  ------  ------
+      0s  connected | serial 4e9d35eb6e0d | fresh for 60s | leaf is valid
+     10s  connected | serial 4e9d35eb6e0d | fresh for 50s | leaf is valid
+     20s  connected | serial 4e9d35eb6e0d | fresh for 39s | leaf is valid
+     30s  connected | serial 35791f99a44a | fresh for 59s | leaf is valid
+     40s  connected | serial 35791f99a44a | fresh for 49s | leaf is valid
+     50s  connected | serial 35791f99a44a | fresh for 39s | leaf is valid
+     60s  connected | serial 7584d829f1e3 | fresh for 59s | leaf is valid
+     70s  connected | serial 7584d829f1e3 | fresh for 49s | leaf is valid
+     80s  connected | serial 7584d829f1e3 | fresh for 39s | leaf is valid
+     90s  connected | serial f248c556ec27 | fresh for 59s | leaf is valid
+    100s  connected | serial f248c556ec27 | fresh for 49s | leaf is valid
+    110s  connected | serial f248c556ec27 | fresh for 39s | leaf is valid
+    120s  connected | serial 755bc39fc9a7 | fresh for 59s | leaf is valid
+    130s  connected | serial 755bc39fc9a7 | fresh for 49s | leaf is valid
+    140s  connected | serial 755bc39fc9a7 | fresh for 39s | leaf is valid
+    150s  connected | serial 16d418915b8d | fresh for 59s | leaf is valid
+
+  control (never-before-seen SNI)
+         connected | serial 43f4161e01d0 | fresh for 59s | leaf is valid
+
+  --- verdict ---
+    ok: 6 leaves across 16 handshakes, never an expired one
+  --- distinct leaves served for aged-5661.example.com ---
+    16d418915b8d93679c7b2f6533c47c996efc5943
+    35791f99a44a86b7928156791e6720360d1d9aed
+    4e9d35eb6e0d4bbdb3c473307325210e51d1809e
+    755bc39fc9a7ff01cfa12679af39ccc0a413a2b
+    7584d829f1e3f71072d393fc33f1f6f486b0ee9a
+    f248c556ec2742f965430511935016723b5203a
+  --- what sdsmint did ---
+    certificates issued: 7
+    time=2026-08-13T08:59:05.444-04:00 level=INFO msg="certificate issued" host=aged-5661.example.com serial=4e9d35eb6e0d4bbdb3c473307325210e51d1809e not_after=2026-08-13T09:00:05.443-04:00
+    time=2026-08-13T08:59:35.537-04:00 level=INFO msg="certificate issued" host=aged-5661.example.com serial=35791f99a44a86b7928156791e6720360d1d9aed not_after=2026-08-13T09:00:35.536-04:00
+    time=2026-08-13T09:00:05.625-04:00 level=INFO msg="certificate issued" host=aged-5661.example.com serial=7584d829f1e3f71072d393fc33f1f6f486b0ee9a not_after=2026-08-13T09:01:05.624-04:00
+    time=2026-08-13T09:00:35.714-04:00 level=INFO msg="certificate issued" host=aged-5661.example.com serial=f248c556ec2742f965430511935016723b5203a not_after=2026-08-13T09:01:35.714-04:00
+    time=2026-08-13T09:01:05.805-04:00 level=INFO msg="certificate issued" host=aged-5661.example.com serial=755bc39fc9a7ff01cfa12679af39ccc0a413a2b not_after=2026-08-13T09:02:05.804-04:00
+    time=2026-08-13T09:01:35.891-04:00 level=INFO msg="certificate issued" host=aged-5661.example.com serial=16d418915b8d93679c7b2f6533c47c996efc5943 not_after=2026-08-13T09:02:35.891-04:00
+    time=2026-08-13T09:01:45.921-04:00 level=INFO msg="certificate issued" host=control-31764.example.com serial=43f4161e01d099c111418ddea5359f553f771f80 not_after=2026-08-13T09:02:45.920-04:00
+  --- envoy: secrets it is holding ---
+  --- ssl / on-demand stats (nonzero only) ---
+    listener.mitm.on_demand_secret.cert_active: 2
+    listener.mitm.on_demand_secret.cert_requested: 7
+    listener.mitm.on_demand_secret.cert_updated: 12
+    listener.mitm.on_demand_secret.ssl.certificate.aged-5661.example.com.expiration_unix_time_seconds: 1786626155
+    listener.mitm.on_demand_secret.ssl.certificate.control-31764.example.com.expiration_unix_time_seconds: 1786626165
+    listener.mitm.ssl.handshake: 17
+  --- envoy warnings and errors ---
+
+done. logs: *-sds.log, *-envoy.log, *-probes.jsonl

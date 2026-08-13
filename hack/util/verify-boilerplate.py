@@ -105,8 +105,10 @@ def main():
         _, ext = os.path.splitext(filepath)
         filename = os.path.basename(filepath)
 
-        # Skip non-source-code files
-        if ext in ['.md', '.txt', '.png', '.jpg', '.jpeg', '.gif', '.mp4', '.json', '.pdf', '.ico', '.woff', '.woff2', '.ttf', '.otf', '.svg']:
+        # Skip non-source-code files. .log and .jsonl are captured program
+        # output: a header cannot be added without falsifying the record, and in
+        # the JSONL case it would not parse.
+        if ext in ['.md', '.txt', '.png', '.jpg', '.jpeg', '.gif', '.mp4', '.json', '.jsonl', '.log', '.pdf', '.ico', '.woff', '.woff2', '.ttf', '.otf', '.svg']:
             continue
         if filename in ['LICENSE', 'NOTICE', 'CODEOWNERS', '.gitignore', 'go.mod', 'go.sum']:
             continue

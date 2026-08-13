@@ -1,0 +1,19 @@
+time=2026-08-13T07:00:47.809-04:00 level=INFO msg="sdsmint listening" network=unix address=./sdsmint.sock config="{UDSPath:./sdsmint.sock CAPoolPath:./pool.json CAID:mitm LeafCertTTL:1m0s Idle:30s LogLevel:debug}"
+time=2026-08-13T07:00:48.363-04:00 level=DEBUG msg="idle sweep armed" idle_timeout=30s sweep_interval=7.5s
+time=2026-08-13T07:00:48.366-04:00 level=INFO msg="certificate issued" host=aged-27329.example.com serial=198f88b63fea63e5c4b621949b5917a69d0cfcd1 not_after=2026-08-13T07:01:48.365-04:00
+time=2026-08-13T07:01:18.369-04:00 level=INFO msg="withdrawing idle secrets" withdrawn=1 idle_for=30s capped=false
+time=2026-08-13T07:01:18.455-04:00 level=DEBUG msg="idle sweep armed" idle_timeout=30s sweep_interval=7.5s
+time=2026-08-13T07:01:18.457-04:00 level=INFO msg="certificate issued" host=aged-27329.example.com serial=5ecb7e38f2872c7b167a223ecbe5762f593a96ab not_after=2026-08-13T07:02:18.456-04:00
+time=2026-08-13T07:01:48.460-04:00 level=INFO msg="withdrawing idle secrets" withdrawn=1 idle_for=30s capped=false
+time=2026-08-13T07:01:48.539-04:00 level=DEBUG msg="idle sweep armed" idle_timeout=30s sweep_interval=7.5s
+time=2026-08-13T07:01:48.540-04:00 level=INFO msg="certificate issued" host=aged-27329.example.com serial=7cdeabe2e5491029e161f546ca350372acf8edf4 not_after=2026-08-13T07:02:48.540-04:00
+time=2026-08-13T07:02:18.545-04:00 level=INFO msg="withdrawing idle secrets" withdrawn=1 idle_for=30s capped=false
+time=2026-08-13T07:02:18.631-04:00 level=DEBUG msg="idle sweep armed" idle_timeout=30s sweep_interval=7.5s
+time=2026-08-13T07:02:18.633-04:00 level=INFO msg="certificate issued" host=aged-27329.example.com serial=68d8e83954f379b6665f841d1e6c615413db7eb5 not_after=2026-08-13T07:03:18.632-04:00
+time=2026-08-13T07:02:56.131-04:00 level=INFO msg="withdrawing idle secrets" withdrawn=1 idle_for=30s capped=false
+time=2026-08-13T07:02:58.750-04:00 level=DEBUG msg="idle sweep armed" idle_timeout=30s sweep_interval=7.5s
+time=2026-08-13T07:02:58.751-04:00 level=INFO msg="certificate issued" host=aged-27329.example.com serial=6fdf3d5bcdc372765bb48c25c3f8bbf07382a not_after=2026-08-13T07:03:58.751-04:00
+time=2026-08-13T07:03:28.756-04:00 level=INFO msg="withdrawing idle secrets" withdrawn=1 idle_for=30s capped=false
+time=2026-08-13T07:03:28.838-04:00 level=DEBUG msg="idle sweep armed" idle_timeout=30s sweep_interval=7.5s
+time=2026-08-13T07:03:28.839-04:00 level=INFO msg="certificate issued" host=control-9173.example.com serial=23567a3e48e6b2150b1c565dd9e41239333c4d20 not_after=2026-08-13T07:04:28.838-04:00
+time=2026-08-13T07:03:28.908-04:00 level=INFO msg="shutting down"

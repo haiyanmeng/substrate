@@ -1,0 +1,48 @@
+building...
+wrote ./pool.json and ./ca.pem: CA "mitm" valid until 2026-08-14T11:29:45Z
+envoy: ../__run/envoy  version: f97695a50e11f5ff6719e129a466bf9204b64a7f/1.37.5/Clean/RELEASE/BoringSSL
+
+############################################################
+# scenario: stuck   --leaf-cert-ttl=1m
+#   SNI aged-2786.example.com
+############################################################
+
+       t  result
+  ------  ------
+      0s  connected | serial 14b7af9e02e6 | fresh for 60s | leaf is valid
+     10s  connected | serial 14b7af9e02e6 | fresh for 50s | leaf is valid
+     20s  connected | serial 14b7af9e02e6 | fresh for 40s | leaf is valid
+     30s  connected | serial 14b7af9e02e6 | fresh for 30s | leaf is valid
+     40s  connected | serial 14b7af9e02e6 | fresh for 20s | leaf is valid
+     50s  connected | serial 14b7af9e02e6 | fresh for 10s | leaf is valid
+     60s  connected | serial 14b7af9e02e6 | EXPIRED 0s ago | served anyway, actor accepted it
+     70s  connected | serial 14b7af9e02e6 | EXPIRED 10s ago | served anyway, actor accepted it
+     80s  connected | serial 14b7af9e02e6 | EXPIRED 20s ago | served anyway, actor accepted it
+     90s  connected | serial 14b7af9e02e6 | EXPIRED 30s ago | served anyway, actor accepted it
+    100s  connected | serial 14b7af9e02e6 | EXPIRED 40s ago | served anyway, actor accepted it
+    110s  connected | serial 14b7af9e02e6 | EXPIRED 50s ago | served anyway, actor accepted it
+    120s  connected | serial 14b7af9e02e6 | EXPIRED 60s ago | served anyway, actor accepted it
+    130s  connected | serial 14b7af9e02e6 | EXPIRED 71s ago | served anyway, actor accepted it
+    140s  connected | serial 14b7af9e02e6 | EXPIRED 81s ago | served anyway, actor accepted it
+    150s  connected | serial 14b7af9e02e6 | EXPIRED 91s ago | served anyway, actor accepted it
+
+  control (never-before-seen SNI)
+         connected | serial 5e406e4c8099 | fresh for 59s | leaf is valid
+
+  --- distinct leaves served for aged-2786.example.com ---
+    14b7af9e02e66bc5b4bdcae11374ff31f7fd0083
+  --- what sdsmint did ---
+    certificates issued: 2
+    time=2026-08-13T07:29:46.143-04:00 level=INFO msg="certificate issued" host=aged-2786.example.com serial=14b7af9e02e66bc5b4bdcae11374ff31f7fd0083 not_after=2026-08-13T07:30:46.142-04:00
+    time=2026-08-13T07:32:26.584-04:00 level=INFO msg="certificate issued" host=control-23185.example.com serial=5e406e4c8099559f0a48934c1148da6872113e46 not_after=2026-08-13T07:33:26.583-04:00
+  --- envoy: secrets it is holding ---
+  --- ssl / on-demand stats (nonzero only) ---
+    listener.mitm.on_demand_secret.cert_active: 2
+    listener.mitm.on_demand_secret.cert_requested: 2
+    listener.mitm.on_demand_secret.cert_updated: 2
+    listener.mitm.on_demand_secret.ssl.certificate.aged-2786.example.com.expiration_unix_time_seconds: 1786620646
+    listener.mitm.on_demand_secret.ssl.certificate.control-23185.example.com.expiration_unix_time_seconds: 1786620806
+    listener.mitm.ssl.handshake: 17
+  --- envoy warnings and errors ---
+
+done. logs: *-sds.log, *-envoy.log, *-probes.jsonl
