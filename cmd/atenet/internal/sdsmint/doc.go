@@ -12,8 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package sdsmint implements `atenet sdsmint`, a minting SDS server: an Envoy
-// Secret Discovery Service that mints a TLS leaf certificate on demand for
-// whatever hostname Envoy asks for, where the requested SDS resource name is
-// the SNI from the client.
+// Package sdsmint implements `atenet sdsmint`, a minting SDS server.
 package sdsmint

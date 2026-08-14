@@ -29,8 +29,6 @@ import (
 // private keys transit this channel, and a unix socket restricted to the
 // proxy's UID is the only reach that is ever wanted.
 func listen(uds string) (net.Listener, error) {
-	// A stale socket from a previous run would make Listen fail with
-	// "address already in use" even though nothing is running.
 	if err := os.Remove(uds); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("removing stale socket %s: %w", uds, err)
 	}

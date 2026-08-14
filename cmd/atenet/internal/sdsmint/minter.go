@@ -118,6 +118,7 @@ func isValidDNSName(host string) bool {
 
 // isValidDNSLabel reports whether one dot-separated component is a legal label:
 // letters, digits, and interior hyphens, up to 63 bytes.
+// https://datatracker.ietf.org/doc/html/rfc1035
 func isValidDNSLabel(label string) bool {
 	if label == "" || len(label) > 63 {
 		return false

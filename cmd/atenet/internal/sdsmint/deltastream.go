@@ -37,10 +37,23 @@ import (
 func (s *server) DeltaSecrets(stream secretservice.SecretDiscoveryService_DeltaSecretsServer) error {
 	ctx := stream.Context()
 
+	// An arbitrary depth, and not a tuned one. One request yields at most one
+	// response -- handleSubscribe batches every name in a request into a single
+	// send -- and the producer signs a leaf per name before it queues anything,
+	// which costs far more than handing a proto to gRPC's own buffered write
+	// path. So the queue sits at 0 or 1 and any small number does the same job.
+	// Only the extremes would change behavior: 0 makes every response a
+	// synchronous handoff to sendLoop and stalls the select loop on each write,
+	// which is what the buffer exists to avoid, and unbounded lets a wedged
+	// stream accumulate every certificate it ever minted. Filling this is not a
+	// failure either -- send blocks, with a ctx.Done escape, which is the stall
+	// the buffer defers rather than prevents.
+	const sendDepth = 8
+
 	st := &deltaStream{
 		srv:      s,
 		stream:   stream,
-		sendCh:   make(chan *discovery.DeltaDiscoveryResponse, 8),
+		sendCh:   make(chan *discovery.DeltaDiscoveryResponse, sendDepth),
 		sendErr:  make(chan error, 1),
 		sendDone: make(chan struct{}),
 	}
@@ -90,21 +103,15 @@ func (s *server) DeltaSecrets(stream secretservice.SecretDiscoveryService_DeltaS
 }
 
 // deltaStream is the per-connection plumbing for a DeltaSecrets stream.
-//
-// Despite delta xDS being the stateful variant, there is no subscription set
-// here. This server tracked one until the resource TTL made it pointless:
-// refresh is Envoy's timer now, so nothing on this side ever needs to know what
-// a stream is holding. What is left is a send queue, and no shared mutable
-// state at all -- handle runs on one goroutine and sendLoop owns the stream.
 type deltaStream struct {
 	srv    *server
 	stream secretservice.SecretDiscoveryService_DeltaSecretsServer
 
-	// sendCh queues responses for sendLoop. sendErr carries the first send
-	// failure back to DeltaSecrets, and sendDone closes once the loop has
-	// stopped touching the stream.
-	sendCh   chan *discovery.DeltaDiscoveryResponse
-	sendErr  chan error
+	// sendCh queues responses for sendLoop.
+	sendCh chan *discovery.DeltaDiscoveryResponse
+	// sendErr carries the first send failure back to DeltaSecrets.
+	sendErr chan error
+	// sendDone closes once the loop has stopped touching the stream.
 	sendDone chan struct{}
 }
 
@@ -121,8 +128,6 @@ func (d *deltaStream) handle(ctx context.Context, req *discovery.DeltaDiscoveryR
 		return nil
 	}
 
-	// initial_resource_versions and resource_names_unsubscribe are read off the
-	// wire and dropped; see the package comment for why neither needs acting on.
 	return d.handleSubscribe(ctx, req.GetResourceNamesSubscribe())
 }
 
@@ -143,7 +148,6 @@ func (d *deltaStream) logNACK(ctx context.Context, req *discovery.DeltaDiscovery
 // skipped. Envoy re-subscribes in two cases and both want a certificate: after
 // a resource TTL dropped the secret and a handshake needs it back, and on the
 // first request of a new stream, where it re-subscribes to everything it holds.
-// Suppressing the repeat would leave the second case with nothing.
 func (d *deltaStream) handleSubscribe(ctx context.Context, names []string) error {
 	if len(names) == 0 {
 		// A bare ACK, or an unsubscribe-only request. Nothing to send.
@@ -191,11 +195,10 @@ func (d *deltaStream) pack(name string, cert *certauth.MintedCert) (*discovery.R
 		Version:  version,
 		Resource: body,
 		// Envoy starts a timer per resource when it receives one and drops the
-		// resource when that timer fires. That drop is the whole refresh
-		// mechanism: the next handshake for the name finds nothing cached and
-		// re-subscribes, and this server mints again. Stamped on every response
-		// rather than the first, because a resource that arrives with no ttl
-		// has its timer cleared and is then held for good.
+		// resource when that timer fires. The next handshake for the name
+		// finds nothing cached and re-subscribes, and this server mints again.
+		// Stamped on every response rather than the first, because a resource
+		// that arrives with no ttl has its timer cleared and is then held for good.
 		Ttl: durationpb.New(d.srv.resourceTTL),
 	}, nil
 }
@@ -216,11 +219,7 @@ func (d *deltaStream) send(ctx context.Context, resources []*discovery.Resource,
 	}
 }
 
-// sendLoop drains sendCh onto the stream. gRPC forbids concurrent Send on a
-// stream, so everything is funneled through this one goroutine; sendCh's
-// buffer is what keeps a slow client from stalling the select loop in
-// DeltaSecrets, which would hold up incoming requests behind a write.
-//
+// sendLoop drains sendCh onto the stream.
 // It stops on the first send failure and hands it to sendErr, which is what
 // DeltaSecrets returns; a full sendErr means a failure is already on its way
 // back, so the second one is dropped rather than blocking the exit.
