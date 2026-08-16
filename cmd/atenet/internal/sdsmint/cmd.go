@@ -60,7 +60,7 @@ func (c config) validateTTL() error {
 	// which is worse than not starting: the operator has no signal that the
 	// number they set is not the number in effect.
 	const (
-		minSensibleTTL = time.Minute
+		minSensibleTTL = 2 * time.Minute
 		maxSensibleTTL = 24 * time.Hour
 	)
 	switch {

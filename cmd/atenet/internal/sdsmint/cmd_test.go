@@ -30,8 +30,10 @@ func TestValidateTTL(t *testing.T) {
 		{name: "the load-test value", ttl: 5 * time.Minute},
 		// The edges of validateTTL's accepted band, spelled out because the
 		// bounds are local to it. Both are inclusive.
-		{name: "at the band floor", ttl: time.Minute},
+		{name: "at the band floor", ttl: 2 * time.Minute},
 		{name: "at the band ceiling", ttl: 24 * time.Hour},
+		// Just under the floor, which the band used to accept.
+		{name: "one minute", ttl: time.Minute, wantErr: true},
 
 		// The whole point of the exercise: --leaf-cert-ttl=0 used to start a server
 		// that logged 0 and issued defaultTTL leaves.

@@ -18,13 +18,8 @@ import (
 	"log/slog"
 	"strconv"
 	"sync/atomic"
-	"time"
 
-	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	secretservice "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
-
-	"github.com/agent-substrate/substrate/cmd/atenet/internal/sdsmint/certauth"
 )
 
 // secretTypeURL is the xDS type URL for SDS resources.
@@ -42,13 +37,6 @@ type server struct {
 
 	minter *minter
 	log    *slog.Logger
-
-	// resourceTTL is the xDS TTL stamped on every resource this server sends:
-	// how long Envoy holds a secret before dropping it of its own accord. It is
-	// derived from the leaf lifetime rather than configured separately, so the
-	// two cannot be set into an order that does not work. See pack, which
-	// stamps it, for what Envoy does with it.
-	resourceTTL time.Duration
 
 	// nonce numbers the responses this server sends. Every xDS response needs
 	// one: the client echoes it back as response_nonce, which is what makes a
@@ -75,19 +63,9 @@ func newServer(m *minter, opts serverOptions) *server {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-
-	// Half the leaf lifetime. Envoy drops the secret when the TTL fires and the
-	// next handshake for that name re-subscribes, so a replacement is minted
-	// while the leaf it replaces is still valid. A TTL equal to the leaf
-	// lifetime would drop the secret at the moment the leaf died, leaving a
-	// window for a handshake to land on one already past its notAfter.
-	const refreshFraction = 2
-
 	return &server{
 		minter: m,
 		log:    opts.Logger,
-		// TODO(haiyanmeng): tune resourceTTL to be more efficient.
-		resourceTTL: m.ttl / refreshFraction,
 	}
 }
 
@@ -96,28 +74,4 @@ func newServer(m *minter, opts serverOptions) *server {
 // the empty nonce.
 func (s *server) nextNonce() string {
 	return strconv.FormatUint(s.nonce.Add(1), 10)
-}
-
-// inlineBytes wraps PEM bytes as an inline Envoy DataSource. Leaf material is
-// inlined rather than written to a path because it is per-connection and
-// short-lived; putting it on a filesystem would only widen exposure.
-func inlineBytes(b []byte) *corev3.DataSource {
-	return &corev3.DataSource{
-		Specifier: &corev3.DataSource_InlineBytes{InlineBytes: b},
-	}
-}
-
-// toSecret packs a minted cert into the Secret proto Envoy expects back. The
-// secret's name MUST equal the requested resource name (the SNI), or Envoy
-// will not match the response to its subscription.
-func toSecret(name string, c *certauth.MintedCert) *tlsv3.Secret {
-	return &tlsv3.Secret{
-		Name: name,
-		Type: &tlsv3.Secret_TlsCertificate{
-			TlsCertificate: &tlsv3.TlsCertificate{
-				CertificateChain: inlineBytes(c.CertChainPEM),
-				PrivateKey:       inlineBytes(c.PrivateKeyPEM),
-			},
-		},
-	}
 }

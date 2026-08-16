@@ -23,7 +23,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	secretservice "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -190,16 +193,17 @@ func (d *deltaStream) pack(name string, cert *certauth.MintedCert) (*discovery.R
 	// every mint looks like a new version to Envoy.
 	version := cert.Serial
 
+	// Measured against this leaf's own notAfter.
+	// --leaf-cert-ttl is refused below 2m, so the subtraction is positive on the
+	// ordinary path. The floor is for the clamp, where notAfter is the CA's and
+	// can be nearer than that.
+	ttl := max(time.Until(cert.NotAfter)-time.Minute, time.Second)
+
 	return &discovery.Resource{
 		Name:     name,
 		Version:  version,
 		Resource: body,
-		// Envoy starts a timer per resource when it receives one and drops the
-		// resource when that timer fires. The next handshake for the name
-		// finds nothing cached and re-subscribes, and this server mints again.
-		// Stamped on every response rather than the first, because a resource
-		// that arrives with no ttl has its timer cleared and is then held for good.
-		Ttl: durationpb.New(d.srv.resourceTTL),
+		Ttl:      durationpb.New(ttl),
 	}, nil
 }
 
@@ -211,6 +215,11 @@ func (d *deltaStream) send(ctx context.Context, resources []*discovery.Resource,
 		Nonce:            d.srv.nextNonce(),
 	}
 
+	// The ctx.Done arm is the only way out if sendLoop has already exited on a
+	// send failure while sendCh is full: nothing drains the channel after that,
+	// and the loop that would notice sendErr is this same goroutine, parked here.
+	// A bare channel send would block for the life of the process, since gRPC
+	// cannot interrupt a stuck handler.
 	select {
 	case d.sendCh <- resp:
 		return nil
@@ -241,5 +250,29 @@ func (d *deltaStream) sendLoop(ctx context.Context) {
 				return
 			}
 		}
+	}
+}
+
+// inlineBytes wraps PEM bytes as an inline Envoy DataSource. Leaf material is
+// inlined rather than written to a path because it is per-connection and
+// short-lived; putting it on a filesystem would only widen exposure.
+func inlineBytes(b []byte) *corev3.DataSource {
+	return &corev3.DataSource{
+		Specifier: &corev3.DataSource_InlineBytes{InlineBytes: b},
+	}
+}
+
+// toSecret packs a minted cert into the Secret proto Envoy expects back. The
+// secret's name MUST equal the requested resource name (the SNI), or Envoy
+// will not match the response to its subscription.
+func toSecret(name string, c *certauth.MintedCert) *tlsv3.Secret {
+	return &tlsv3.Secret{
+		Name: name,
+		Type: &tlsv3.Secret_TlsCertificate{
+			TlsCertificate: &tlsv3.TlsCertificate{
+				CertificateChain: inlineBytes(c.CertChainPEM),
+				PrivateKey:       inlineBytes(c.PrivateKeyPEM),
+			},
+		},
 	}
 }

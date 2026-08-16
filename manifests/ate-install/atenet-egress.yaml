@@ -521,9 +521,10 @@ spec:
         - "--ca-pool-path=/run/ca-state/mitm-pool.json"
         - "--ca-id=mitm"
         # --leaf-cert-ttl sets two things at once. It stamps the leaf's notAfter,
-        # and sdsmint derives the xDS resource TTL from it at half its length --
-        # so at 15m, Envoy drops each cached secret after 7m30s and the next
-        # handshake for that name re-mints. That drop is the only thing that
+        # and sdsmint derives the xDS resource TTL from that notAfter, a minute
+        # short of it -- so at 15m, Envoy drops each cached secret after 14m and
+        # the next handshake for that name re-mints, with a minute of the old
+        # leaf still valid to cover the gap. That drop is the only thing that
         # replaces a leaf: nothing pushes, and rotation and the idle sweep are
         # both gone. Cost follows traffic, since a name nobody asks for is
         # dropped and never minted again.
