@@ -108,10 +108,44 @@ jobs:
         E2E_TEMPLATE_NAME: counter-microvm
         E2E_TEMPLATE_READY_TIMEOUT: 600s
       run: hack/run-e2e-kind.sh ./internal/e2e/suites/demo -v -args --no-color
+    # The sdsmint egress gateway is a whole second manifest rather than an
+    # overlay, selected by --experimental-use-sdsmint. Swapping it in here, on
+    # the cluster the runs above already used, costs one Deployment rollout.
+    #
+    # Shrink the replicas of counter worker pool from 5 to 2 to reclaim 750m and 3Gi.
+    # Shrink it rather than delete it, because the sdsmint test creates its probe actor FROM
+    # ate-demo-counter/counter.
+    - name: Shrink the counter worker pool
+      if: matrix.ateapi-client-auth == 'cert'
+      run: |
+        kubectl --context kind-kind patch workerpool counter -n ate-demo-counter \
+          --type=merge -p '{"spec":{"replicas":2}}'
+        kubectl --context kind-kind wait --for=jsonpath='{.status.readyReplicas}'=2 \
+          workerpool/counter -n ate-demo-counter --timeout=120s
+    - name: Deploy the sdsmint egress gateway
+      if: matrix.ateapi-client-auth == 'cert'
+      run: hack/install-ate-kind.sh --deploy-atenet --experimental-use-sdsmint
+    - name: Run E2E tests (sdsmint egress)
+      if: matrix.ateapi-client-auth == 'cert'
+      env:
+        # Turns requireSdsmintDeployed's skip into a failure. Without it a
+        # broken deploy step above would leave the passthrough gateway running
+        # and this step would go green having tested nothing.
+        E2E_REQUIRE_SDSMINT: "1"
+      run: hack/run-e2e-kind.sh ./internal/e2e/suites/sdsmint -v -args --no-color
     - name: Dump diagnostics on failure
       if: failure()
       run: |
         kubectl --context kind-kind get actortemplate,workerpool,pods -A -o wide || true
+        echo "=== describe: node ==="
+        kubectl --context kind-kind describe node | tail -50 || true
+        kubectl --context kind-kind get pods -A \
+          --field-selector=status.phase!=Running,status.phase!=Succeeded \
+          -o 'custom-columns=:.metadata.namespace,:.metadata.name' --no-headers 2>/dev/null \
+          | while read -r ns name; do
+              echo "=== describe: $ns/$name ==="
+              kubectl --context kind-kind describe pod -n "$ns" "$name" 2>/dev/null | tail -40 || true
+            done
         dump() {
           echo "=== logs: $1/$2 ==="
           kubectl --context kind-kind logs -n "$1" "$2" --all-containers --tail=300 2>/dev/null || true

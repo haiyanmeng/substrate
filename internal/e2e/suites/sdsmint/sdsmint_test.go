@@ -115,6 +115,8 @@ const (
 func TestSdsmintMintsALeafPerSNI(t *testing.T) {
 	ctx := context.Background()
 
+	requireSdsmintDeployed(t, ctx)
+
 	root := mitmRootCertificate(t, ctx)
 	probe := sharedProbe(t, ctx)
 
@@ -260,6 +262,36 @@ func TestGatewayRefusesAnUnknownActor(t *testing.T) {
 	t.Logf("gateway denied the unknown actor at CONNECT as expected: %s", result.Error)
 }
 
+// requireSdsmintDeployed stops the test unless the gateway in the cluster is
+// the sdsmint variant.
+func requireSdsmintDeployed(t *testing.T, ctx context.Context) {
+	t.Helper()
+	// The native sidecar declared in
+	// manifests/ate-install/atenet-egress-with-sdsmint.yaml.
+	const (
+		egressDeployment = "atenet-egress"
+		sdsmintContainer = "sdsmint"
+	)
+
+	deployment, err := e2e.GetClients().K8s.AppsV1().Deployments(egressNamespace).Get(ctx, egressDeployment, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("reading deployment %s/%s: %v", egressNamespace, egressDeployment, err)
+	}
+	for _, container := range deployment.Spec.Template.Spec.InitContainers {
+		if container.Name == sdsmintContainer {
+			return
+		}
+	}
+
+	const requireEnv = "E2E_REQUIRE_SDSMINT"
+	reason := fmt.Sprintf("deployment %s/%s has no %q container, so the deployed gateway is the shipped passthrough build and there is no minter to test; redeploy with hack/install-ate.sh --deploy-atenet --experimental-use-sdsmint",
+		egressNamespace, egressDeployment, sdsmintContainer)
+	if os.Getenv(requireEnv) != "" {
+		t.Fatalf("%s (%s is set, so a missing minter is a failure rather than a skip)", reason, requireEnv)
+	}
+	t.Skip(reason)
+}
+
 // mitmRootCertificate reads the trust anchor sdsmint signs under, straight
 // from the secret the sidecar mounts, so the test is checking the chain against
 // the CA that is actually deployed rather than one it was told about.
@@ -403,11 +435,44 @@ func waitForProbeReady(t *testing.T, ctx context.Context, ns string) {
 		}
 		time.Sleep(2 * time.Second)
 	}
-	t.Fatalf("timed out after %v waiting for probe pod %s/%s to become ready: %s", timeout, ns, probeName, lastState)
+	t.Fatalf("timed out after %v waiting for probe pod %s/%s to become ready: %s\nrecent events for the pod:\n%s", timeout, ns, probeName, lastState, probeEvents(ctx, ns))
+}
+
+// probeEvents renders the recent events for the probe pod.
+//
+// The pod status says what state the pod is in; only the events say why. A pod
+// that never scheduled carries the scheduler's per-node verdict here and
+// nowhere else, and it has no logs for the CI diagnostics step to dump, so
+// without this a timeout arrives naming neither the cause nor whose fault it
+// is -- suite bug, or a cluster with no room left.
+func probeEvents(ctx context.Context, ns string) string {
+	events, err := e2e.GetClients().K8s.CoreV1().Events(ns).List(ctx, metav1.ListOptions{
+		FieldSelector: "involvedObject.kind=Pod,involvedObject.name=" + probeName,
+	})
+	if err != nil {
+		return fmt.Sprintf("  (reading events: %v)", err)
+	}
+	if len(events.Items) == 0 {
+		return "  (none, which is itself the finding: the scheduler never reached a verdict)"
+	}
+	var lines []string
+	for _, event := range events.Items {
+		lines = append(lines, fmt.Sprintf("  %s %s: %s", event.Type, event.Reason, strings.TrimSpace(event.Message)))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func describeProbeState(pod *corev1.Pod) string {
 	parts := []string{"phase=" + string(pod.Status.Phase)}
+	// An unscheduled pod has no container statuses at all, so reporting only
+	// those renders it as a bare "phase=Pending" -- indistinguishable from a pod
+	// that is scheduled and merely slow to pull. The scheduler's verdict is the
+	// one thing that tells those apart.
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodScheduled && cond.Status != corev1.ConditionTrue {
+			parts = append(parts, fmt.Sprintf("not scheduled: %s: %s", cond.Reason, strings.TrimSpace(cond.Message)))
+		}
+	}
 	for _, cs := range pod.Status.ContainerStatuses {
 		switch {
 		case cs.State.Waiting != nil:
