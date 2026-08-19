@@ -53,7 +53,10 @@ intercepted and carried over mTLS to a gateway that verifies who is making the r
 ## Components
 
 - **Egress app (`main.go`)** — the Actor: `POST /` with `{"url":"..."}` → fetches it → returns
-  status + body.
+  status + body. An optional `caPem` pins that one fetch to the CA it carries and nothing else,
+  which is what makes an `https://` URL testable against the MITM egress gateway: that gateway
+  mints a leaf per SNI off a cluster-local CA no actor has any reason to trust. See
+  `docs/dev/extprocd-testing.md` for how to extract it.
 - **Egress gateway** — `manifests/ate-install/atenet-egress.yaml`. One pod, two containers:
   an Envoy (`envoy`) and the atenet router ext_proc (`ext-proc`, `--mode=egress`), called over
   localhost. In egress mode the router serves the egress ext_proc handler only — no xDS server,
