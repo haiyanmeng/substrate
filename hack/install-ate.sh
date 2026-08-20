@@ -74,6 +74,9 @@ function usage() {
   echo "Experiments:"
   echo ""
   echo "  --experimental-use-sdsmint             Deploy the egress gateway with per-SNI certificate minting (experimental)"
+  echo "  --experimental-additional-egress-extproc-service NS/SVC:PORT"
+  echo "                                         Run an additional ext_proc authorization filter, served by that Service."
+  echo "                                         Requires --experimental-use-sdsmint. (experimental)"
   echo ""
   echo "Infrastructure components:"
   echo ""
@@ -264,6 +267,250 @@ atenet_egress_manifest() {
     echo "manifests/ate-install/atenet-egress-with-sdsmint.yaml"
   else
     echo "manifests/ate-install/atenet-egress.yaml"
+  fi
+}
+
+# The Envoy cluster the additional ext_proc filter dials.
+readonly ADDITIONAL_EGRESS_EXTPROC_CLUSTER="additional_egress_ext_proc"
+
+# additional_egress_extproc_endpoint validates
+# --experimental-additional-egress-extproc-service and echoes the DNS name to
+# dial, the port, and the name to verify the server certificate against,
+# space-separated.
+#
+# The last two differ, which is the point of returning both. Resolution uses
+# the fully qualified name so it does not depend on the pod's search list,
+# while the servicedns signer puts only <service>.<namespace>.svc in the leaf
+# (cmd/podcertcontroller/internal/servicednssigner). Validating the FQDN would
+# fail against every certificate that signer issues.
+#
+# Example input: ate-system/foo:50051
+# Example output: foo.ate-system.svc.cluster.local 50051 foo.ate-system.svc
+additional_egress_extproc_endpoint() {
+  local spec="$1"
+  local label='[a-z0-9]([-a-z0-9]*[a-z0-9])?'
+  if [[ ! "${spec}" =~ ^${label}/${label}:[0-9]+$ ]]; then
+    echo "Error: --experimental-additional-egress-extproc-service must be <namespace>/<service>:<port>, got '${spec}'" >&2
+    return 1
+  fi
+
+  local namespace="${spec%%/*}"
+  local rest="${spec#*/}"
+  local service="${rest%%:*}"
+  local port="${rest##*:}"
+  if (( port < 1 || port > 65535 )); then
+    echo "Error: --experimental-additional-egress-extproc-service port must be 1-65535, got '${port}'" >&2
+    return 1
+  fi
+
+  echo "${service}.${namespace}.svc.cluster.local ${port} ${service}.${namespace}.svc"
+}
+
+# render_atenet_egress_manifest writes the egress manifest to deploy on stdout.
+#
+# Without --experimental-additional-egress-extproc-service that is the file
+# atenet_egress_manifest chose, byte for byte. With it, the
+# #ATE_MITM_EXTPROC_FILTER and #ATE_MITM_EXTPROC_CLUSTER marker comments in
+# manifests/ate-install/atenet-egress-with-sdsmint.yaml are replaced by a
+# generated ext_proc filter -- one per filter chain in mitm_listener -- and the
+# cluster it dials.
+#
+# Marker comments rather than a Kustomize patch or a YAML tool for the same
+# reason the two variants are whole files: the thing being edited is Envoy's
+# bootstrap, which lives as one inline string inside a ConfigMap, so nothing
+# that understands Kubernetes YAML can reach into it. Markers keep the
+# insertion points visible in the manifest itself instead of encoding them as
+# line numbers or structural guesses in this script.
+render_atenet_egress_manifest() {
+  local manifest
+  manifest="$(atenet_egress_manifest)"
+
+  if [[ -z "${ATE_ADDITIONAL_EGRESS_EXTPROC_SERVICE:-}" ]]; then
+    cat "${manifest}"
+    return
+  fi
+
+  # Only the sdsmint manifest carries the markers. Refuse rather than apply an
+  # unpatched manifest: silently ignoring the flag would deploy a gateway with
+  # no additional checkpoint on it while the install reported success.
+  if [[ "${ATE_EXPERIMENTAL_USE_SDSMINT:-false}" != "true" ]]; then
+    echo "Error: --experimental-additional-egress-extproc-service requires --experimental-use-sdsmint" >&2
+    return 1
+  fi
+
+  local endpoint address port server_name
+  endpoint="$(additional_egress_extproc_endpoint "${ATE_ADDITIONAL_EGRESS_EXTPROC_SERVICE}")" || return 1
+  read -r address port server_name <<<"${endpoint}"
+
+  # Indented for its position under a filter chain's http_filters.
+  local filter_block
+  filter_block="$(cat <<EOF
+              # Added by hack/install-ate.sh
+              # --experimental-additional-egress-extproc-service=${ATE_ADDITIONAL_EGRESS_EXTPROC_SERVICE}.
+              - name: envoy.filters.http.ext_proc
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                  grpc_service:
+                    envoy_grpc:
+                      cluster_name: ${ADDITIONAL_EGRESS_EXTPROC_CLUSTER}
+                    timeout: 2s
+                  # Fail closed, like the CONNECT-leg filter. A checkpoint that
+                  # passes traffic when it is down is not a checkpoint.
+                  failure_mode_allow: false
+                  # Default is 200ms, which is tuned for the co-located sidecar
+                  # on the CONNECT leg. This processor is a Service somewhere
+                  # else in the cluster, and under failure_mode_allow: false a
+                  # message that lands late is a denied request rather than a
+                  # slow one.
+                  message_timeout: 2s
+                  # The actor's verified identity, which cannot travel as a
+                  # header on this leg: the actor writes the bytes inside its
+                  # own tunnel, so a self-identifying header here is an
+                  # assertion by the workload being policed. The CONNECT leg
+                  # publishes it with set_filter_state from the peer
+                  # certificate; empty means no certificate was presented, so
+                  # treat it as unidentified rather than as trusted. Must stay
+                  # subscripted -- bare filter_state yields the whole CEL map,
+                  # which flattens to the literal string "CelMap value". See
+                  # docs/dev/egress-identity-filter-state.md.
+                  request_attributes:
+                  - filter_state['ate.actor']
+                  processing_mode:
+                    request_header_mode: SEND
+                    response_header_mode: SKIP
+                    request_body_mode: NONE
+                    response_body_mode: NONE
+                    request_trailer_mode: SKIP
+                    response_trailer_mode: SKIP
+                  # This processor is operator-supplied, so it runs locked down.
+                  # Ordinary header mutation stays available -- that headroom is
+                  # what lets a processor inject a credential the actor never
+                  # held -- but rewriting :authority would send that credential
+                  # to a name the SNI was never policed for. disallow_is_error
+                  # turns the attempt into a failed request; the default is to
+                  # drop it silently, which looks to the processor like success.
+                  mutation_rules:
+                    disallow_system: true
+                    disallow_is_error: true
+EOF
+)"
+
+  # Indented for its position in static_resources.clusters.
+  local cluster_block
+  cluster_block="$(cat <<EOF
+      # Added by hack/install-ate.sh
+      # --experimental-additional-egress-extproc-service=${ATE_ADDITIONAL_EGRESS_EXTPROC_SERVICE}.
+      #
+      # STRICT_DNS, not the STATIC that ext_proc_server uses: that one is a
+      # sidecar on localhost, this one is a Service whose endpoints move.
+      - name: ${ADDITIONAL_EGRESS_EXTPROC_CLUSTER}
+        type: STRICT_DNS
+        lb_policy: ROUND_ROBIN
+        connect_timeout: 1s
+        # ext_proc is gRPC, so this leg has to be HTTP/2.
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            explicit_http_config:
+              http2_protocol_options: {}
+        # mTLS. The CONNECT-leg ext_proc is a sidecar on localhost and needs
+        # none; this one is a Service, so the decision to allow a request --
+        # and any credential the decision carries with it -- crosses the pod
+        # network. Without this, reaching :${port} would be enough to authorize
+        # egress, and answering on ${server_name} would be enough to decide it.
+        transport_socket:
+          name: envoy.transport_sockets.tls
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+            # The name in the certificate, not the name being resolved: the
+            # servicedns signer issues <service>.<namespace>.svc, while the
+            # endpoint above is fully qualified so resolution does not depend
+            # on the pod's search list. Leaving this unset would send the FQDN
+            # as SNI and validate against it, which no issued leaf matches.
+            sni: ${server_name}
+            common_tls_context:
+              # Pinned, because Envoy's default ceiling for an *upstream*
+              # context is TLS 1.2 -- only downstream defaults to 1.3 -- while
+              # extprocd, like every other Go server in this install, will not
+              # negotiate below 1.3. Left to the defaults the two never agree,
+              # and the handshake fails with TLSV1_ALERT_PROTOCOL_VERSION on a
+              # config where both ends name TLS 1.3.
+              tls_params:
+                tls_minimum_protocol_version: TLSv1_3
+                tls_maximum_protocol_version: TLSv1_3
+              # The gateway's own pod identity, the same credential its other
+              # client legs present. watched_directory because pod
+              # certificates rotate roughly daily and Envoy would otherwise
+              # hold the first one until the process restarts.
+              tls_certificates:
+              - certificate_chain: { filename: /run/podidentity.podcert.ate.dev/credential-bundle.pem }
+                private_key: { filename: /run/podidentity.podcert.ate.dev/credential-bundle.pem }
+                watched_directory: { path: /run/podidentity.podcert.ate.dev }
+              validation_context:
+                trusted_ca:
+                  filename: /run/servicedns.podcert.ate.dev/trust-bundle.pem
+                  watched_directory: { path: /run/servicedns.podcert.ate.dev }
+                # Chaining to the servicedns CA only proves the peer is some
+                # pod serving some Service. Pinning the name is what makes
+                # this the processor the operator asked for.
+                match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher:
+                    exact: ${server_name}
+        load_assignment:
+          cluster_name: ${ADDITIONAL_EGRESS_EXTPROC_CLUSTER}
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: ${address}
+                    port_value: ${port}
+EOF
+)"
+
+  # One per filter chain in mitm_listener. Hardcoded, and checked, because
+  # "every filter chain" is the security property this flag is for: a chain
+  # added to the manifest without a marker is a way around the checkpoint, and
+  # it should break the install rather than ship. Adding a chain means adding a
+  # marker and bumping this.
+  local expected_filter_markers=2
+
+  # Anchored to the start of the line so that prose mentioning a marker -- the
+  # mitm_listener comment in the manifest names both of them -- is not itself
+  # replaced by a config block.
+  awk -v filter="${filter_block}" -v cluster="${cluster_block}" \
+      -v want_filters="${expected_filter_markers}" '
+    /^[ \t]*#ATE_MITM_EXTPROC_FILTER/  { print filter;  filters++;  next }
+    /^[ \t]*#ATE_MITM_EXTPROC_CLUSTER/ { print cluster; clusters++; next }
+    { print }
+    END {
+      if (filters != want_filters || clusters != 1) {
+        printf("Error: expected %d #ATE_MITM_EXTPROC_FILTER and 1 #ATE_MITM_EXTPROC_CLUSTER marker in %s, found %d and %d\n",
+               want_filters, FILENAME, filters, clusters) > "/dev/stderr"
+        exit 1
+      }
+    }
+  ' "${manifest}"
+}
+
+# apply_atenet_egress deploys the egress gateway. Piped rather than applied by
+# path because render_atenet_egress_manifest may have patched it.
+apply_atenet_egress() {
+  local manifest
+  manifest="$(render_atenet_egress_manifest)" || exit 1
+
+  # Restart the atenet-egress Deployment if needed to pick up the latest version
+  # of the Envoy config.
+  local running=false
+  if run_kubectl -n ate-system get deployment/atenet-egress >/dev/null 2>&1; then
+    running=true
+  fi
+
+  echo "${manifest}" | run_ko apply -f -
+
+  if [[ "${running}" == "true" && -n "${ATE_ADDITIONAL_EGRESS_EXTPROC_SERVICE:-}" ]]; then
+    run_kubectl -n ate-system rollout restart deployment/atenet-egress
   fi
 }
 
@@ -628,7 +875,7 @@ deploy_ate_system() {
   # --experimental-use-sdsmint composes with every overlay instead of needing a
   # variant of each.
   ensure_egress_mitm_ca_pool_secret
-  run_ko apply -f "$(atenet_egress_manifest)"
+  apply_atenet_egress
 
   log_step "Waiting for ATE system components to be ready..."
   case "$(store_backend)" in
@@ -726,7 +973,7 @@ deploy_atenet() {
   echo "${router_manifest}" | run_kubectl apply -f -
 
   ensure_egress_mitm_ca_pool_secret
-  run_ko apply -f "$(atenet_egress_manifest)"
+  apply_atenet_egress
   run_ko apply -f manifests/ate-install/atenet-dns.yaml
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
   run_kubectl rollout status deployment/atenet-egress -n ate-system --timeout=120s
@@ -938,6 +1185,16 @@ for ((i = 0; i < ${#prescan_args[@]}; i++)); do
       ATE_ATENET_ROUTER="${prescan_args[$((i + 1))]}"
       ;;
     --experimental-use-sdsmint) ATE_EXPERIMENTAL_USE_SDSMINT=true ;;
+    --experimental-additional-egress-extproc-service=*)
+      ATE_ADDITIONAL_EGRESS_EXTPROC_SERVICE="${prescan_args[i]#*=}"
+      ;;
+    --experimental-additional-egress-extproc-service)
+      if (( i + 1 >= ${#prescan_args[@]} )); then
+        echo "Error: --experimental-additional-egress-extproc-service requires <namespace>/<service>:<port>" >&2
+        exit 1
+      fi
+      ATE_ADDITIONAL_EGRESS_EXTPROC_SERVICE="${prescan_args[$((i + 1))]}"
+      ;;
     --store-backend=*) ATE_INSTALL_STORE_BACKEND="${prescan_args[i]#*=}" ;;
     --store-backend)
       if (( i + 1 >= ${#prescan_args[@]} )); then
@@ -1020,6 +1277,8 @@ while [[ "$#" -gt 0 ]]; do
     # Captured in the pre-scan above; matched here only so the `*)` branch does
     # not reject it as an unknown option.
     --experimental-use-sdsmint) ;;
+    --experimental-additional-egress-extproc-service) shift ;;
+    --experimental-additional-egress-extproc-service=*) ;;
     --store-backend=*) ATE_INSTALL_STORE_BACKEND="${1#*=}" ;;
     --store-backend)
       shift

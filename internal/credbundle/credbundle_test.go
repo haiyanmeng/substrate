@@ -380,3 +380,61 @@ func rotateProjectedBundle(path string, bundle []byte) error {
 	}
 	return nil
 }
+
+func TestParseTrustBundle(t *testing.T) {
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: generateCertificate(t, 1)})
+	path := writeBundle(t, pemBytes)
+
+	if _, err := ParseTrustBundle(path); err != nil {
+		t.Fatalf("ParseTrustBundle() error = %v", err)
+	}
+
+	// An empty pool would reject every client rather than accept every client,
+	// but it would do so one handshake at a time and look like a peer problem.
+	if _, err := ParseTrustBundle(writeBundle(t, []byte("not a certificate"))); err == nil {
+		t.Error("ParseTrustBundle() = nil error for a bundle with no certificates")
+	}
+	if _, err := ParseTrustBundle(t.TempDir() + "/absent.pem"); err == nil {
+		t.Error("ParseTrustBundle() = nil error for a missing file")
+	}
+}
+
+func TestTrustBundleLoaderRereadsOnChange(t *testing.T) {
+	first := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: generateCertificate(t, 1)})
+	path := writeBundle(t, first)
+
+	load := TrustBundleLoader(path)
+	pool, err := load()
+	if err != nil {
+		t.Fatalf("load() error = %v", err)
+	}
+	if got := len(pool.Subjects()); got != 1 { //nolint:staticcheck // Subjects is the only way to count a pool.
+		t.Fatalf("pool has %d subjects, want 1", got)
+	}
+
+	// Same content, so the cache must serve the same pool rather than reparse.
+	again, err := load()
+	if err != nil {
+		t.Fatalf("load() error = %v", err)
+	}
+	if again != pool {
+		t.Error("load() reparsed an unchanged trust bundle")
+	}
+
+	second := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: generateCertificate(t, 2)})
+	if err := os.WriteFile(path, append(first, second...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().Add(time.Minute)
+	if err := os.Chtimes(path, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+
+	rotated, err := load()
+	if err != nil {
+		t.Fatalf("load() error = %v", err)
+	}
+	if got := len(rotated.Subjects()); got != 2 { //nolint:staticcheck // Subjects is the only way to count a pool.
+		t.Errorf("pool has %d subjects after rotation, want 2", got)
+	}
+}

@@ -17,6 +17,8 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,6 +38,18 @@ const (
 
 type fetchRequest struct {
 	URL string `json:"url"`
+
+	// CAPem, when set, is the only root this fetch will accept. It exists for
+	// the MITM egress gateway: that gateway mints a leaf per SNI off a
+	// cluster-local CA, and nothing distributes that CA into actor sandboxes,
+	// so an ordinary HTTPS fetch fails verification and never becomes a
+	// request the gateway can police. Passing the CA here is what lets an
+	// https:// URL be tested end to end.
+	//
+	// Deliberately not an "insecure, skip verification" switch. Pinning proves
+	// the leaf chained to the CA it was supposed to; skipping proves nothing,
+	// and a demo is where people copy their habits from.
+	CAPem string `json:"caPem,omitempty"`
 }
 
 type fetchResponse struct {
@@ -79,6 +93,16 @@ func newHandler(client *http.Client) http.Handler {
 			return
 		}
 
+		fetcher := client
+		if input.CAPem != "" {
+			pinned, err := clientPinnedTo(client, input.CAPem)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, fetchResponse{Error: err.Error()})
+				return
+			}
+			fetcher = pinned
+		}
+
 		outbound, err := http.NewRequestWithContext(r.Context(), http.MethodGet, input.URL, nil)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, fetchResponse{Error: fmt.Sprintf("invalid URL: %v", err)})
@@ -87,7 +111,7 @@ func newHandler(client *http.Client) http.Handler {
 		if traceparent := r.Header.Get("traceparent"); traceparent != "" {
 			outbound.Header.Set("traceparent", traceparent)
 		}
-		response, err := client.Do(outbound)
+		response, err := fetcher.Do(outbound)
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, fetchResponse{Error: fmt.Sprintf("request failed: %v", err)})
 			return
@@ -102,6 +126,25 @@ func newHandler(client *http.Client) http.Handler {
 		writeJSON(w, response.StatusCode, fetchResponse{StatusCode: response.StatusCode, Body: string(body)})
 	})
 	return mux
+}
+
+// clientPinnedTo returns a client that accepts caPEM and nothing else, keeping
+// the base client's timeout. The system roots are dropped rather than added to
+// on purpose: against the MITM gateway the only certificate a fetch should ever
+// see is one that gateway minted, so a request that succeeds here could not
+// have bypassed it.
+//
+// A fresh transport per request, so no connection is reused across two
+// different pins. That costs a handshake per fetch, which is the right trade
+// for a demo and the wrong one for anything hot.
+func clientPinnedTo(base *http.Client, caPEM string) (*http.Client, error) {
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM([]byte(caPEM)) {
+		return nil, fmt.Errorf("caPem contained no PEM certificate")
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+	return &http.Client{Timeout: base.Timeout, Transport: transport}, nil
 }
 
 func validateURL(raw string) error {

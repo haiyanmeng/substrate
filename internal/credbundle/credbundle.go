@@ -53,6 +53,74 @@ func ClientLoader(path string) func(*tls.CertificateRequestInfo) (*tls.Certifica
 	}
 }
 
+// TrustBundleLoader reads a PEM trust bundle, as written by a projected
+// clusterTrustBundle source, and returns a function yielding the parsed pool.
+//
+// The counterpart to Loader for the other half of an mTLS config: Loader keeps
+// the leaf fresh, this keeps the set of CAs that leaf is verified against
+// fresh. Reading the bundle once at startup instead is a latent outage --
+// nothing fails at the moment a CA is rotated, and then every handshake starts
+// failing whenever the process next restarts or the old CA leaves the bundle,
+// which for a fail-closed checkpoint means denied traffic rather than degraded
+// traffic.
+//
+// Cached on the same stat comparison as Loader, so a bundle that has not
+// changed is not re-parsed per handshake. Wire it into tls.Config through
+// GetConfigForClient, since ClientCAs is read once when the config is built.
+func TrustBundleLoader(path string) func() (*x509.CertPool, error) {
+	c := &poolCache{path: path}
+	return c.get
+}
+
+// poolCache is certCache for a trust bundle. Kept separate rather than
+// generalized: the two parse different file shapes into unrelated types, and
+// the shared part is the six-line stat comparison.
+type poolCache struct {
+	path string
+
+	mu   sync.Mutex
+	fi   os.FileInfo
+	pool *x509.CertPool
+}
+
+func (c *poolCache) get() (*x509.CertPool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	fi, err := os.Stat(c.path)
+	if err != nil {
+		return nil, fmt.Errorf("while getting file info for trust bundle %q: %w", c.path, err)
+	}
+	if c.pool != nil && os.SameFile(c.fi, fi) && fi.ModTime().Equal(c.fi.ModTime()) && fi.Size() == c.fi.Size() {
+		return c.pool, nil
+	}
+
+	pool, err := ParseTrustBundle(c.path)
+	if err != nil {
+		return nil, err
+	}
+	c.fi, c.pool = fi, pool
+	return pool, nil
+}
+
+// ParseTrustBundle reads a PEM trust bundle into a pool.
+//
+// An empty or certificate-free file is an error rather than an empty pool. An
+// empty pool verifies nothing, so as the ClientCAs of a server requiring client
+// certificates it rejects every peer -- a failure worth reporting where it is
+// caused rather than one handshake later.
+func ParseTrustBundle(path string) (*x509.CertPool, error) {
+	pemBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("while reading trust bundle: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("no CA certificates found in trust bundle %q", path)
+	}
+	return pool, nil
+}
+
 // certCache holds the parse of a credential bundle file together with the stat
 // of the file it was parsed from, so unchanged files are not re-parsed on
 // every TLS handshake.
