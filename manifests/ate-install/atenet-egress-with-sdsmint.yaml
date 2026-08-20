@@ -143,19 +143,10 @@ data:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config
                   on_request_headers:
                   - object_key: ate.actor
-                    # What makes the object a StringAccessor. Left unset it
-                    # defaults to object_key, and Envoy looks for a registered
-                    # factory by that name.
                     factory_key: envoy.string
-                    # One internal hop -- this listener's upstream IS
-                    # mitm_listener -- so ONCE is enough. It also takes the
-                    # internal_upstream transport socket on mitm_internal below
-                    # to land on that listener's downstream connection.
                     shared_with_upstream: ONCE
                     # Nothing downstream may overwrite an authenticated identity.
                     read_only: true
-                    # No object at all beats an empty one: a reader can tell
-                    # "absent" from "present and blank".
                     skip_if_empty: true
                     format_string:
                       text_format_source:
@@ -219,16 +210,7 @@ data:
       # list a matching #ATE_MITM_EXTPROC_CLUSTER. They are inert comments until
       # hack/install-ate.sh is run with
       # --experimental-additional-egress-extproc-service, which replaces each
-      # with a generated block; see render_atenet_egress_manifest there. Both
-      # chains, not one: an operator's policy that ran only on the TLS chain
-      # would be bypassed by any actor that spoke cleartext, which is a choice
-      # the actor makes.
-      #
-      # The filter is spliced in ahead of dynamic_forward_proxy so a denial
-      # costs no DNS resolution, and because this is the first point on the
-      # egress path where the hostname, method, and path exist in the clear at
-      # all -- the CONNECT leg sees only the IP:port atunnel took from
-      # SO_ORIGINAL_DST.
+      # with a generated block; see render_atenet_egress_manifest there.
       # ---------------------------------------------------------------------
       - name: mitm_listener
         stat_prefix: mitm
@@ -259,12 +241,6 @@ data:
                     json_format:
                       leg: mitm
                       time: "%START_TIME%"
-                      # The identity set on the CONNECT leg. "-" here means it
-                      # did not arrive: either the actor presented no
-                      # certificate, or set_filter_state / internal_upstream is
-                      # missing. Those two present identically, so this is the
-                      # first place to look before trusting anything that reads
-                      # filter_state['ate.actor'].
                       actor: "%FILTER_STATE(ate.actor:PLAIN)%"
                       sni: "%REQUESTED_SERVER_NAME%"
                       authority: "%REQ(:AUTHORITY)%"
@@ -353,9 +329,6 @@ data:
                     json_format:
                       leg: cleartext
                       time: "%START_TIME%"
-                      # Same object as the TLS chain: filter state is
-                      # connection-level and both chains sit behind
-                      # mitm_internal.
                       actor: "%FILTER_STATE(ate.actor:PLAIN)%"
                       authority: "%REQ(:AUTHORITY)%"
                       method: "%REQ(:METHOD)%"
