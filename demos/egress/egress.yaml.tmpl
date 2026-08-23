@@ -38,10 +38,40 @@ metadata:
   name: egress
   namespace: ate-demo-egress
 spec:
+  # Requires an sdsmint install (--experimental-use-sdsmint): only that path
+  # creates the egress-mitm-ca-pool Secret the bundle is derived from, and an
+  # actor referencing a bundle that does not resolve fails to start.
+  volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+      # The trust anchors for the per-SNI leaves the MITM egress gateway mints.
+      # Only allowlisted bundle names resolve; this is the one supported today.
+      - trustBundle:
+          name: egress-mitm.ate.dev
+          path: trust-bundle.pem
   containers:
   - name: egress
     image: ko://github.com/agent-substrate/substrate/demos/egress
     command: ["/ko-app/egress"]
+    # The demo fetches with a stock net/http client, so its roots come from
+    # crypto/x509's system pool — which on Unix reads both of these.
+    #
+    # SSL_CERT_FILE alone is not enough to make the projected bundle the whole
+    # story: it replaces the default cert FILE list, but the default cert
+    # DIRECTORY list is still scanned, and the base image keeps its public
+    # roots in /etc/ssl/certs. Pointing SSL_CERT_DIR at the projection too
+    # makes the anchor set exactly the gateway CA, so a successful HTTPS fetch
+    # proves the projected bundle validated the minted leaf. Under sdsmint the
+    # public roots are useless anyway: every origin is fronted by the gateway.
+    env:
+    - name: SSL_CERT_FILE
+      value: /run/ate/trust-bundle.pem
+    - name: SSL_CERT_DIR
+      value: /run/ate
+    volumeMounts:
+    - name: system-info
+      mountPath: /run/ate   # the bundle lands at /run/ate/trust-bundle.pem
     readyz:
       httpGet:
         path: /readyz
