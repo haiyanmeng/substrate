@@ -54,12 +54,70 @@ spec:
   workerSelector:
     matchLabels:
       workload: sandbox
+  # Requires an sdsmint install (--experimental-use-sdsmint): only that path
+  # creates the egress-mitm-ca-pool Secret the bundle is derived from, and an
+  # actor referencing a bundle that does not resolve fails to start.
+  volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+      # The trust anchors for the per-SNI leaves the MITM egress gateway mints.
+      # Only allowlisted bundle names resolve; this is the one supported today.
+      - trustBundle:
+          name: egress-mitm.ate.dev
+          path: trust-bundle.pem
   containers:
   - name: sandbox
     image: ko://github.com/agent-substrate/substrate/demos/sandbox
     env:
     - name: PORT
       value: "80"
+    # The sandbox server runs client-supplied commands, and os/exec passes this
+    # environment on to every one of them — both when cmd.Env is left nil and
+    # when handleProcess rebuilds it from os.Environ(). So these two reach the
+    # tools an operator actually reaches for, not just the server itself.
+    #
+    # SSL_CERT_FILE alone is not enough to make the projected bundle the whole
+    # story: it replaces the default cert FILE list, but the default cert
+    # DIRECTORY list is still scanned, and the base image keeps its public
+    # roots in /etc/ssl/certs. Pointing SSL_CERT_DIR at the projection too
+    # makes the anchor set exactly the gateway CA. Under sdsmint the public
+    # roots are useless anyway: every origin is fronted by the gateway.
+    #
+    # This covers the OpenSSL and Go consumers, which on the alpine base is the
+    # majority of them: curl, python's stdlib ssl, and -- verified against the
+    # image, because both are usually assumed to be unreachable this way --
+    # apk-tools 3.x and busybox wget, whose ssl_client helper calls
+    # SSL_CTX_set_default_verify_paths. apk matters most: its repositories are
+    # https, so without this the first `apk add` in a sandbox fails with
+    # "TLS: server certificate not trusted".
+    - name: SSL_CERT_FILE
+      value: /run/ate/trust-bundle.pem
+    - name: SSL_CERT_DIR
+      value: /run/ate
+    # The exceptions, each of which reaches past the OpenSSL defaults to a store
+    # of its own and so needs naming individually.
+    #
+    # git sets CURLOPT_CAINFO from its own config before libcurl consults the
+    # environment, so it ignores both variables above -- a clone succeeds with
+    # SSL_CERT_FILE and SSL_CERT_DIR pointed at empty anchors, which is what
+    # makes this one easy to miss.
+    - name: GIT_SSL_CAINFO          # git over https
+      value: /run/ate/trust-bundle.pem
+    # Node compiles its root store into the binary. Note this one appends rather
+    # than replaces, so Node keeps trusting the public roots as well; harmless
+    # here, since under sdsmint no origin presents a publicly-rooted leaf.
+    - name: NODE_EXTRA_CA_CERTS     # Node.js
+      value: /run/ate/trust-bundle.pem
+    # requests defaults to certifi rather than the system store. Unlike the
+    # others this fails closed on a bad path -- a missing file makes every
+    # request raise OSError rather than fall back -- so it has to track the
+    # mountPath below.
+    - name: REQUESTS_CA_BUNDLE      # Python requests
+      value: /run/ate/trust-bundle.pem
+    volumeMounts:
+    - name: system-info
+      mountPath: /run/ate   # the bundle lands at /run/ate/trust-bundle.pem
   # Sandbox size: an actor occupies its whole worker, so size it at (or below)
   # the pool's per-worker capacity above. ateom writes these to the OCI spec
   # (cgroup CPU quota + memory limit) — see internal/sizing.
