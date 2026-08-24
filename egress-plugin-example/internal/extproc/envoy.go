@@ -15,7 +15,7 @@
 // This file is the wire side of the checkpoint: it turns a CalloutResult into
 // the ProcessingResponse Envoy expects.
 
-package inner
+package extproc
 
 import (
 	"context"
@@ -25,11 +25,13 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+
+	"github.com/agent-substrate/substrate/egress-plugin-example/policy"
 )
 
 // allowResponse passes the request upstream, carrying whatever credentials the
 // decision asked to inject.
-func allowResponse(ctx context.Context, decision CalloutResult) *extprocv3.ProcessingResponse {
+func allowResponse(ctx context.Context, decision policy.CalloutResult) *extprocv3.ProcessingResponse {
 	common := &extprocv3.CommonResponse{}
 
 	var setHeaders []*corev3.HeaderValueOption

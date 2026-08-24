@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package inner implements the ext_proc server.
-package inner
+// Package extproc is the ext_proc glue between Envoy and a policy.
+//
+// It speaks the wire protocol, projects each message onto a policy.Request,
+// renders the decision back into a ProcessingResponse, and logs what was
+// decided. It holds no policy of its own and should not need editing to ship
+// one -- that is the egress-plugin-example/policy package.
+package extproc
 
 import (
 	"context"
@@ -24,22 +29,9 @@ import (
 
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/agent-substrate/substrate/egress-plugin-example/policy"
 )
-
-// Policy decides whether one tunneled request may leave. This is the one place
-// egress policy lives; everything around it is plumbing.
-//
-// An interface rather than a method on Server so that policy can be developed,
-// tested, and swapped without touching the ext_proc plumbing.
-type Policy interface {
-	Evaluate(ctx context.Context, req *Request) CalloutResult
-}
-
-// AllowAll permits every request.
-type AllowAll struct{}
-
-// Evaluate permits the request.
-func (AllowAll) Evaluate(_ context.Context, _ *Request) CalloutResult { return Allow() }
 
 // denyAll refuses every request. It is not exported, because it exists for one
 // caller: NewServer, when handed no policy at all. A server wired up wrong
@@ -48,25 +40,25 @@ func (AllowAll) Evaluate(_ context.Context, _ *Request) CalloutResult { return A
 type denyAll struct{}
 
 // Evaluate refuses the request.
-func (denyAll) Evaluate(_ context.Context, _ *Request) CalloutResult {
-	return Deny("extproc was started without a policy")
+func (denyAll) Evaluate(_ context.Context, _ *policy.Request) policy.CalloutResult {
+	return policy.Deny("extproc was started without a policy")
 }
 
 // Server is the ext_proc gRPC service extproc serves to the egress gateway's
 // mitm_listener.
 type Server struct {
-	policy Policy
+	policy policy.Policy
 }
 
 // NewServer builds the service around a policy. A nil policy denies
 // everything, so a wiring mistake shows up as refused egress rather than as
-// unpoliced egress; pass AllowAll{} to mean it.
-func NewServer(policy Policy) *Server {
-	if policy == nil {
+// unpoliced egress; pass policy.AllowAll{} to mean it.
+func NewServer(p policy.Policy) *Server {
+	if p == nil {
 		slog.Error("extproc started with no policy; denying all egress")
-		policy = denyAll{}
+		p = denyAll{}
 	}
-	return &Server{policy: policy}
+	return &Server{policy: p}
 }
 
 // Process implements the ExternalProcessor service.
@@ -130,7 +122,7 @@ func (s *Server) authorize(ctx context.Context, attr map[string]*structpb.Struct
 
 	decision := s.policy.Evaluate(ctx, req)
 
-	if decision.Action == CalloutDeny {
+	if decision.Action == policy.CalloutDeny {
 		// Info level, unlike the allow path: a denial is the case someone has
 		// to explain afterwards, and the header set is most of the explanation.
 		// This is the one log line here whose volume tracks misbehavior rather

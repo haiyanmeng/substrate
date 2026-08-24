@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package inner
+package extproc
 
 import (
 	"bytes"
@@ -29,6 +29,8 @@ import (
 	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/agent-substrate/substrate/egress-plugin-example/policy"
 )
 
 // fakeStream plays Envoy: it hands the server a fixed list of messages, then
@@ -80,7 +82,7 @@ func rawHeaders(pairs map[string]string) *extprocv3.ProcessingRequest {
 func process(t *testing.T, req *extprocv3.ProcessingRequest) *extprocv3.ProcessingResponse {
 	t.Helper()
 	stream := &fakeStream{incoming: []*extprocv3.ProcessingRequest{req}}
-	if err := NewServer(AllowAll{}).Process(stream); err != nil {
+	if err := NewServer(policy.AllowAll{}).Process(stream); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
 	if len(stream.sent) != 1 {
@@ -118,7 +120,7 @@ func mutationOf(t *testing.T, resp *extprocv3.ProcessingResponse) *extprocv3.Hea
 
 func TestAllowResponseInjectsTheCredential(t *testing.T) {
 	resp := allowResponse(t.Context(),
-		AllowWithCredential("authorization", "Bearer s3cret"))
+		policy.AllowWithCredential("authorization", "Bearer s3cret"))
 
 	mutation := mutationOf(t, resp)
 	if len(mutation.GetSetHeaders()) != 1 {
@@ -145,7 +147,7 @@ func TestAllowResponseInjectsTheCredential(t *testing.T) {
 // silently, so a policy that tried would look like it worked.
 func TestAllowResponseRefusesPseudoHeaderInjection(t *testing.T) {
 	resp := allowResponse(t.Context(),
-		AllowWithCredential(":authority", "attacker.example.com"))
+		policy.AllowWithCredential(":authority", "attacker.example.com"))
 
 	if mutation := mutationOf(t, resp); mutation != nil {
 		t.Errorf("allow carried a pseudo-header mutation: %v", mutation)
@@ -157,9 +159,9 @@ func TestAllowResponseRefusesPseudoHeaderInjection(t *testing.T) {
 // asked for: a partial injection reads upstream as a bad credential rather
 // than as a gateway that dropped one.
 func TestAllowResponseInjectsEveryCredential(t *testing.T) {
-	resp := allowResponse(t.Context(), AllowWithCredentials(
-		CredentialHeader{Key: "authorization", Value: "Bearer s3cret"},
-		CredentialHeader{Key: "x-api-key", Value: "k3y"},
+	resp := allowResponse(t.Context(), policy.AllowWithCredentials(
+		policy.CredentialHeader{Key: "authorization", Value: "Bearer s3cret"},
+		policy.CredentialHeader{Key: "x-api-key", Value: "k3y"},
 	))
 
 	var got []string
@@ -177,9 +179,9 @@ func TestAllowResponseInjectsEveryCredential(t *testing.T) {
 // request with no credential at all, which fails upstream in a way that points
 // nowhere near the policy that caused it.
 func TestAllowResponseDropsOnlyThePseudoHeader(t *testing.T) {
-	resp := allowResponse(t.Context(), AllowWithCredentials(
-		CredentialHeader{Key: ":authority", Value: "attacker.example.com"},
-		CredentialHeader{Key: "authorization", Value: "Bearer s3cret"},
+	resp := allowResponse(t.Context(), policy.AllowWithCredentials(
+		policy.CredentialHeader{Key: ":authority", Value: "attacker.example.com"},
+		policy.CredentialHeader{Key: "authorization", Value: "Bearer s3cret"},
 	))
 
 	setHeaders := mutationOf(t, resp).GetSetHeaders()
@@ -193,7 +195,7 @@ func TestAllowResponseDropsOnlyThePseudoHeader(t *testing.T) {
 
 // The shipped policy injects nothing.
 func TestAllowResponseWithoutACredential(t *testing.T) {
-	resp := allowResponse(t.Context(), Allow())
+	resp := allowResponse(t.Context(), policy.Allow())
 
 	if mutation := mutationOf(t, resp); mutation != nil {
 		t.Errorf("allow without a credential carried a mutation: %v", mutation)
@@ -203,10 +205,10 @@ func TestAllowResponseWithoutACredential(t *testing.T) {
 // Two values for one header cannot both be injected: Envoy applies the
 // OVERWRITEs in order and the last one stands.
 func TestAllowResponseKeepsTheLastOfDuplicateCredentials(t *testing.T) {
-	resp := allowResponse(t.Context(), AllowWithCredentials(
-		CredentialHeader{Key: "authorization", Value: "Bearer stale"},
+	resp := allowResponse(t.Context(), policy.AllowWithCredentials(
+		policy.CredentialHeader{Key: "authorization", Value: "Bearer stale"},
 		// Different case, same header: HTTP header names are case-insensitive.
-		CredentialHeader{Key: "Authorization", Value: "Bearer fresh"},
+		policy.CredentialHeader{Key: "Authorization", Value: "Bearer fresh"},
 	))
 
 	setHeaders := mutationOf(t, resp).GetSetHeaders()
@@ -215,25 +217,6 @@ func TestAllowResponseKeepsTheLastOfDuplicateCredentials(t *testing.T) {
 	}
 	if got := string(setHeaders[0].GetHeader().GetRawValue()); got != "Bearer fresh" {
 		t.Errorf("injected %q, want the last value the policy asked for", got)
-	}
-}
-
-// Deny has to set the action and not just the reason.
-func TestDenySetsTheAction(t *testing.T) {
-	if got := Deny("not permitted").Action; got != CalloutDeny {
-		t.Errorf("Deny action = %q, want %q", got, CalloutDeny)
-	}
-}
-
-// The zero CalloutResult must not be an allow. A policy that returns an unset
-// result, or one built by a caller who forgot the field, has to fail closed --
-// the alternative is a decision nobody made that passes traffic.
-func TestZeroCalloutResultIsNotAnAllow(t *testing.T) {
-	if (CalloutResult{}).Action == CalloutAllow {
-		t.Error("the zero CalloutResult allows, want it to read as a denial")
-	}
-	if got := Allow().Action; got != CalloutAllow {
-		t.Errorf("Allow action = %q, want %q", got, CalloutAllow)
 	}
 }
 
@@ -258,39 +241,6 @@ func TestDenyResponse(t *testing.T) {
 
 	if body := string(immediate.ImmediateResponse.GetBody()); body != denyBody {
 		t.Errorf("deny body = %q, want the fixed body %q", body, denyBody)
-	}
-}
-
-// Host is the form a hostname policy is meant to match on, so its
-// normalization is the thing standing between a policy and its cheapest
-// bypasses. Each case below is one of them.
-func TestRequestHostNormalizes(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		authority string
-		want      string
-	}{
-		{"already normal", "blocked.example.com", "blocked.example.com"},
-		// DNS names are case-insensitive, so a policy comparing the authority
-		// verbatim is bypassed by shifting the case of a single letter.
-		{"uppercase", "BLOCKED.Example.COM", "blocked.example.com"},
-		// The authority may carry a port, and a policy keyed on the full
-		// authority would miss every non-default one.
-		{"with port", "blocked.example.com:8443", "blocked.example.com"},
-		// A trailing dot is a legal absolute form of the same name.
-		{"trailing dot", "blocked.example.com.", "blocked.example.com"},
-		{"port and case and dot", "Blocked.Example.COM.:8443", "blocked.example.com"},
-		// Subdomains and parents are different names and must stay distinct: a
-		// Host that collapsed either one would silently widen every policy
-		// written against it.
-		{"subdomain stays distinct", "sub.blocked.example.com", "sub.blocked.example.com"},
-		{"parent stays distinct", "example.com", "example.com"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := (&Request{Authority: tc.authority}).Host(); got != tc.want {
-				t.Errorf("Request{Authority: %q}.Host() = %q, want %q", tc.authority, got, tc.want)
-			}
-		})
 	}
 }
 
@@ -411,7 +361,7 @@ func TestProcessAnswersEachMessageKindInKind(t *testing.T) {
 // without a response is the fail-closed outcome: Envoy reports it as a 500.
 func TestProcessRefusesAnUnknownMessageKind(t *testing.T) {
 	stream := &fakeStream{incoming: []*extprocv3.ProcessingRequest{{}}}
-	if err := NewServer(AllowAll{}).Process(stream); err == nil {
+	if err := NewServer(policy.AllowAll{}).Process(stream); err == nil {
 		t.Fatal("Process accepted a ProcessingRequest with no message set, want an error")
 	}
 	if len(stream.sent) != 0 {
@@ -424,7 +374,7 @@ func TestProcessHandlesMultipleMessagesAndEOF(t *testing.T) {
 		rawHeaders(map[string]string{":authority": "a.example.com"}),
 		rawHeaders(map[string]string{":authority": "b.example.com"}),
 	}}
-	if err := NewServer(AllowAll{}).Process(stream); err != nil {
+	if err := NewServer(policy.AllowAll{}).Process(stream); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
 	if len(stream.sent) != 2 {
@@ -437,7 +387,7 @@ func typeName(v any) string {
 }
 
 // The split parts and the header dump have to reach the log, which is the
-// only place they are observable while AllowAll ignores them.
+// only place they are observable while policy.AllowAll ignores them.
 func TestAuthorizeLogsTheSplitActorAndHeaders(t *testing.T) {
 	const uri = "spiffe://substrate-actor.local/atespace/demo/actor/egress-demo"
 
@@ -457,7 +407,7 @@ func TestAuthorizeLogsTheSplitActorAndHeaders(t *testing.T) {
 		"authorization": "Bearer super-secret-token",
 	}).GetRequestHeaders()
 
-	NewServer(AllowAll{}).authorize(context.Background(), attrs, headers)
+	NewServer(policy.AllowAll{}).authorize(context.Background(), attrs, headers)
 
 	logged := buf.String()
 	for _, want := range []string{

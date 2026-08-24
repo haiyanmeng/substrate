@@ -4,6 +4,21 @@
 custom logic into the egress traffic path such as custom authorization,
 credential injection, custom telemetry.
 
+## Where your code goes
+
+`policy/` is the part you are meant to change. A policy is a function from a
+`policy.Request` to a `policy.CalloutResult`; nothing in the package imports
+Envoy, so a policy can be written and tested without a gateway, a cluster, or a
+protobuf. `AllowAll` in `policy/policy.go` is the one shipped here.
+
+`internal/extproc/` is the glue that speaks ext_proc to Envoy: it projects a
+`ProcessingRequest` into a `policy.Request`, calls the policy, and turns the
+result back into header mutations or an immediate denial. It is `internal` on
+purpose — shipping your own policy should not require editing it.
+
+To ship one: implement `policy.Policy`, and pass it to `extproc.NewServer` in
+`main.go` in place of `policy.AllowAll{}`.
+
 ## Unit tests
 
 ```bash
@@ -50,9 +65,61 @@ needs to be restarted to pick up new podCertificates and clusterTrustBundles for
 kubectl rollout restart deployment egress-plugin -n nous-dev
 ```
 
-## Step 3: Send egress traffic from an actor
+## Step 3: Make your actors trust the egress MITM trust bundle
 
-## Step 4: Observe the policy decision and enforcement
+To make your actors trust the egress MITM trust bundle, update your `ActorTemplate` to include
+the `system-info` volume, and the `system-info` volumeMount, and several environment variables, similar to:
+
+```
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: egress
+  namespace: ate-demo-egress
+spec:
+  # Requires an sdsmint install (--experimental-use-sdsmint): only that path
+  # creates the egress-mitm-ca-pool Secret the bundle is derived from, and an
+  # actor referencing a bundle that does not resolve fails to start.
+  volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+      # The trust anchors for the per-SNI leaves the MITM egress gateway mints.
+      - trustBundle:
+          name: egress-mitm.ate.dev
+          path: trust-bundle.pem
+  containers:
+  - name: egress
+    image: ko://github.com/agent-substrate/substrate/demos/egress
+    command: ["/ko-app/egress"]
+    # SSL_CERT_FILE alone is not enough to make the projected bundle the whole
+    # story: it replaces the default cert FILE list, but the default cert
+    # DIRECTORY list is still scanned, and the base image keeps its public
+    # roots in /etc/ssl/certs. Pointing SSL_CERT_DIR at the projection too
+    # makes the anchor set exactly the gateway CA, so a successful HTTPS fetch
+    # proves the projected bundle validated the minted leaf. Under sdsmint the
+    # public roots are useless anyway: every origin is fronted by the gateway.
+    env:
+    - name: SSL_CERT_FILE
+      value: /run/ate/trust-bundle.pem
+    - name: SSL_CERT_DIR
+      value: /run/ate
+    - name: NODE_EXTRA_CA_CERTS    # Node.js
+      value: /run/ate/trust-bundle.pem
+    - name: REQUESTS_CA_BUNDLE     # Python requests
+      value: /run/ate/trust-bundle.pem
+    - name: GIT_SSL_CAINFO          # git over https
+      value: /run/ate/trust-bundle.pem
+    volumeMounts:
+    - name: system-info
+      mountPath: /run/ate   # the bundle lands at /run/ate/trust-bundle.pem
+```
+
+After updating your ActorTemplate, Apply the ActorTemplate and create new actors using it.
+
+## Step 4: Send egress traffic from an actor
+
+## Step 5: Observe the policy decision and enforcement
 
 ```shell
 # 1. Check the log of the egress plugin to see the allow/deny decision for a request.

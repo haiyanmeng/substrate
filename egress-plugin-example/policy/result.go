@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package inner
-
-import "log/slog"
+package policy
 
 // CalloutAction is the allow or deny decision made by the extproc.
 type CalloutAction string
@@ -66,17 +64,4 @@ func AllowWithCredentials(credentials ...CredentialHeader) CalloutResult {
 // Deny refuses a request.
 func Deny(reason string) CalloutResult {
 	return CalloutResult{Action: CalloutDeny, Reason: reason}
-}
-
-// loggedCredentials is a decision's credential set on its way into a log
-// record. The header names reach the log; the values never do.
-type loggedCredentials []CredentialHeader
-
-// LogValue renders the credential set as its header names.
-func (c loggedCredentials) LogValue() slog.Value {
-	names := make([]string, 0, len(c))
-	for _, credential := range c {
-		names = append(names, credential.Key)
-	}
-	return slog.AnyValue(names)
 }

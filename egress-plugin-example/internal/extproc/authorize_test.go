@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package inner
+package extproc
 
 import (
 	"context"
@@ -21,12 +21,16 @@ import (
 
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/agent-substrate/substrate/egress-plugin-example/policy"
 )
 
-// policyFunc adapts a function to Policy, so a test can state its policy inline.
-type policyFunc func(context.Context, *Request) CalloutResult
+// policyFunc adapts a function to policy.Policy, so a test can state its policy inline.
+type policyFunc func(context.Context, *policy.Request) policy.CalloutResult
 
-func (f policyFunc) Evaluate(ctx context.Context, req *Request) CalloutResult { return f(ctx, req) }
+func (f policyFunc) Evaluate(ctx context.Context, req *policy.Request) policy.CalloutResult {
+	return f(ctx, req)
+}
 
 // isImmediate reports whether the response is Envoy answering the request
 // itself, which is what a denial looks like on the wire.
@@ -36,27 +40,27 @@ func isImmediate(resp *extprocv3.ProcessingResponse) bool {
 }
 
 // authorizeWith runs one request through a server built on the given policy.
-func authorizeWith(t *testing.T, policy Policy, actorURI string, headers map[string]string) *extprocv3.ProcessingResponse {
+func authorizeWith(t *testing.T, p policy.Policy, actorURI string, headers map[string]string) *extprocv3.ProcessingResponse {
 	t.Helper()
 	attrs := map[string]*structpb.Struct{
 		"envoy.filters.http.ext_proc": {Fields: map[string]*structpb.Value{
 			actorAttribute: structpb.NewStringValue(actorURI),
 		}},
 	}
-	return NewServer(policy).authorize(t.Context(), attrs, rawHeaders(headers).GetRequestHeaders())
+	return NewServer(p).authorize(t.Context(), attrs, rawHeaders(headers).GetRequestHeaders())
 }
 
 // The server must route the decision it was given, not one of its own.
 func TestServerHonorsTheConfiguredPolicy(t *testing.T) {
-	deny := policyFunc(func(context.Context, *Request) CalloutResult {
-		return Deny("test policy denies everything")
+	deny := policyFunc(func(context.Context, *policy.Request) policy.CalloutResult {
+		return policy.Deny("test policy denies everything")
 	})
 	if resp := authorizeWith(t, deny, "", map[string]string{":authority": "example.com"}); !isImmediate(resp) {
 		t.Errorf("a denying policy produced %T, want an immediate response", resp.GetResponse())
 	}
 
-	if resp := authorizeWith(t, AllowAll{}, "", map[string]string{":authority": "example.com"}); isImmediate(resp) {
-		t.Error("AllowAll produced an immediate response, want the request passed upstream")
+	if resp := authorizeWith(t, policy.AllowAll{}, "", map[string]string{":authority": "example.com"}); isImmediate(resp) {
+		t.Error("policy.AllowAll produced an immediate response, want the request passed upstream")
 	}
 }
 
@@ -76,10 +80,10 @@ func TestNilPolicyDeniesEverything(t *testing.T) {
 func TestPolicySeesTheRequestAndTheSplitActor(t *testing.T) {
 	const uri = "spiffe://substrate-actor.local/atespace/demo/actor/egress-demo"
 
-	var got *Request
-	record := policyFunc(func(_ context.Context, req *Request) CalloutResult {
+	var got *policy.Request
+	record := policyFunc(func(_ context.Context, req *policy.Request) policy.CalloutResult {
 		got = req
-		return Allow()
+		return policy.Allow()
 	})
 	authorizeWith(t, record, uri, map[string]string{
 		":authority": "Example.COM:443",
@@ -102,7 +106,7 @@ func TestPolicySeesTheRequestAndTheSplitActor(t *testing.T) {
 		{"ActorName", got.ActorName, "egress-demo"},
 	} {
 		if tc.got != tc.want {
-			t.Errorf("Request.%s = %q, want %q", tc.field, tc.got, tc.want)
+			t.Errorf("policy.Request.%s = %q, want %q", tc.field, tc.got, tc.want)
 		}
 	}
 }

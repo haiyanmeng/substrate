@@ -30,7 +30,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
-	"github.com/agent-substrate/substrate/egress-plugin-example/internal/inner"
+	"github.com/agent-substrate/substrate/egress-plugin-example/internal/extproc"
+	"github.com/agent-substrate/substrate/egress-plugin-example/policy"
 	"github.com/agent-substrate/substrate/internal/version"
 )
 
@@ -75,7 +76,7 @@ func run(ctx context.Context) error {
 	defer lis.Close()
 
 	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConfig)))
-	extprocv3.RegisterExternalProcessorServer(grpcServer, inner.NewServer(inner.AllowAll{}))
+	extprocv3.RegisterExternalProcessorServer(grpcServer, extproc.NewServer(policy.AllowAll{}))
 
 	slog.InfoContext(ctx, "extproc listening",
 		slog.String("address", lis.Addr().String()),
