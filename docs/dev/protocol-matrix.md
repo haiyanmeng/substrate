@@ -114,12 +114,13 @@ Every credential presented anywhere on either path.
 | I2 | router → atunnel :443 | router (client) | `spiffe://cluster.local/ns/ate-system/sa/atenet-router` (podidentity) | atunnel | `VerifyConnection` requires URI SAN == `--atunnel-client-identity` |
 | I3 | router → atunnel :443 | atunnel (server) | worker podidentity SVID | router | `MatchTypedSubjectAltNames` URI **prefix** `spiffe://cluster.local/` (`--upstream-spiffe-prefix`) |
 | I4 | atunnel → actor | none | none | — | plaintext HTTP/1.1 to `169.254.17.2:<port>` over the veth |
-| E1 | atunnel → atelet credential broker | atelet (server) | `spiffe://cluster.local/ns/ate-system/sa/atelet` | atunnel | exact URI match **plus** matching NodeName/NodeUID |
-| E2 | atunnel → egress gateway :443 | atunnel (client) | **actor cert**: `spiffe://substrate-actor.local/atespace/<atespace>/actor/<name>` + `ActorIdentity{Atespace, ActorName, ActorUid, Purpose=atunnel}` under PEN OID `1.3.6.1.4.1.11129.2.12` | gateway Envoy, then egress ext_proc | Envoy: `require_client_certificate: true` against `/run/actor-id-ca-certs/ca.crt`. ext_proc: re-parses the chain from XFCC, re-verifies in Go, refuses `IsCA`, requires ClientAuth EKU and `Purpose == atunnel`, authorizes on **UID** and `ACTOR_STATE_RUNNING` |
-| E3 | atunnel → egress gateway :443 | gateway (server) | servicedns serving cert | atunnel | `ServerName` = gateway host, trust bundle = servicedns clusterTrustBundle |
-| E4 | MITM leaf (sdsmint only) | gateway (server, to the actor) | per-SNI leaf minted on demand by `sdsmintd` | the actor's own TLS stack | only succeeds if the actor image trusts the MITM CA |
-| E5 | gateway → origin | gateway (client) | none (no client cert) | origin | — |
-| E6 | gateway → origin (sdsmint TLS chain) | origin (server) | origin's real cert | gateway | `auto_sni` + `auto_san_validation` against `/etc/ssl/certs/ca-certificates.crt` |
+| E1 | atunnel → atelet credential broker | atunnel (client) | worker podidentity SVID | atelet | `verifyClientOnSameNode` requires the worker's `PodIdentity` NodeName/NodeUID to equal atelet's own node incarnation; the handler re-reads the peer certificate before minting |
+| E2 | atunnel → atelet credential broker | atelet (server) | `spiffe://cluster.local/ns/ate-system/sa/atelet` | atunnel | exact URI match **plus** matching NodeName/NodeUID |
+| E3 | atunnel → egress gateway :443 | atunnel (client) | **actor cert**: `spiffe://substrate-actor.local/atespace/<atespace>/actor/<name>` + `ActorIdentity{Atespace, ActorName, ActorUid, Purpose=atunnel}` under PEN OID `1.3.6.1.4.1.11129.2.12` | gateway Envoy, then egress ext_proc | Envoy: `require_client_certificate: true` against `/run/actor-id-ca-certs/ca.crt`. ext_proc: re-parses the chain from XFCC, re-verifies in Go, refuses `IsCA`, requires ClientAuth EKU and `Purpose == atunnel`, authorizes on **UID** and `ACTOR_STATE_RUNNING` |
+| E4 | atunnel → egress gateway :443 | gateway (server) | servicedns serving cert | atunnel | `ServerName` = gateway host, trust bundle = servicedns clusterTrustBundle |
+| E5 | MITM leaf (sdsmint only) | gateway (server, to the actor) | per-SNI leaf minted on demand by `sdsmintd` | the actor's own TLS stack | only succeeds if the actor image trusts the MITM CA |
+| E6 | gateway → origin | gateway (client) | none (no client cert) | origin | — |
+| E7 | gateway → origin (sdsmint TLS chain) | origin (server) | origin's real cert | gateway | `auto_sni` + `auto_san_validation` against `/etc/ssl/certs/ca-certificates.crt` |
 
 Two consequences worth stating plainly:
 
@@ -166,6 +167,113 @@ request's `:authority` is unrelated to the actor being addressed.
 ---
 
 ## 3. What Envoy actually does, per path
+
+### The ingress config at a glance
+
+Everything `xds.go` builds, and how a request moves through it. The four socket
+listeners collapse into two HCM shapes, and the CONNECT pair rejoins the other
+two after reinjection.
+
+```
+                    ┌───────────────────────────────────────┐
+                    │ atenet router --mode=ingress          │
+                    │ ADS ──► LDS · RDS · CDS · SDS         │
+                    └───────────────────┬───────────────────┘
+                                        │ snapshot
+════════════════════ ENVOY ═════════════▼══════════════════════════════
+
+ downstream client
+      │
+      ├───────────────┬───────────────┬───────────────┐
+      ▼               ▼               ▼               ▼
+  :8080           :8443           :8081           :8444
+  ingress_http_   ingress_https_  connect_        connect_
+  listener        listener        terminate       terminate_tls
+      │               │               │               │
+      │        SDS serving cert       │        SDS serving cert
+      │        ✗ validation_context   │        ✗ validation_context
+      │        ✗ alpn_protocols       │        ✗ alpn_protocols
+      │               │               │               │
+      └───────┬───────┘               └───────┬───────┘
+              ▼                               ▼
+   buildHcm(captureAuthority        buildConnectTerminateHCM
+            =true)                  codec AUTO · allow_connect
+   codec AUTO · route: RDS          upgrade_configs: [CONNECT]
+                                    http_filters:
+                                      set_filter_state
+                                        dev.ate.authority
+                                      router     ← no ext_proc
+                                            │
+                                    connect_matcher → main_internal
+                                    timeout 0s
+                                            │
+                                            ▼
+                                    cluster main_internal (STATIC)
+                                      envoy_internal_address
+                                      internal_upstream(raw_buffer)
+                                      passthrough_metadata: Host /
+                                        …listener.original_dst
+                                            │
+                                            ▼
+                                    listener main_internal
+                                      listener_filters:[original_dst]
+                                      buildHcm(captureAuthority
+                                               =false)
+              │                             │
+              └──────────────┬──────────────┘
+                             ▼
+      ════════ shared tail: all four entry points ════════
+
+  http_filters:
+    1. set_filter_state dev.ate.authority = %REQ(:AUTHORITY)%
+         (ingress_* only; main_internal skips it)
+    2. ext_proc ─────────────────────────► cluster ate-cluster
+         request_attributes:                 STATIC 127.0.0.1:50051
+           filter_state['dev.ate.authority'] HTTP/2, connect 250ms
+         metadata fwd + recv:                circuit breaker:
+           …listener.original_dst              max_requests
+         request_headers SEND, rest SKIP/NONE
+       ◄── dynamic metadata {local: <workerIP>:443, port: <target>}
+           after parse authority → park → resume actor
+    3. router
+                             │
+                             ▼
+  RDS substrate_routes → vhost "*" → match { prefix: "/" }
+    request_headers_to_add:
+      X-Ate-Target-Port: %DYNAMIC_METADATA(…original_dst:port)%
+    timeout: --route-timeout   idle_timeout: routeIdleTimeout()
+                             │
+                             ▼
+  cluster actor_original_dst
+    ORIGINAL_DST · CLUSTER_PROVIDED
+    lb_config.metadata_key: …original_dst → "local"
+    transport_socket: upstream mTLS (podidentity)
+      validate URI SAN prefix spiffe://cluster.local/
+    HttpProtocolOptions: explicit HTTP/1.1    ← downgrades h2
+                             │
+                             ▼
+                 atunnel :443 (worker pod)
+```
+
+Three things the diagram settles that the prose does not spell out:
+
+* **The CONNECT HCM has no ext_proc filter.** `buildConnectTerminateHCM`
+  (`xds.go:901`) lists exactly two: the authority capture and the router. Actor
+  resolution, parking, and resume happen only on `main_internal`'s HCM, so a
+  CONNECT request crosses two HCMs and reaches ext_proc once, at the second.
+* **One HCM builder serves both shapes, parameterized only by
+  `captureAuthority`.** `main_internal` passes `false` (`xds.go:844`) for the
+  reason given in §2: the outer CONNECT already shared the right value.
+* **Two different mechanisms cross the internal-listener hop.**
+  `dev.ate.authority` is *filter state* (`shared_with_upstream: ONCE`); the
+  ORIGINAL_DST address is *host metadata*, carried by the `internal_upstream`
+  transport socket's `passthrough_metadata` (`xds.go:717-728`). `Host` kind is
+  correct there precisely because an internal hop has no real
+  `SO_ORIGINAL_DST`.
+
+Omitted from the diagram: the stdout access logger on every HCM, and the OTLP
+tracing provider (`otel_collector_cluster`), attached to every HCM when
+`--otlp-host` is set. Neither affects the request path.
 
 ### Ingress, non-CONNECT (`ingress_http_listener`, `ingress_https_listener`)
 
@@ -235,6 +343,137 @@ What the transport socket does and does not buy:
 4. From there it is identical to the non-CONNECT path (ext_proc → ORIGINAL_DST →
    atunnel over mTLS, HTTP/1.1).
 
+### The egress config at a glance
+
+Two configurations, one contract. Both terminate the actor's CONNECT on a
+listener called `egress` behind the same mTLS, and both authorize it with the
+same ext_proc call. They diverge entirely in what happens to the tunnel
+afterwards.
+
+```
+ ── SHIPPED: manifests/ate-install/atenet-egress.yaml ──────────────────
+
+ actor (atunnel egress client)
+      │  mTLS: presents an actor-identity client cert
+      ▼
+ listener egress   [::]:443, ipv4_compat: true
+   filter_chain "egress"        ← the name IS the ext_proc dispatch key
+     downstream TLS: servicedns leaf (watched_directory rotation)
+                     require_client_certificate: true
+                     trusted_ca /run/actor-id-ca-certs/ca.crt
+      │
+      ▼
+ HCM egress_connect · codec_type HTTP1 · upgrade_configs [CONNECT]
+   forward_client_cert_details SANITIZE_SET, chain: true   → XFCC
+   flush_log_on_tunnel_successfully_established: true
+   http_filters:
+     1. ext_proc ─────────────────► cluster ext_proc_server
+          request_attributes:         STATIC 127.0.0.1:50051, h2
+            xds.filter_chain_name     (atenet router --mode=egress)
+          failure_mode_allow: false   timeout 2s
+        ◄── 403 on deny · 503 if the router is down · else continue
+     2. dynamic_forward_proxy (egress_dns_cache, V4_ONLY)
+     3. router
+      │
+      ▼
+ route  connect_matcher → egress_forward_proxy
+      │
+      ▼
+ cluster egress_forward_proxy · dynamic_forward_proxy · CLUSTER_PROVIDED
+      │
+      ▼
+ origin IP:port     ← opaque TCP from here on. Envoy never reads a byte
+                      of the tunnel, so IP:port is all that was policed.
+```
+
+```
+ ── EXPERIMENTAL MITM: atenet-egress-with-sdsmint.yaml (Envoy ≥ 1.37) ──
+
+ actor (atunnel egress client)
+      │  mTLS: presents an actor-identity client cert
+      ▼
+ LISTENER A  egress  0.0.0.0:443
+   filter_chain "egress" — downstream TLS identical to the shipped config
+   HCM egress_connect · codec_type HTTP1 · upgrade_configs [CONNECT]
+     1. set_filter_state ate.actor.identity = %DOWNSTREAM_PEER_URI_SAN%
+          read_only · skip_if_empty · shared_with_upstream ONCE
+     2. ext_proc ──► ext_proc_server        (403 deny, fails closed)
+     3. set_filter_state
+          envoy.network.transport_socket.original_dst_address
+            = %REQ(:AUTHORITY)%   · shared_with_upstream ONCE
+     4. router
+   route  connect_matcher → mitm_internal · timeout 0s
+      │
+      ▼
+ cluster mitm_internal
+   envoy_internal_address: mitm_listener
+   internal_upstream(raw_buffer)   ← the only carrier for both
+                                     filter-state objects above
+      │
+      ▼
+ LISTENER B  mitm_listener · internal_listener {} · no socket anywhere
+   (needs bootstrap_extensions: envoy.bootstrap.internal_listener —
+    without it the listener silently fails to load)
+   listener_filters: tls_inspector, http_inspector
+   listener_filters_timeout 1s + continue_on_listener_filters_timeout
+     (a server-speaks-first client sends nothing, is tagged raw_buffer,
+      and lands on chain 3 instead of deadlocking)
+      │
+      ├─ transport_protocol: tls ───────────────────────► CHAIN 1
+      ├─ raw_buffer + application_protocols ────────────► CHAIN 2
+      │    [http/1.0, http/1.1, h2c]
+      └─ raw_buffer, nothing more specific matched ─────► CHAIN 3
+
+ CHAIN 1   HCM mitm_http                            log leg=mitm
+   downstream TLS: custom_tls_certificate_selector: on-demand
+     └─ DELTA_GRPC SDS ──► cluster sds_mint
+          unix pipe /var/run/sdsmint/sdsmint.sock, h2,
+          max_requests 32768 (a cap on the LIVE SECRET SET, not a
+          burst limit — Envoy holds each stream open)
+        certificate_mapper: sni
+          default sni-required.egress.ate.invalid (no-SNI clients)
+        both stateless and stateful resumption disabled
+   alpn_protocols [h2, http/1.1] · upgrade_configs [websocket]
+   transport_socket_connect_timeout 5s
+   #ATE_MITM_EXTPROC_FILTER · dynamic_forward_proxy · router
+   routes: content-type prefix application/grpc
+             → egress_forward_proxy_grpc
+           else prefix "/" → egress_forward_proxy
+
+ CHAIN 2   HCM mitm_cleartext                       log leg=cleartext
+   no transport socket — the Host header is already in the clear
+   upgrade_configs [websocket]
+   #ATE_MITM_EXTPROC_FILTER · dynamic_forward_proxy · router
+   route prefix "/" → egress_forward_proxy_cleartext
+
+ CHAIN 3   tcp_proxy mitm_passthrough               log leg=passthrough
+   no HTTP filters and no marker — an opaque stream has no request
+   → egress_tcp_passthrough
+
+ ── upstream clusters, all dialling the origin ─────────────────────────
+
+  egress_forward_        egress_forward_    egress_forward_
+  proxy                  proxy_grpc         proxy_cleartext
+  dyn_fwd_proxy          dyn_fwd_proxy      dyn_fwd_proxy
+  upstream TLS,          upstream TLS,      NO upstream TLS
+   public roots           public roots      use_downstream_
+  auto_sni +             auto_sni +          protocol_config
+   auto_san               auto_san           (h1 or h2c, as sent)
+  explicit HTTP/1.1      auto_config h1+h2  allow_insecure_
+   (WebSockets live,      (trailers live)    cluster_options
+    h2 trailers die)
+
+  egress_tcp_passthrough · type ORIGINAL_DST · dials the
+    original_dst_address filter state set back on listener A
+```
+
+Structurally, MITM adds exactly three things: a second listener reachable only
+over an internal address, on-demand per-SNI certificate minting so the tunnelled
+TLS can be terminated, and filter state as the only sound way to carry the
+actor's identity and original destination across that hop. Everything else —
+the `:443` socket, the mTLS, the CONNECT termination, the ext_proc
+authorization — is the same config in both files.
+
 ### Egress, shipped (`atenet-egress.yaml`)
 
 1. Listener `egress` on `[::]:443` with `ipv4_compat: true` — one dual-stack
@@ -249,7 +488,7 @@ What the transport socket does and does not buy:
    `flush_log_on_tunnel_successfully_established: true`.
 4. ext_proc (`failure_mode_allow: false`,
    `request_attributes: [xds.filter_chain_name]`) performs the authorization in
-   §2/E2. Non-CONNECT methods are rejected outright.
+   §2/E3. Non-CONNECT methods are rejected outright.
 5. Route `connect_matcher` → `egress_forward_proxy` (`dynamic_forward_proxy`,
    `V4_ONLY`). **The tunnel is opaque TCP from here on.** Envoy never looks at
    the tunnelled bytes.
@@ -308,23 +547,49 @@ cleartext h2c is relayed as h2c and trailers survive (§5.9).
 
 Inbound to an actor. Identities on every hop are I1–I4 in §2.
 
-| Protocol | Ingress behaviour | § |
-| --- | --- | --- |
-| raw TCP | not served | 4.1 |
-| raw UDP | not served | 4.1 |
-| TLS (non-HTTP) | not served | 4.1 |
-| SSH | not served | 4.1 |
-| DNS | separate service (`atenet-dns`), not an actor ingress path | 4.2 |
-| HTTP/1.0 | served | 4.3 |
-| HTTP/1.1 GET | served — the mainline path | 4.4 |
-| HTTP/1.1 CONNECT | terminated + reinjected into `main_internal` | 4.5 |
-| HTTP/2 GET | h2c prior-knowledge only (no ALPN advertised) | 4.6 |
-| HTTP/2 CONNECT | terminated + reinjected; `:8081` only in practice | 4.7 |
-| HTTP/3 GET | **unsupported** | 4.8 |
-| HTTP/3 CONNECT | **unsupported** | 4.8 |
-| WebSocket over HTTP/1.1 | **rejected** — no `websocket` upgrade config | 4.9 |
-| WebSocket over HTTP/2 | **rejected** | 4.9 |
-| WebSocket over HTTP/3 | **unsupported** | 4.9 |
+The **fix** column rates each gap. Priority is a reading of the evidence in the
+sections below, not a commitment — the facts stand whether or not you agree with
+the ranking.
+
+| | Priority | | Effort |
+| --- | --- | --- | --- |
+| **P0** | fails open — traffic leaves with no identity, no authorization, no log | **S** | config only, plus a test; 1–3 days |
+| **P1** | blocks a plausible mainstream use, or blocks defaulting sdsmint on | **M** | config plus code, or changes spanning components; 1–3 weeks |
+| **P2** | real gap, but a workaround exists | **L** | a new listener stack or subsystem; 3+ weeks |
+| **P3** | no known demand | | |
+| **—** | no gap to close | | |
+
+§4.10 and §5.15 cost each row against those bands, in engineer-days.
+
+| Protocol | Ingress behaviour | Fix | § |
+| --- | --- | --- | --- |
+| raw TCP | not served | P3 · L | 4.1 |
+| raw UDP | not served | P3 · L | 4.1 |
+| TLS (non-HTTP) | not served | P3 · M | 4.1 |
+| SSH | not served | P3 · L | 4.1 |
+| DNS | separate service (`atenet-dns`), not an actor ingress path | — | 4.2 |
+| HTTP/1.0 | served | — | 4.3 |
+| HTTP/1.1 GET | served — the mainline path | — | 4.4 |
+| HTTP/1.1 CONNECT | terminated + reinjected into `main_internal` | — | 4.5 |
+| HTTP/2 GET | h2c prior-knowledge only (no ALPN advertised) | P1 · M | 4.6 |
+| HTTP/2 CONNECT | terminated + reinjected; `:8081` only in practice | P3 · S | 4.7 |
+| HTTP/3 GET | **unsupported** | P3 · L | 4.8 |
+| HTTP/3 CONNECT | **unsupported** | P3 · L | 4.8 |
+| WebSocket over HTTP/1.1 | **rejected** — no `websocket` upgrade config | P1 · S | 4.9 |
+| WebSocket over HTTP/2 | **rejected** | P2 · M | 4.9 |
+| WebSocket over HTTP/3 | **unsupported** | P3 · L | 4.9 |
+
+Nothing on ingress fails open — every gap here is a client that cannot connect or
+cannot upgrade, which is why the column tops out at P1. Two of them are cheap and
+worth doing: WebSocket over HTTP/1.1 is one `upgrade_configs` line against an
+upstream already pinned to HTTP/1.1, and it currently fails *silently* (§4.9). The
+ALPN gap is the more consequential one — without `alpn_protocols` on `:8443` there
+is no h2 over TLS at all, so gRPC cannot reach an actor over the TLS listener.
+Advertising ALPN is one line; carrying h2 the rest of the way is not, since both
+the ORIGINAL_DST cluster and atunnel's reverse proxy are HTTP/1.1 (§4.6). The four
+non-HTTP rows share a deeper blocker: actor resolution keys on `:authority`, and a
+raw TCP or SSH stream carries no name to resolve. TLS is the exception, since SNI
+would serve.
 
 ### 4.1 Protocols with no ingress path: raw TCP, raw UDP, non-HTTP TLS, SSH
 
@@ -428,33 +693,226 @@ form (RFC 8441 extended CONNECT) would additionally need
 `http2_protocol_options.allow_connect` on the ingress HCMs, plus ALPN so h2 can
 be negotiated at all.
 
+### 4.10 What each ingress fix costs
+
+Engineer-days for one person already fluent in this repo, covering config, code,
+unit test, e2e, and review — excluding design approval and rollout. Ranges are
+wide exactly where an empirical question is unsettled, and those are named below.
+
+Three properties of the current code set the floor for every row.
+
+**Every ingress dataplane change lands twice.** Envoy is programmed from
+`xds.go`; agentgateway is *statically* configured (`config.go:44-50`) from
+`manifests/ate-install/components/agentgateway/configmap.yaml`, which hand-rolls
+the same four binds in a different schema. A one-line Envoy change is one line,
+plus a YAML edit, plus a second CI lane — or a deliberate decision to leave the
+agentgateway lane behind while it stays opt-in behind `--atenet-router=agentgateway`.
+**Every number below assumes Envoy only; add 30–50% to carry agentgateway.**
+
+**Actor resolution needs a name, and only the addressing problem is hard.**
+`parseActorRef` (`ingress.go:202`) reads the name out of `:authority`, and
+resume-and-park hangs off `HandleRequestHeaders` — an ext_proc *HTTP* filter
+callback, with the parking lot (`h.parking.enter`, `ingress.go:124`) holding the
+request open while the worker pool drains. None of that survives a protocol with
+no request. The *plumbing* to replace it is nevertheless mostly off-the-shelf;
+see "the L4 path is cheaper than it looks" below. What is not off-the-shelf is
+deciding how a nameless stream identifies its actor, and that is what keeps the
+`L` on §4.1.
+
+**The last two hops are HTTP/1.1 by construction.** `buildOriginalDstCluster`
+pins `Http1ProtocolOptions` and says why: *"The atunnel ingress server terminates
+TLS and reverse-proxies to the actor over HTTP/1.1"* (`xds.go:760-776`). atunnel
+is an `httputil.ReverseProxy` over `http.Server` (`internal/atunnel/ingress.go:130`).
+Any row needing something other than h1 at the actor pays for four hops, not one.
+
+**Nothing tests the TLS listeners, and no certificate matches the name clients
+use.** `RouterClient` port-forwards and speaks plaintext; no e2e touches `:8443`
+or `:8444` at all (§6 lists only the two plaintext ingress tests). Worse, the
+servicedns signer issues SANs of exactly one shape — `<svc>.<ns>.svc`
+(`servicednssigner.go:130-138`) — so the router serves a certificate for
+`atenet-router.ate-system.svc`, while CoreDNS points
+`<actor>.<atespace>.actors.resources.substrate.ate.dev` at that same router
+(§4.2). A verifying TLS client that addresses an actor by name gets a hostname
+mismatch. **Every TLS-terminating row inherits an unpriced prerequisite here**,
+and §2's I1 ("ordinary WebPKI/cluster trust") glosses over it.
+
+**The e2e harness cannot carry UDP.** It reaches the router through
+`kubectl port-forward` (`internal/portforward`, `router_client.go:50-52`), which
+is TCP-only. Any QUIC row needs a new way into the cluster — NodePort, hostPort,
+or an in-cluster driver pod — before it needs a QUIC client. This is an *ingress*
+constraint only: egress tests dial outward from an actor that is already inside
+the cluster.
+
+| Row | § | Matrix | Standalone | Incremental | What dominates |
+| --- | --- | --- | --- | --- | --- |
+| raw TCP | 4.1 | L | 2–3 wk | — | addressing design; whether the L4 filter fires before client data |
+| SSH | 4.1 | L | 2–3 wk | +0 d, or blocked | server-speaks-first — it hits the trigger question head-on |
+| TLS (non-HTTP) | 4.1 | M | 1.5–2 wk **+ certs** | +2–4 d after raw TCP | SNI supplies the name *and* the trigger — but see the cert gap |
+| raw UDP | 4.1 | L | 5–7 wk | +2–3 wk after raw TCP | datagram transport router→worker; no UDP anywhere today |
+| HTTP/2 GET — ALPN negotiated | 4.6 | M | 2–3 d | — | one line; proving it needs a TLS client the harness lacks |
+| HTTP/2 GET — h2 to the actor | 4.6 | M | 2–3 wk | +2–3 wk after ALPN | four hops to convert; h2c server in the counter demo |
+| HTTP/2 CONNECT | 4.7 | S | 0.5 d | +0 d with ALPN | the same shared line; `allow_connect` already set |
+| HTTP/3 GET | 4.8 | L | 3–5 wk | — | the harness and the Service, not the Envoy config |
+| HTTP/3 CONNECT | 4.8 | L | — | +3–5 d after h3 GET | routing only |
+| WebSocket over HTTP/1.1 | 4.9 | S | 2–3 d | — | verifying ReverseProxy's 101 path; a WS endpoint in the demo |
+| WebSocket over HTTP/2 | 4.9 | M | 1.5–2 wk | +3–5 d after ALPN + WS/h1 | `allow_connect` on `buildHcm`; extended CONNECT → h1 Upgrade |
+| WebSocket over HTTP/3 | 4.9 | L | — | +2–3 d after h3 | nothing new |
+
+**The ALPN line is shared, so §4.6 and §4.7 are one edit.**
+`buildDownstreamTlsTransportSocket` (`xds.go:1167`) — "shared by every
+TLS-terminating listener", per its own comment — is the transport socket for both
+`buildHttpsListener` (`:8443`) and `buildConnectTerminateTLSListener` (`:8444`).
+Adding `alpn_protocols` there closes §4.6's negotiation gap and §4.7's in the same
+line; they cannot be scheduled apart without splitting the function.
+`allow_connect: true` is already set on the CONNECT HCM (`xds.go:901`), so §4.7
+needs no further code at all — its incremental cost is a test.
+
+**§4.6 is two different projects, and the matrix's single `M` conflates them.**
+Advertising ALPN (2–3 d) gets h2 negotiated and downgraded to h1 at the cluster —
+but what that buys is bounded by the cert gap above: it can be *proved* only with
+verification disabled, because no certificate the router holds matches the name
+an h2 client would dial. Carrying h2 to the actor — what gRPC ingress needs —
+converts four hops: the ORIGINAL_DST cluster's protocol options, the
+router→atunnel ALPN, `Serve`'s TLS config (`ServeConnect` already sets
+`NextProtos: [h2, http/1.1]` at `ingress.go:209`; `Serve` does not), and the
+ReverseProxy transport — plus an h2c server in the counter demo to test against.
+
+**`S` is days, not hours, because of the test.** §4.9's config change really is
+one `UpgradeConfigs` entry on `buildHcm`, which today sets neither
+`UpgradeConfigs` nor `Http2ProtocolOptions`. The cost sits elsewhere: Go's
+`ReverseProxy` has handled 101 upgrades since Go 1.12, but this one carries a
+custom `Rewrite` (`ingress.go:131`) and has never been exercised against an
+upgrade; the counter demo has no WebSocket endpoint; and `networking` runs once
+per sandbox class. Budget a day for that verification to come back negative and
+turn a one-line fix into an atunnel change.
+
+**The L4 path is cheaper than it looks, because three pieces already line up.**
+Envoy has a *network* ext_proc filter (`envoy.filters.network.ext_proc`), and its
+config is field-for-field the shape `buildHcm` already emits for the HTTP one —
+`failure_mode_allow`, `message_timeout`, `metadata_options`, plus
+`connection_attributes` where the HTTP filter has `request_attributes`. Its
+`ProcessingResponse.dynamic_metadata` is settable by the server, which is exactly
+how the current handler steers the ORIGINAL_DST cluster. `tcp_proxy` then carries
+the stream with `tunneling_config`, whose own proto documentation gives
+`hostname: "%DYNAMIC_METADATA(tunnel:address)%"` as the worked example — so the
+router can wrap a raw stream in a CONNECT aimed wherever resolution just pointed.
+And the far end of that CONNECT already exists: `ServeConnect`
+(`internal/atunnel/ingress.go:204`, `DefaultConnectPort = 444`) hijacks and
+relays raw bytes with half-close, is provisioned by `workerpool_apply.go`, and is
+unused today only because the dataplane hardcodes `:443` (§4.5). The raw relay to
+the actor is built and deployed; it is not on the critical path. What remains is
+a sibling of `ingress.Handler` reusing `ActorResumer` and the parking lot
+unchanged, with `message_timeout` covering the parking budget the way
+`SetExtProcMessageTimeout` does now. Neither `tcp_proxy` nor `network_ext_proc`
+is vendored — `vendor/.../filters/network/` holds only
+`http_connection_manager` — but that is a `go mod vendor` chore, not a design
+one. Call the plumbing 1–1.5 weeks.
+
+**What is left is one design question and one empirical one, and they are the
+estimate.** *Addressing:* a raw stream carries no name, and port-per-actor — the
+only scheme that works without one — means a Kubernetes Service enumerating a
+port per actor, which is a reconciliation and scaling problem rather than a
+coding one. Pre-declaring a fixed port range dodges it, at the cost of a ceiling
+on concurrent raw-TCP actors. *The trigger:* the L4 filter processes **data**, so
+a client that sends nothing until greeted never produces a `read_data` message
+and its actor is never resumed. Whether the filter also fires on connection
+establishment decides whether SSH works at all. That is the ingress twin of
+§5.8's `http_inspector` question and deserves the same half day against a scratch
+Envoy before anyone commits to a number.
+
+**So §4.1 is two rows, not three.** raw TCP and SSH stand or fall together on the
+trigger question — SSH is the server-speaks-first case in its purest form, so it
+is free once raw TCP lands or it is blocked outright, with nothing in between.
+Non-HTTP TLS escapes both problems: SNI is a name and a ClientHello is
+client-first data, so it needs the shared L4 plumbing and neither the addressing
+scheme nor a favourable trigger answer. That makes it the one row in §4.1 worth
+costing on its own, and the cheapest way to put the L4 path into production at
+all.
+
+**The TLS cert gap is a project nobody has scoped, and two rows depend on it.**
+Non-HTTP TLS ingress has to choose: pass the TLS through to the actor, so the
+*actor* needs a serving certificate for its own DNS name and nothing provisions
+one; or terminate at the router, so the router needs SANs covering actor names
+and the signer emits `<svc>.<ns>.svc` only. Either branch is a
+certificate-provisioning change outside this matrix, which is why that row
+carries **+ certs** rather than a number. §4.6's ALPN row escapes it only because
+ALPN negotiation can be demonstrated with verification off.
+
+**HTTP/3's cost is the harness, not Envoy.** Downstream QUIC is mature in Envoy:
+a `udp_listener_config`, `quic_options`, a QUIC transport socket and
+`CodecType: HTTP3` in `xds.go` is roughly a week, and the certificate already
+arrives over SDS. The rest is everything around it — a second Service port (all
+four at `atenet-router.yaml:363` are `protocol: TCP`), whatever fronts it in each
+environment, and a way for the suite to send UDP at all, which port-forward
+cannot. That reordering is why this is 3–5 weeks rather than the 5–7 a "no UDP
+anywhere" reading suggests. It still downgrades to h1 upstream, so §4.6 remains a
+prerequisite for it to be useful past the router.
+
+**Raw UDP ingress keeps 5–7 weeks, for a reason HTTP/3 does not share.** An Envoy
+UDP listener does not solve the router→worker hop: that leg is mTLS TCP with no
+datagram framing, and unlike HTTP/3 — which terminates at the router and
+continues upstream as HTTP — there is no CONNECT-shaped tunnel to borrow.
+
+Read down the *incremental* column and the ingress backlog is smaller than the
+matrix suggests. Both P1s and the lone S come to a little over one engineer-week
+combined — ALPN, WebSocket over HTTP/1.1, and h2 CONNECT arriving free with the
+first. Of what remains, only raw UDP at 5–7 weeks is genuinely a subsystem; the
+L4 story is a week of plumbing wrapped in two unanswered questions, and HTTP/3 is
+mostly harness work.
+
+The caveat that outranks all of them: **the TLS listeners are untested and serve
+a name no client uses.** That is not on the matrix, because it is not a protocol
+gap — but it caps what §4.6 and the TLS row in §4.1 can actually deliver, and it
+should be settled before either is scheduled.
+
 ---
 
 ## 5. Per-protocol matrix: egress
 
-Outbound from an actor. Identities on every hop are E1–E6 in §2.
+Outbound from an actor. Identities on every hop are E1–E7 in §2.
 
 **tunnelled** = TCP, REDIRECTed to atunnel, carried inside CONNECT with the actor
 certificate, authorized by ext_proc. **bypass** = leaves the worker pod by
 MASQUERADE with no identity, no authorization, and no log.
 
-| Protocol | Shipped (`atenet-egress.yaml`) | sdsmint (experimental) | § |
-| --- | --- | --- | --- |
-| raw TCP | tunnelled, opaque | tunnelled → chain 3 passthrough | 5.1 |
-| raw UDP | **bypass** | **bypass** | 5.2 |
-| DNS | **bypass** (UDP) / tunnelled (TCP) | same | 5.3 |
-| TLS (non-HTTP) | tunnelled, opaque | tunnelled → chain 1, MITM attempted, **breaks** | 5.4 |
-| SSH | tunnelled, opaque | tunnelled → chain 3 passthrough | 5.5 |
-| HTTP/1.0 | tunnelled, opaque | chain 2 cleartext | 5.6 |
-| HTTP/1.1 GET | tunnelled, opaque | chain 1 (TLS) or chain 2 (cleartext) | 5.7 |
-| HTTP/1.1 CONNECT | tunnelled opaquely, works | **broken** — no chain routes CONNECT | 5.8 |
-| HTTP/2 GET | tunnelled, opaque | chain 1, downgraded to HTTP/1.1 unless gRPC | 5.9 |
-| HTTP/2 CONNECT | as HTTP/1.1 CONNECT | as HTTP/1.1 CONNECT | 5.10 |
-| HTTP/3 GET | **bypass** (UDP) | **bypass** | 5.11 |
-| HTTP/3 CONNECT | **bypass** | **bypass** | 5.11 |
-| WebSocket over HTTP/1.1 | tunnelled, opaque (works) | chains 1 and 2, `upgrade_configs: [websocket]` | 5.12 |
-| WebSocket over HTTP/2 | tunnelled, opaque (works) | not supported | 5.13 |
-| WebSocket over HTTP/3 | **bypass** | **bypass** | 5.14 |
+Priority and effort codes are as in §4.
+
+| Protocol | Shipped (`atenet-egress.yaml`) | sdsmint (experimental) | Fix | § |
+| --- | --- | --- | --- | --- |
+| raw TCP | tunnelled, opaque | tunnelled → chain 3 passthrough | — | 5.1 |
+| raw UDP | **bypass** | **bypass** | **P0** · M | 5.2 |
+| DNS | **bypass** (UDP) / tunnelled (TCP) | same | P1 · M | 5.3 |
+| TLS (non-HTTP) | tunnelled, opaque | tunnelled → chain 1, MITM attempted, **breaks** | P1 · S | 5.4 |
+| SSH | tunnelled, opaque | tunnelled → chain 3 passthrough | — | 5.5 |
+| HTTP/1.0 | tunnelled, opaque | chain 2 cleartext | — | 5.6 |
+| HTTP/1.1 GET | tunnelled, opaque | chain 1 (TLS) or chain 2 (cleartext) | — | 5.7 |
+| HTTP/1.1 CONNECT | tunnelled opaquely, works | **broken** — no chain routes CONNECT | P2 · M | 5.8 |
+| HTTP/2 GET | tunnelled, opaque | chain 1, downgraded to HTTP/1.1 unless gRPC | P2 · M | 5.9 |
+| HTTP/2 CONNECT | as HTTP/1.1 CONNECT | as HTTP/1.1 CONNECT | P2 · with 5.8 | 5.10 |
+| HTTP/3 GET | **bypass** (UDP) | **bypass** | **P0** · S | 5.11 |
+| HTTP/3 CONNECT | **bypass** | **bypass** | **P0** · with 5.11 | 5.11 |
+| WebSocket over HTTP/1.1 | tunnelled, opaque (works) | chains 1 and 2, `upgrade_configs: [websocket]` | — | 5.12 |
+| WebSocket over HTTP/2 | tunnelled, opaque (works) | not supported | P3 · S | 5.13 |
+| WebSocket over HTTP/3 | **bypass** | **bypass** | **P0** · with 5.11 | 5.14 |
+
+Every P0 in this document is on egress, and all of them are the same bug seen from
+different angles: interception is TCP-only, so UDP leaves by MASQUERADE with no
+identity, no ext_proc call, and no log line. **HTTP/3 is the one to fix first** —
+not because it is the largest hole but because it is the one a normal actor image
+walks into by accident, since QUIC-capable clients try UDP/443 before falling back
+to TCP. Dropping UDP/443 in the postrouting chain forces that fallback and closes
+it in a few lines. The general UDP case (§5.2) is larger only because DNS has to
+keep working through whatever closes it, which is what makes §5.3 a prerequisite
+rather than a gap of its own.
+
+Below P0, the ordering is about unblocking sdsmint: non-HTTP TLS (§5.4) is the one
+row where enabling the MITM gateway actively breaks traffic that works today, and
+the fix is cheap — though, as that section notes, it fails open for TLS clients
+that omit ALPN, so it trades a correctness bug for a policy one. Actor-issued
+CONNECT (§5.8) is rated M less for the config than for the open empirical question
+in front of it: whether `http_inspector` claims a cleartext CONNECT decides whether
+the connection lands on chain 2 and fails or on chain 3 and works, and no test
+settles it.
 
 ### 5.1 Raw TCP
 
@@ -471,7 +929,7 @@ if net.ParseIP(host) == nil {
 }
 ```
 
-Identities: E2 (actor cert) and E3 (gateway serving cert). Envoy terminates the
+Identities: E3 (actor cert) and E4 (gateway serving cert). Envoy terminates the
 CONNECT and opens a plain TCP connection to the authority. In the shipped config
 it never inspects a byte of the payload. Under sdsmint the bytes reach
 `mitm_listener` and, being neither TLS nor HTTP, land on chain 3.
@@ -641,6 +1099,163 @@ extended CONNECT and would additionally need
 
 Bypass, for the reasons in §5.11.
 
+### 5.15 What each egress fix costs
+
+Same basis as §4.10 — engineer-days for one person fluent in this repo, covering
+config, code, unit test, e2e, and review; excluding design approval and rollout.
+
+Seven properties of the egress path set the floor here, and they are not the
+ingress ones.
+
+**The egress config exists in three hand-maintained copies.**
+`atenet-egress.yaml` (393 lines) and `atenet-egress-with-sdsmint.yaml` (1023) are
+*independent full files* selected by `atenet_egress_manifest()`
+(`hack/install-ate.sh:241`), not a base and an overlay; `agentgateway-egress/`
+layers the shared `components/agentgateway` over the first. Listener A, the
+downstream mTLS, the CONNECT termination and the ext_proc filter are duplicated
+verbatim between the two Envoy files. §7 already records a bug caused by exactly
+this — the `ipv4_compat` divergence. Assume any change to the shared part is
+written two or three times.
+
+**Three Envoy versions are deployed.** Shipped egress is
+`envoyproxy/envoy:v1.34-latest`, sdsmint egress `v1.37-latest`, the router
+`v1.39-latest`. The shipped egress gateway is the oldest component in the
+deployment, so any fix that needs a post-1.34 feature on the passthrough lane
+costs a version bump and a re-qualification before it costs anything else.
+
+**Egress e2e is four lanes, not one.** `pr-workflow.yaml` runs `networking` four
+times — passthrough and MITM, each on gVisor and micro-VM — and `egressmitm`
+twice. Every new egress assertion is paid for four times in wall-clock and flake
+surface, and the lane ordering is load-bearing (§6).
+
+**The nftables rows land once, not once per sandbox class.** The four-lane CI
+matrix invites a ×2 for gVisor and micro-VM, and there isn't one: both classes
+call the same `ateomnet.SetupActorNetwork`, from `cmd/ateom-gvisor/main.go:625`
+and `:894` and from `cmd/ateom-microvm/run.go:401` and `restore.go:277`, and it
+calls `InstallActorNftablesRules` at `net.go:571`. One edit, four lanes of
+verification. Nor does the DNS carve-out need a new flag threaded through those
+four call sites: the worker pod's `/etc/resolv.conf` holds the cluster resolver
+and is already read in-process by `writeGuestResolvConf` (`run.go:228`).
+
+**For the UDP rows the test is the deliverable.** The `forward` chain is already
+there with policy accept (`net.go:280-295`), so a drop is a rule, not a chain,
+and the demo actor already has the shape a UDP probe needs — `/grpc` sits beside
+`/` in the same mux (`demos/egress/main.go:152`), so a `/udp` endpoint is a
+handler, not a fixture. Two things are genuinely missing rather than cheap: there
+is no UDP or destination-port matcher to compose against (`TCPProtocol` at
+`net.go:346` is the only L4 helper, and nothing reaches into the transport
+header), and the forward chain's unconditional accept (`net.go:289-295`) has to
+be inserted around rather than appended to. Neither is hard. What the estimate
+actually buys is a fixture that proves a packet *did not* leave, because a
+regression here fails open and silently and no existing test would say so.
+
+**Four of the non-UDP rows are sdsmint-only, which relaxes the first three
+floors.** §5.4, §5.8/§5.10, §5.9 and §5.13 all read "shipped: opaque, works" and
+fail only under interception. Their fix therefore lands in
+`atenet-egress-with-sdsmint.yaml` alone — one file, not three — is qualified
+against Envoy v1.37 rather than the shipped v1.34, and is exercised by the
+`E2E_EGRESS_MITM=1` lanes rather than all four. The duplication and version
+floors above bite the UDP rows and the shared listener, not these. What they buy
+in exchange is bounded: they matter exactly as much as defaulting sdsmint on
+does.
+
+**Egress does not inherit the ingress harness's UDP problem.** §4.10 prices raw
+UDP ingress partly for lack of any way to get a datagram to the cluster —
+`internal/portforward` is TCP-only. Egress never needs one: the suite drives the
+actor over ordinary HTTP through the router (`postThroughEgressActor`) and the
+actor originates the datagram from inside the cluster itself. The assertion is a
+JSON field in the actor's reply, plus a gateway access log. That asymmetry is why
+UDP costs days here and weeks there.
+
+#### Closing a hole is not the same project as policing it
+
+Every P0 admits two fixes, and the matrix prices only one of them. **Closing**
+means making UDP fail shut — reject the datagrams and let the actor fall back to
+TCP, which the tunnel already polices. **Policing** means carrying UDP through
+the gateway with an actor identity attached. Closing is days. Policing is over a
+month. The P0s are P0 because traffic escapes unlogged, and closing removes that
+entirely, so the table prices both.
+
+| Row | § | Matrix | Standalone | Incremental | What dominates |
+| --- | --- | --- | --- | --- | --- |
+| raw UDP — close | 5.2 | M | 4–5 d | — | the DNS carve-out, and an e2e that proves a drop |
+| raw UDP — police | 5.2 | M | 5–7 wk | +4–6 wk after close | CONNECT-UDP end to end; a new ext_proc shape |
+| DNS | 5.3 | M | 2–4 d | +0 d with UDP-close | pinning the masquerade to the cluster resolver — the same rule |
+| HTTP/3 GET — close | 5.11 | S | 2–3 d | — | `reject`, not `drop`, so the client fails over at once |
+| HTTP/3 CONNECT, WS over h3 | 5.11, 5.14 | S | — | +0 d | the same rule; nothing protocol-specific |
+| HTTP/3 — police | 5.11 | — | 6–8 wk | +1–2 wk after UDP-police | QUIC on the gateway; no demand |
+| TLS (non-HTTP) | 5.4 | S | 2–3 d | — | an in-cluster non-HTTP TLS origin to test against |
+| HTTP/1.1 and h2 CONNECT | 5.8, 5.10 | M | 4–6 d | — | 0.5 d to settle `http_inspector` first; the fix branches on the answer |
+| HTTP/2 GET | 5.9 | M | 1–1.5 wk | — | un-pinning chain 1 without breaking WebSockets |
+| WebSocket over HTTP/2 | 5.13 | S | 1–2 d | — | one `allow_connect` on `mitm_http` |
+| raw TCP, SSH, HTTP/1.0, HTTP/1.1 GET, WS over h1 | 5.1, 5.5–5.7, 5.12 | — | 0 | — | no gap |
+
+**§5.3 has no independent cost.** The DNS row and the UDP-close row are one
+nftables edit seen twice: narrowing the masquerade to the cluster resolver is
+precisely what makes dropping everything else safe. §5's preamble already calls
+§5.3 a prerequisite rather than a gap; the corollary is that it disappears into
+§5.2's close. Its `M` belongs to the policing project, not to the row.
+
+**§5.11's `S` is real, and it is the best-value row in this document.** The one
+design choice worth making deliberately: `drop` leaves a QUIC client waiting out
+its own timeout before racing TCP, while `reject with icmp port-unreachable`
+makes the fallback immediate. Same rule count either way, and `expr.Reject` is in
+the nftables library already; the `forward` chain is `ChainTypeFilter` on
+`ChainHookForward` (`net.go:281-288`), which is one of the hooks reject is legal
+in — it would not be from either NAT chain. Standalone the row needs a UDP
+destination-port matcher that does not exist yet; done as part of the UDP close
+it needs nothing at all, because a blanket non-DNS UDP drop already covers 443.
+
+**§5.4's `S` survives, and the origin is cheaper than it was.** The config is two
+chain edits in one manifest — qualify chain 1 with `application_protocols`, add a
+bare `transport_protocol: tls` chain to `egress_tcp_passthrough`. Nothing in CI
+speaks non-HTTP TLS today (§6 lists it under no automated coverage, resting on
+the manual harness), so the balance of the estimate is standing up an origin —
+but `e2e.DeployServerPod` now renders any `--listen=:<port>` binary into a Pod
+and a Service from one shared template, so that is a small `main` and a struct
+literal. The one snag: the template's readiness probe is HTTP GET or gRPC only
+(`serverpod.go:144-153`), and a raw TLS listener answers neither, so it wants a
+`tcpSocket` variant — an hour in `serverReadinessProbe`, not a new fixture. The
+row also trades a correctness bug for a policy one, as §5.4 says: no-ALPN TLS
+clients then pass through unexamined.
+
+**§5.8's `M` is mostly the unknown.** Half a day with
+`docs/dev/non-http-egress-manual-test.md` decides whether there is anything to
+fix at all — if `http_inspector` does not claim `CONNECT`, the connection lands
+on chain 3 and already works. The 4–6 d assumes the unfavourable answer, and
+assumes the sdsmint scoping above: one manifest, and the two MITM lanes. Settle
+the question before scheduling the row — the favourable answer takes it to zero.
+
+**§5.9 is not the cluster swap it looks like.** Putting `auto_config` or
+`use_downstream_protocol_config` on `egress_forward_proxy` restores h2 and
+trailers and breaks every WebSocket (§5.12) — the HTTP/1.1 pin is load-bearing,
+deliberately. The fix is a route-level split on the `upgrade` header so the two
+cases reach different clusters, which makes the estimate testing rather than
+config.
+
+**Policing UDP is an `L`, not an `M`.** RFC 9298 CONNECT-UDP needs h2 extended
+CONNECT, and listener A is `codec_type: HTTP1` with no `allow_connect`. The
+destination moves out of `:authority` and into the request path, so
+`HandleRequestHeaders` changes shape — it rejects non-CONNECT outright
+(`egress.go:97`) and reads the destination from `:authority` (`egress.go:131`).
+atunnel gains a UDP listener and per-flow demux where today `validateDestination`
+requires an IP literal for a TCP dial (`client.go:208-221`). The egress Service
+publishes 443/TCP only (`atenet-egress.yaml:391-393`). That is a subsystem.
+
+The ordering these numbers suggest is not the one the matrix implies. Every P0
+collapses into **under one engineer-week total** if the goal is to stop traffic
+escaping unpoliced: reject UDP/443, pin the masquerade to the cluster resolver,
+drop the rest. That is one change to one function, and it closes §5.2, §5.3,
+§5.11 and §5.14 together — converting the only fail-open rows in this document
+into fail-closed ones. The 5–7 week policing project buys UDP *support*, which
+nothing currently demands; it should not be what keeps the P0s open.
+
+Everything left after that week is sdsmint-only, and none of it is fail-open. So
+the egress backlog is really two decisions, not eleven rows: whether to close UDP
+now (a week, and the answer is obviously yes), and whether sdsmint is going to
+default on (which, if yes, makes §5.4, §5.8, §5.9 and §5.13 a further 2.5–4
+engineer-weeks, and if no, makes them documentation).
+
 ---
 
 ## 6. What CI actually exercises
@@ -658,7 +1273,7 @@ lane runs once per sandbox class (gVisor and micro-VM).
 | `networking` `TestActorEgressGRPC` | h2c + trailers, unary/server-stream/bidi, §5.9 | both |
 | `networking` `TestActorDirectAccess`, `TestActorArbitraryPortAccess` | ingress HTTP/1.1, §4.4 | n/a |
 | `egressmitm` `TestActorEgressMITMTrust` | the MITM CA reaching the actor's trust store, §5.4/§5.7 | sdsmint only (skips otherwise) |
-| `egressauthz` | the gateway refusing a non-actor workload and an unknown actor, E2 in §2 | passthrough lanes; the behaviour does not depend on the variant |
+| `egressauthz` | the gateway refusing a non-actor workload and an unknown actor, E3 in §2 | passthrough lanes; the behaviour does not depend on the variant |
 | `cmd/atenet/internal/sdsmint` `manifest_test.go` | the MITM CA mounting only on the `sdsmint` container | unit |
 
 `TestActorEgressMITMTrust` also carries a system-roots negative control, which is
@@ -691,3 +1306,10 @@ Two root-level design docs disagree with the shipped code. The code is correct.
   presents the **actor** certificate — see `internal/atunnel/credential.go`,
   `prepareActorEgress` in `cmd/ateom-gvisor/main.go`, and the observed
   `peer_san=spiffe://substrate-actor.local/...` in the access log quoted in §5.5.
+
+One drift between the two manifests rather than between doc and code: the
+shipped `atenet-egress.yaml` binds both `:443` and the admin `:15000` to `::`
+with `ipv4_compat: true`, and comments that this is load-bearing for the kubelet
+dialling the pod IP. `atenet-egress-with-sdsmint.yaml` still binds both to
+`0.0.0.0`, so it works only on an IPv4 cluster. Harmless today — the MITM
+variant is experimental and CI runs IPv4 — but the two files should converge.
