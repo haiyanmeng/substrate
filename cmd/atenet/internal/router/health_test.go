@@ -17,9 +17,12 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -67,6 +70,116 @@ func setHealthyDataplaneClient(rh *routerHealth) {
 			Body:       io.NopCloser(strings.NewReader("LIVE")),
 		}, nil
 	})}
+}
+
+// writeServingBundle drops a credential bundle whose leaf expires at notAfter
+// into a temp dir, standing in for the projected podCertificate volume.
+func writeServingBundle(t *testing.T, notAfter time.Time) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "credential-bundle.pem")
+	if err := os.WriteFile(path, makeServingBundleExpiring(t, "atenet-egress", notAfter), 0o600); err != nil {
+		t.Fatalf("write credential bundle: %v", err)
+	}
+	return path
+}
+
+// newServingCertHealth builds a routerHealth whose dataplane admin API reports
+// loading certPath with the given expiry. A zero loadedExpiry reports a
+// dataplane that has no certificate at all.
+func newServingCertHealth(t *testing.T, certPath string, loadedExpiry time.Time) *routerHealth {
+	t.Helper()
+	rh := newRouterHealth(time.Second, nil, nil, routerConfig{
+		Mode:           ModeEgress,
+		EnvoyCertPath:  certPath,
+		EnvoyAdminAddr: "localhost:15000",
+	})
+	body := `{"certificates":[]}`
+	if !loadedExpiry.IsZero() {
+		body = fmt.Sprintf(`{"certificates":[{"ca_cert":[],"cert_chain":[{"path":%q,"expiration_time":%q}]}]}`,
+			certPath, loadedExpiry.UTC().Format(time.RFC3339))
+	}
+	rh.dataplaneClient = &http.Client{Transport: healthRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/certs" {
+			t.Errorf("serving certificate check requested %s, want /certs", req.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+	return rh
+}
+
+// TestCheckServingCert covers the divergence the SDS delivery in sds.go exists
+// to prevent: the dataplane holding a leaf older than the one on disk, which
+// nothing else reports until that leaf expires and every handshake fails.
+func TestCheckServingCert(t *testing.T) {
+	onDisk := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+
+	t.Run("in sync", func(t *testing.T) {
+		certPath := writeServingBundle(t, onDisk)
+		healthy, msg := newServingCertHealth(t, certPath, onDisk).checkServingCert(context.Background())
+		if !healthy {
+			t.Errorf("checkServingCert() = (false, %q), want healthy when the loaded leaf matches the bundle", msg)
+		}
+	})
+
+	t.Run("rotation not picked up", func(t *testing.T) {
+		// The shape of the outage this check is for: kubelet has written the
+		// replacement, and the dataplane is still on the leaf it booted with.
+		certPath := writeServingBundle(t, onDisk)
+		stale := onDisk.Add(-23 * time.Hour)
+		healthy, msg := newServingCertHealth(t, certPath, stale).checkServingCert(context.Background())
+		if healthy {
+			t.Fatal("checkServingCert() = healthy while the dataplane served a leaf a day behind the bundle on disk")
+		}
+		for _, want := range []string{stale.UTC().Format(time.RFC3339), onDisk.UTC().Format(time.RFC3339), certPath} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("checkServingCert() message = %q, want it to name %q", msg, want)
+			}
+		}
+	})
+
+	t.Run("within the reload grace", func(t *testing.T) {
+		// Reading the file and reading the admin API are two instants with the
+		// reload in between, so a lag under the grace is that race, not a fault.
+		certPath := writeServingBundle(t, onDisk)
+		lagging := onDisk.Add(-(servingCertReloadGrace / 2))
+		healthy, msg := newServingCertHealth(t, certPath, lagging).checkServingCert(context.Background())
+		if !healthy {
+			t.Errorf("checkServingCert() = (false, %q), want the reload race tolerated", msg)
+		}
+	})
+
+	t.Run("nothing loaded", func(t *testing.T) {
+		certPath := writeServingBundle(t, onDisk)
+		healthy, msg := newServingCertHealth(t, certPath, time.Time{}).checkServingCert(context.Background())
+		if healthy {
+			t.Fatal("checkServingCert() = healthy while the dataplane had no certificate loaded")
+		}
+		if !strings.Contains(msg, certPath) {
+			t.Errorf("checkServingCert() message = %q, want it to name %q", msg, certPath)
+		}
+	})
+}
+
+// A router with no dataplane certificate to speak of — an ext_proc-only
+// deployment, or agentgateway — must not report a permanently degraded
+// dependency, nor dial an admin API that is not there.
+func TestCheckServingCertSkippedWithoutCertPath(t *testing.T) {
+	rh := newRouterHealth(time.Second, nil, nil, routerConfig{EnvoyAdminAddr: "localhost:9901"})
+	rh.dataplaneClient = &http.Client{Transport: healthRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Error("serving certificate check dialed the dataplane admin API with no certificate configured")
+		return nil, errors.New("unexpected request")
+	})}
+
+	healthy, msg := rh.checkServingCert(context.Background())
+	if !healthy {
+		t.Errorf("checkServingCert() healthy = false, want true (skipped)")
+	}
+	if !strings.Contains(msg, "Skipped") {
+		t.Errorf("checkServingCert() message = %q, want it to report the check was skipped", msg)
+	}
 }
 
 func TestCheckDataplane(t *testing.T) {

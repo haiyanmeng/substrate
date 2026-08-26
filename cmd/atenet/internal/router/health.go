@@ -16,11 +16,14 @@ package router
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -43,9 +46,10 @@ type ComponentHealth struct {
 }
 
 type RouterHealthReport struct {
-	Dataplane ComponentHealth `json:"dataplane"`
-	K8sAPI    ComponentHealth `json:"k8s_api"`
-	AteAPI    ComponentHealth `json:"ate_api"`
+	Dataplane   ComponentHealth `json:"dataplane"`
+	ServingCert ComponentHealth `json:"serving_cert"`
+	K8sAPI      ComponentHealth `json:"k8s_api"`
+	AteAPI      ComponentHealth `json:"ate_api"`
 }
 
 type componentHealthCheckResult struct {
@@ -104,12 +108,16 @@ func (rh *routerHealth) check(ctx context.Context) {
 	// Run network checks concurrently and without holding the report mutex, so
 	// the cycle is bounded by the slowest dependency and status requests can
 	// continue serving the last completed report.
-	var dataplaneResult, k8sResult, ateResult componentHealthCheckResult
+	var dataplaneResult, servingCertResult, k8sResult, ateResult componentHealthCheckResult
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 	go func() {
 		defer wg.Done()
 		dataplaneResult = runComponentHealthCheck(ctx, "Router dataplane health check failed", rh.checkDataplane)
+	}()
+	go func() {
+		defer wg.Done()
+		servingCertResult = runComponentHealthCheck(ctx, "Dataplane serving certificate health check failed", rh.checkServingCert)
 	}()
 	go func() {
 		defer wg.Done()
@@ -124,6 +132,7 @@ func (rh *routerHealth) check(ctx context.Context) {
 	rh.mu.Lock()
 	defer rh.mu.Unlock()
 	updateComponentHealth(&rh.report.Dataplane, dataplaneResult.healthy, dataplaneResult.message, dataplaneResult.checkedAt)
+	updateComponentHealth(&rh.report.ServingCert, servingCertResult.healthy, servingCertResult.message, servingCertResult.checkedAt)
 	updateComponentHealth(&rh.report.K8sAPI, k8sResult.healthy, k8sResult.message, k8sResult.checkedAt)
 	updateComponentHealth(&rh.report.AteAPI, ateResult.healthy, ateResult.message, ateResult.checkedAt)
 }
@@ -195,6 +204,134 @@ func (rh *routerHealth) checkDataplane(ctx context.Context) (bool, string) {
 	}
 
 	return true, check.expectedBody
+}
+
+// servingCertReloadGrace is how far the dataplane's loaded certificate may lag
+// the bundle on disk before the check calls it stuck. A rotation is two
+// separate reads from outside — the file, then the admin endpoint — with the
+// proxy's own reload somewhere in between, so a small lag is that race and not
+// a fault. It is minutes against a certificate lifetime of a day, so a real
+// stall is still caught with hours to spare.
+const servingCertReloadGrace = 2 * time.Minute
+
+// envoyCertsResponse is the part of Envoy's admin /certs output this check
+// reads: for each TLS context, the chain it currently has loaded.
+type envoyCertsResponse struct {
+	Certificates []struct {
+		CertChain []struct {
+			Path           string `json:"path"`
+			ExpirationTime string `json:"expiration_time"`
+		} `json:"cert_chain"`
+	} `json:"certificates"`
+}
+
+// checkServingCert compares the certificate the dataplane has loaded against
+// the credential bundle on disk.
+//
+// It exists because that divergence is invisible from everywhere else. A proxy
+// holding a certificate it has stopped refreshing stays live, ready, and
+// serving — /ready says nothing about leaf validity — right up to the moment
+// the leaf expires, when every handshake resets at once and stays broken until
+// someone restarts the pod. Kubelet rotates a podCertificate with only hours
+// of overlap, so the window between "the reload silently did not happen" and
+// "the gateway is down" is short and entirely unlit.
+func (rh *routerHealth) checkServingCert(ctx context.Context) (bool, string) {
+	if rh.cfg.EnvoyCertPath == "" || rh.cfg.EnvoyAdminAddr == "" || rh.cfg.atenetRouter() != atenetRouterEnvoy {
+		return true, "Skipped (no Envoy dataplane serving certificate configured)"
+	}
+
+	onDisk, err := credentialBundleNotAfter(rh.cfg.EnvoyCertPath)
+	if err != nil {
+		return false, err.Error()
+	}
+	loaded, err := rh.loadedCertNotAfter(ctx, rh.cfg.EnvoyCertPath)
+	if err != nil {
+		return false, err.Error()
+	}
+
+	if onDisk.Sub(loaded) > servingCertReloadGrace {
+		return false, fmt.Sprintf("the dataplane is serving a leaf that expires at %s while %s already holds one valid to %s: the rotation was not picked up, and every TLS handshake fails from the earlier time onwards",
+			loaded.Format(time.RFC3339), rh.cfg.EnvoyCertPath, onDisk.Format(time.RFC3339))
+	}
+	return true, fmt.Sprintf("Serving a leaf valid to %s", loaded.Format(time.RFC3339))
+}
+
+// credentialBundleNotAfter reads the leaf expiry out of a projected
+// podCertificate credential bundle. The leaf is the first certificate in the
+// PEM; the private key and any intermediates share the file.
+func credentialBundleNotAfter(path string) (time.Time, error) {
+	pemBytes, err := os.ReadFile(path)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("reading credential bundle: %w", err)
+	}
+	for rest := pemBytes; len(rest) > 0; {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		leaf, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("parsing leaf from %s: %w", path, err)
+		}
+		return leaf.NotAfter, nil
+	}
+	return time.Time{}, fmt.Errorf("no certificate in %s", path)
+}
+
+// loadedCertNotAfter asks Envoy's admin API when the certificate it loaded
+// from certPath expires. Envoy reports one entry per TLS context, and this
+// takes the latest: contexts reload independently, and treating the first one
+// to catch up as the answer would flap on every rotation.
+func (rh *routerHealth) loadedCertNotAfter(ctx context.Context, certPath string) (time.Time, error) {
+	timeoutCtx, cancel := context.WithTimeout(ctx, dependencyHealthCheckTimeout)
+	defer cancel()
+
+	url := "http://" + rh.cfg.EnvoyAdminAddr + "/certs"
+	req, err := http.NewRequestWithContext(timeoutCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return time.Time{}, err
+	}
+	resp, err := rh.dataplaneClient.Do(req)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return time.Time{}, fmt.Errorf("%s returned status %d", url, resp.StatusCode)
+	}
+
+	certs := &envoyCertsResponse{}
+	if err := json.NewDecoder(resp.Body).Decode(certs); err != nil {
+		return time.Time{}, fmt.Errorf("decoding %s: %w", url, err)
+	}
+
+	var latest time.Time
+	for _, c := range certs.Certificates {
+		for _, chain := range c.CertChain {
+			if chain.Path != certPath {
+				continue
+			}
+			expiry, err := time.Parse(time.RFC3339, chain.ExpirationTime)
+			if err != nil {
+				return time.Time{}, fmt.Errorf("parsing expiration_time %q from %s: %w", chain.ExpirationTime, url, err)
+			}
+			if expiry.After(latest) {
+				latest = expiry
+			}
+		}
+	}
+	if latest.IsZero() {
+		// Also the startup state, until the dataplane finishes warming its
+		// listeners. Reported as a failure regardless: a dataplane that never
+		// loads the certificate is exactly as broken as one that loaded it and
+		// then went stale.
+		return time.Time{}, fmt.Errorf("the dataplane has no certificate loaded from %s", certPath)
+	}
+	return latest, nil
 }
 
 func (rh *routerHealth) checkK8s(ctx context.Context) (bool, string) {

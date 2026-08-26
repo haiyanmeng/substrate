@@ -567,6 +567,13 @@ func TestTlsSecret_ProjectedVolumeRotation(t *testing.T) {
 // private key followed by a self-signed serving cert with the given CN.
 func makeServingBundle(t *testing.T, cn string) []byte {
 	t.Helper()
+	return makeServingBundleExpiring(t, cn, time.Now().Add(time.Hour))
+}
+
+// makeServingBundleExpiring is makeServingBundle with the leaf's NotAfter
+// chosen by the caller, for tests about certificate lifetime.
+func makeServingBundleExpiring(t *testing.T, cn string, notAfter time.Time) []byte {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
@@ -575,7 +582,7 @@ func makeServingBundle(t *testing.T, cn string) []byte {
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: cn},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
+		NotAfter:     notAfter,
 		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
