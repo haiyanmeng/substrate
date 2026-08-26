@@ -75,13 +75,21 @@ type authConfig struct {
 // routerConfig holds deployment setup and endpoint options for the router node instance.
 type routerConfig struct {
 	// Mode restricts the instance to one traffic direction. Empty means ModeAll.
-	Mode           Mode
-	AtenetRouter   string
-	Namespace      string
-	Kubeconfig     string
-	AteapiAddr     string
-	HttpPort       int
-	XdsPort        int
+	Mode         Mode
+	AtenetRouter string
+	Namespace    string
+	Kubeconfig   string
+	AteapiAddr   string
+	HttpPort     int
+	XdsPort      int
+	// SdsPort is the loopback port for the SDS server that hands EnvoyCertPath
+	// to a statically configured dataplane — the egress gateway, which runs no
+	// xDS control plane of its own. It exists because a bootstrap
+	// tls_certificates entry never picks up kubelet's certificate rotation;
+	// see credentialBundleSecret. Non-positive disables the server, which is
+	// what an ingress router wants: its xDS server already publishes the same
+	// secret over ADS.
+	SdsPort        int
 	ExtprocPort    int
 	ExtprocAddr    string
 	TemplatesFile  string
@@ -223,6 +231,10 @@ func (c routerConfig) validate() error {
 	}
 	if err := c.ParkedRequest.Validate(); err != nil {
 		return err
+	}
+
+	if c.SdsPort > 0 && c.EnvoyCertPath == "" {
+		return fmt.Errorf("--port-sds is set (%d) but --envoy-cert-path is empty: the SDS server would publish a secret naming no file, and the dataplane waiting on it would never open its TLS listener", c.SdsPort)
 	}
 
 	if c.ExtProcMaxRequests < 0 {

@@ -132,6 +132,15 @@ emit_additional_egress_extproc_cluster() {
           tls_minimum_protocol_version: TLSv1_3
           tls_maximum_protocol_version: TLSv1_3
         # The gateway's own pod identity.
+        #
+        # TODO: route this through the sds_server cluster, as the egress
+        # listener's serving certificate is. Neither watched_directory below
+        # does anything: Envoy honors the field only for a TlsCertificate (or
+        # trusted_ca) delivered by SDS, and reads a statically named file once
+        # at config load. So this leg presents the podidentity leaf the gateway
+        # booted with, and once kubelet rotates it past expiry the ext_proc
+        # handshake fails until the pod restarts. Left as is because this whole
+        # cluster is behind --experimental-additional-egress-extproc-service.
         tls_certificates:
         - certificate_chain: { filename: /run/podidentity.podcert.ate.dev/credential-bundle.pem }
           private_key: { filename: /run/podidentity.podcert.ate.dev/credential-bundle.pem }

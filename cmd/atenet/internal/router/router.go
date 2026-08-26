@@ -270,6 +270,28 @@ func (s *RouterServer) Run(ctx context.Context) error {
 		}
 	}
 
+	// The egress gateway is statically configured, with one exception: its
+	// serving certificate has to arrive over SDS or kubelet's podCertificate
+	// rotation is never picked up (see credentialBundleSecret). This SDS server
+	// is the whole control plane such a gateway has, so it is independent of
+	// the ingress one above and runs in either mode.
+	if s.cfg.SdsPort > 0 {
+		sdsSrv := NewSdsServer(s.cfg.EnvoyCertPath)
+		g.Go(func() error {
+			slog.InfoContext(ctx, "Starting Envoy SDS Server",
+				slog.Int("port", s.cfg.SdsPort), slog.String("cert_path", s.cfg.EnvoyCertPath))
+			// Loopback only: the sole client is the dataplane sharing this pod,
+			// and the pod IP would expose the secret stream cluster-wide.
+			lis, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", s.cfg.SdsPort))
+			if err != nil {
+				return fmt.Errorf("failed to listen on sds port %d: %w", s.cfg.SdsPort, err)
+			}
+			defer lis.Close()
+
+			return sdsSrv.Serve(ctx, lis)
+		})
+	}
+
 	// Start periodic service checking logic
 	g.Go(func() error {
 		slog.InfoContext(ctx, "Starting periodic health checker", slog.Duration("interval", s.cfg.HealthInterval))

@@ -70,13 +70,30 @@ data:
               "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
               require_client_certificate: true
               common_tls_context:
-                tls_certificates:
-                # Gateway server identity (servicedns signer). credential-bundle.pem
-                # holds the leaf cert and key concatenated. watched_directory picks
-                # up kubelet's projected certificate rotation without a restart.
-                - certificate_chain: { filename: /run/servicedns.podcert.ate.dev/credential-bundle.pem }
-                  private_key: { filename: /run/servicedns.podcert.ate.dev/credential-bundle.pem }
-                  watched_directory: { path: /run/servicedns.podcert.ate.dev }
+                # Gateway server identity (servicedns signer), delivered by the
+                # ext-proc sidecar over SDS rather than named here. Naming the
+                # projected credential-bundle.pem in a static tls_certificates
+                # entry does work, once: Envoy honors watched_directory only for
+                # a certificate delivered by SDS, so on a static entry it is
+                # accepted and ignored, the bundle is read at config load, and
+                # the gateway serves that leaf until it expires no matter how
+                # often kubelet rotates the file underneath it. Secret name must
+                # match GatewayCertSecretName in
+                # cmd/atenet/internal/router/sds.go.
+                #
+                # Distinct from the sds_mint cluster below, which mints
+                # per-destination MITM leaf certificates on demand. This is the
+                # gateway's own identity on the actor-facing listener.
+                tls_certificate_sds_secret_configs:
+                - name: gateway_serving_cert
+                  sds_config:
+                    resource_api_version: V3
+                    api_config_source:
+                      api_type: GRPC
+                      transport_api_version: V3
+                      grpc_services:
+                      - envoy_grpc:
+                          cluster_name: sds_server
                 validation_context:
                   # Actors authenticate with an actor-identity client cert.
                   # Envoy enforces chain, signature, and validity period here, so
@@ -585,6 +602,28 @@ data:
                   socket_address:
                     address: 127.0.0.1
                     port_value: 50051
+      # SDS server = the same atenet router sidecar, on its own loopback port.
+      # It publishes one secret, the gateway's serving certificate; see the
+      # egress listener above for why that cannot be a static tls_certificates
+      # entry. Unrelated to sds_mint, which mints MITM leaves on demand.
+      - name: sds_server
+        type: STATIC
+        lb_policy: ROUND_ROBIN
+        connect_timeout: 1s
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            explicit_http_config:
+              http2_protocol_options: {}
+        load_assignment:
+          cluster_name: sds_server
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 127.0.0.1
+                    port_value: 50052
       # The only cluster that dials the internet. Reached from the MITM leg, so
       # the host it resolves comes from the decrypted request's own Host header
       # rather than from the CONNECT authority.
@@ -917,6 +956,11 @@ spec:
         - --namespace=ate-system
         - --port-extproc=50051
         - --extproc-address=127.0.0.1
+        # Publishes the gateway's serving certificate over SDS. The egress Envoy
+        # is otherwise entirely bootstrap-configured; this exists only so the
+        # certificate rotates — see the listener's common_tls_context above.
+        - --port-sds=50052
+        - --envoy-cert-path=/run/servicedns.podcert.ate.dev/credential-bundle.pem
         - --ateapi-address=dns:///api.ate-system.svc:443
         - --ateapi-ca-file=/run/servicedns.podcert.ate.dev/trust-bundle.pem
         - --ateapi-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem

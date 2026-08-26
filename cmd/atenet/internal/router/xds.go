@@ -21,7 +21,6 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -1288,31 +1287,7 @@ func (x *XdsServer) buildConnectTerminateTLSListener() *listenerv3.Listener {
 }
 
 func (x *XdsServer) buildTlsSecret() *tlsv3.Secret {
-	return &tlsv3.Secret{
-		Name: HTTPSCertSecretName,
-		Type: &tlsv3.Secret_TlsCertificate{
-			TlsCertificate: &tlsv3.TlsCertificate{
-				// The pod certificate is projected as a single PEM bundle
-				// holding both the cert chain and the private key, so both
-				// DataSources point at the same file.
-				CertificateChain: &corev3.DataSource{
-					Specifier: &corev3.DataSource_Filename{
-						Filename: x.certPath,
-					},
-				},
-				PrivateKey: &corev3.DataSource{
-					Specifier: &corev3.DataSource_Filename{
-						Filename: x.certPath,
-					},
-				},
-				// By specifying WatchedDirectory, we tell envoy to watch changes to the mounted pod certificate file.
-				// See documentation in https://pkg.go.dev/github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3#:~:text=This%20only%20applies%20when%20a%20%E2%80%9CTlsCertificate%E2%80%9C%20is%20delivered%20by%20SDS
-				WatchedDirectory: &corev3.WatchedDirectory{
-					Path: filepath.Dir(x.certPath),
-				},
-			},
-		},
-	}
+	return credentialBundleSecret(HTTPSCertSecretName, x.certPath)
 }
 
 func newAny(msg proto.Message) *anypb.Any {
