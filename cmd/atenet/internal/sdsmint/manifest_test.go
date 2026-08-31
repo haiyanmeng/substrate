@@ -26,6 +26,13 @@ import (
 
 const sdsmintContainerName = "sdsmint"
 
+// egressManifestPath is the deployed egress gateway, read by every test here.
+const egressManifestPath = "../../../../manifests/ate-install/atenet-egress-with-sdsmint.yaml"
+
+// sniForwardProxyFilter resolves the upstream from the SNI the filter chain
+// matched on. A bypass chain without it dials something else.
+const sniForwardProxyFilter = "envoy.filters.network.sni_dynamic_forward_proxy"
+
 // TestManifestKeepsTheCAOffTheDataPlane verifies that the MITM CA is only mounted
 // on the `sdsmint` container in the `atenet-egress` Deployment.
 func TestManifestKeepsTheCAOffTheDataPlane(t *testing.T) {
@@ -70,9 +77,139 @@ func sdsmintCAPoolPath(t *testing.T, pod *corev1.PodSpec) string {
 	return path
 }
 
+// TestBypassChainsResolveTheNameTheyMatched guards the one thing that turns a
+// destination allowlist back into a global opt-out. A chain selected by SNI and
+// pointed at an ORIGINAL_DST cluster matches on one actor-controlled value and
+// dials another: the actor sends an allowlisted SNI, aims the socket at its own
+// server, and reaches it with interception off. Resolving the matched name is
+// what keeps the two from disagreeing, and nothing else in the config notices
+// if it stops happening -- traffic still flows, to the wrong place.
+func TestBypassChainsResolveTheNameTheyMatched(t *testing.T) {
+	cfg := egressEnvoyConfig(t)
+
+	originalDst := map[string]bool{}
+	for _, c := range cfg.StaticResources.Clusters {
+		if c.Type == "ORIGINAL_DST" {
+			originalDst[c.Name] = true
+		}
+	}
+
+	for _, listener := range cfg.StaticResources.Listeners {
+		for i, chain := range listener.FilterChains {
+			// A nil ServerNames is a chain that does not select on SNI at all.
+			// An empty one is the shipped bypass chain, which selects on SNI and
+			// currently names nothing -- still subject to this.
+			if chain.FilterChainMatch.ServerNames == nil {
+				continue
+			}
+			var sawSNIResolver bool
+			for _, f := range chain.Filters {
+				if f.Name == sniForwardProxyFilter {
+					sawSNIResolver = true
+				}
+				cluster, _ := f.TypedConfig["cluster"].(string)
+				if originalDst[cluster] {
+					t.Errorf("listener %s filter chain %d selects on SNI %v but forwards to %q, an ORIGINAL_DST cluster; it would dial the address the actor's socket names rather than the name that was policed, so any actor could reach any destination with MITM off by sending an allowlisted SNI",
+						listener.Name, i, chain.FilterChainMatch.ServerNames, cluster)
+				}
+			}
+			if !sawSNIResolver {
+				t.Errorf("listener %s filter chain %d selects on SNI %v but has no %s filter; without it the upstream comes from somewhere other than the name that was matched",
+					listener.Name, i, chain.FilterChainMatch.ServerNames, sniForwardProxyFilter)
+			}
+		}
+	}
+}
+
+// TestBypassChainShipsWithNoDestinations keeps the shipped default at "intercept
+// everything". The bypass list is an operator's judgement about origins they
+// cannot intercept; a name checked in here would silently exempt it for every
+// deployment, and an exemption is invisible in traffic that otherwise looks fine.
+func TestBypassChainShipsWithNoDestinations(t *testing.T) {
+	cfg := egressEnvoyConfig(t)
+
+	var found bool
+	for _, listener := range cfg.StaticResources.Listeners {
+		for i, chain := range listener.FilterChains {
+			if chain.FilterChainMatch.ServerNames == nil {
+				continue
+			}
+			found = true
+			if len(chain.FilterChainMatch.ServerNames) != 0 {
+				t.Errorf("listener %s filter chain %d ships with server_names %v; the bypass list must be empty in the repository and set per deployment",
+					listener.Name, i, chain.FilterChainMatch.ServerNames)
+			}
+		}
+	}
+	if !found {
+		t.Error("no filter chain selects on server_names; the MITM bypass chain is gone, and with it the only way to reach an origin whose certificate the actor pins")
+	}
+}
+
+// egressEnvoyConfig is the Envoy bootstrap the egress gateway runs, read out of
+// the ConfigMap that supplies it.
+func egressEnvoyConfig(t *testing.T) *envoyBootstrap {
+	t.Helper()
+	for _, doc := range egressManifestDocs(t) {
+		var cm corev1.ConfigMap
+		if err := yaml.Unmarshal([]byte(doc), &cm); err != nil {
+			continue // not a ConfigMap; egressManifestDocs covers the whole file
+		}
+		if cm.Kind != "ConfigMap" {
+			continue
+		}
+		raw, ok := cm.Data["envoy.yaml"]
+		if !ok {
+			continue
+		}
+		var cfg envoyBootstrap
+		if err := yaml.Unmarshal([]byte(raw), &cfg); err != nil {
+			t.Fatalf("parsing envoy.yaml out of ConfigMap %s: %v", cm.Name, err)
+		}
+		return &cfg
+	}
+	t.Fatalf("%s has no ConfigMap carrying an envoy.yaml key", egressManifestPath)
+	return nil
+}
+
+// envoyBootstrap is the slice of the bootstrap these tests assert on. Envoy's
+// own Go types would pull the whole go-control-plane API in to read four fields,
+// and would reject the file over any unrelated field this package does not
+// otherwise care about.
+type envoyBootstrap struct {
+	StaticResources struct {
+		Listeners []struct {
+			Name         string `json:"name"`
+			FilterChains []struct {
+				FilterChainMatch struct {
+					TransportProtocol string   `json:"transport_protocol"`
+					ServerNames       []string `json:"server_names"`
+				} `json:"filter_chain_match"`
+				Filters []struct {
+					Name        string         `json:"name"`
+					TypedConfig map[string]any `json:"typed_config"`
+				} `json:"filters"`
+			} `json:"filter_chains"`
+		} `json:"listeners"`
+		Clusters []struct {
+			Name string `json:"name"`
+			Type string `json:"type"`
+		} `json:"clusters"`
+	} `json:"static_resources"`
+}
+
+// egressManifestDocs is the manifest split into its YAML documents.
+func egressManifestDocs(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile(egressManifestPath)
+	if err != nil {
+		t.Fatalf("reading %s: %v", egressManifestPath, err)
+	}
+	return strings.Split(string(raw), "\n---\n")
+}
+
 func egressPodSpec(t *testing.T) *corev1.PodSpec {
 	t.Helper()
-	const egressManifestPath = "../../../../manifests/ate-install/atenet-egress-with-sdsmint.yaml"
 	raw, err := os.ReadFile(egressManifestPath)
 	if err != nil {
 		t.Fatalf("reading %s: %v", egressManifestPath, err)
