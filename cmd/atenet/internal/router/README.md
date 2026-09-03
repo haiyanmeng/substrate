@@ -27,6 +27,9 @@ Router has several responsibilities:
   gateway's ext_proc handler re-verifies the actor's client certificate against
   the actor-identity CA, reads the `ActorIdentity` X.509 extension out of it,
   and checks the certified UID against the ATE API.
+* Decides per connection whether the egress gateway intercepts TLS, from the
+  actor's `tls_interception_exemptions`. See
+  [TLS interception exemptions](#tls-interception-exemptions).
 * Serves arbitrary-port ingress: a client reaches a port on the actor other
   than its default (80) by sending an HTTP CONNECT to
   `<actor-dns>:<port>` on `--port-connect`/`--port-connect-tls`, rather than
@@ -53,7 +56,11 @@ packages that cannot reach into each other:
   It imports neither handler package.
 * `ingress` — resume, park, and route to the actor's worker.
 * `egress` — certificate-based actor-identity authentication for outbound
-  CONNECTs.
+  CONNECTs, and the exemption set each one resolves to.
+* `egressxds` — the xDS server that renders those exemption sets into the
+  egress gateway's dispatch listener. It depends on `egress`, not the other way
+  around: `egress` reaches it through a one-method `ExemptionRegistry`
+  interface, so the handler can be tested without a dataplane.
 
 Direction is decided by the filter chain the dataplane says accepted the
 request (`xds.filter_chain_name`, an Envoy attribute the egress gateway is
@@ -108,9 +115,13 @@ One binary serves both directions. `--mode` selects which:
 
 | `--mode` | ext_proc handlers | xDS server | Kubernetes access |
 | --- | --- | --- | --- |
-| `ingress` | ingress | yes | yes |
-| `egress` | egress | no | none |
-| `all` (default) | both | yes | yes |
+| `ingress` | ingress | ingress dataplane (`--port-xds`) | yes |
+| `egress` | egress | dispatch listener only (`--port-egress-xds`) | none |
+| `all` (default) | both | both | yes |
+
+The two xDS servers are separate, on separate ports, because `--mode=all` runs
+both. The egress one serves exactly one listener to one node and reads nothing
+from Kubernetes.
 
 The mux refuses a direction this instance was not started to serve (404) rather
 than falling back to the other handler, which would run the request through the
@@ -122,6 +133,73 @@ independently, not because they need separate binaries.
 
 `--atenet-router` selects the dataplane for both Deployments. Each gateway has
 its own static configuration because ingress and egress scale independently.
+
+## TLS interception exemptions
+
+Under an sdsmint install the egress gateway terminates and re-originates every
+TLS connection an actor opens, so the actor sees a leaf the gateway minted
+rather than the origin's. Some destinations cannot be reached that way at all:
+a pinned certificate, or mutual TLS the actor holds the client key for. An
+actor's `EgressPolicy.tls_interception_exemptions` lists the hostnames whose
+TLS the gateway must leave alone.
+
+**An exemption is not an authorization.** It says *how* a destination is
+reached, not *whether*. `rules` is still what decides that.
+
+### how a connection is dispatched
+
+Envoy can only match an SNI against literals it was configured with; there is
+no matcher that searches a list carried on the connection. So the patterns have
+to be in the config, and only a name for them can travel with the request.
+
+1. `NewExemptionSet` folds a policy's patterns to lowercase, drops any trailing
+   dot, sorts and deduplicates them, and hashes the result. Two actors that
+   exempt the same names get the same **set ID**, and share one rendering.
+2. On each CONNECT the egress handler reads the actor's policy, resolves its
+   set, and registers it with `egressxds`. `Register` blocks until the gateway
+   has acknowledged a snapshot containing that set — naming a set the gateway
+   does not have yet would dispatch the connection to a filter chain that does
+   not exist.
+3. The handler returns the set ID as dynamic metadata. A `set_filter_state`
+   filter in the bootstrap copies it into filter state, which is what survives
+   the hop into an internal listener.
+4. `egress_dispatch`, served over LDS by `egressxds`, matches on that filter
+   state to pick the set's subtree, then on SNI within it. A hit goes to the
+   passthrough chain, which dials the original destination unmodified. Anything
+   else goes to the MITM chain.
+
+A pattern is either an exact hostname or a single leftmost-label wildcard:
+`*.cdn.example.com` covers `assets.cdn.example.com` and neither
+`cdn.example.com` nor `a.b.cdn.example.com`.
+
+This is the Envoy gateway only. `--atenet-router=agentgateway` runs a different
+proxy with no equivalent of `filter_chain_matcher`, and its MITM variant
+intercepts everything; an actor's exemptions there are ignored, which fails in
+the safe direction but is not the behavior the policy asked for.
+
+### failure modes
+
+Every one of them intercepts, which is the behavior of the gateway without this
+feature at all: no policy, an empty exemption list, an unreachable control
+plane, no gateway subscribed to LDS, a NACKed or unacknowledged snapshot, an
+unknown set ID on the connection, an SNI outside the set, or no SNI at all.
+Failing the other way would hand an actor an untapped tunnel by breaking
+something.
+
+The only case that fails the CONNECT rather than intercepting it is a policy
+lookup that errors for a reason other than `NotFound`, which the handler
+already treats as a control plane it cannot vouch for.
+
+### bounds
+
+atenet has no way to enumerate egress policies, so `egressxds` learns sets from
+live traffic instead. That means it also has to forget them: it holds at most
+512 sets, evicting the least recently used, and sweeps any set unused for 30
+minutes. An evicted set is re-registered by the next CONNECT that needs it.
+
+Snapshot versions carry a per-process epoch, so a gateway reconnecting after an
+atenet restart cannot have a stale version mistaken for an acknowledgement of
+the current one.
 
 ## status page
 

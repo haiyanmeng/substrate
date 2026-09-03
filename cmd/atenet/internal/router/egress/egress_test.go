@@ -192,13 +192,23 @@ func xfccHeaderDER(chain ...[]byte) string {
 
 // egressHandler builds a Handler whose GetActor returns actor/err.
 func egressHandler(roots *x509.CertPool, actor *ateapipb.Actor, err error) *Handler {
-	return New(&egressMockClient{actor: actor, err: err}, roots)
+	return New(&egressMockClient{actor: actor, err: err}, roots, nil)
 }
 
 type egressMockClient struct {
 	ateapipb.ControlClient
 	actor *ateapipb.Actor
 	err   error
+
+	policy    *ateapipb.EgressPolicy
+	policyErr error
+}
+
+func (m *egressMockClient) GetActorEgressPolicy(context.Context, *ateapipb.GetActorEgressPolicyRequest, ...grpc.CallOption) (*ateapipb.EgressPolicy, error) {
+	if m.policyErr != nil {
+		return nil, m.policyErr
+	}
+	return m.policy, nil
 }
 
 func (m *egressMockClient) GetActor(context.Context, *ateapipb.GetActorRequest, ...grpc.CallOption) (*ateapipb.Actor, error) {

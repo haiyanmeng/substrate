@@ -171,6 +171,14 @@ func ValidateCustom_EgressPolicy_Metadata(_ context.Context, _ operation.Operati
 }
 
 func ValidateCustom_HostnameRule_Patterns(_ context.Context, _ operation.Operation, p *field.Path, patterns, _ []string) field.ErrorList {
+	return validateHostnamePatterns(patterns, p)
+}
+
+func ValidateCustom_EgressPolicy_TlsInterceptionExemptions(_ context.Context, _ operation.Operation, p *field.Path, exemptions, _ []string) field.ErrorList {
+	return validateHostnamePatterns(exemptions, p)
+}
+
+func validateHostnamePatterns(patterns []string, p *field.Path) field.ErrorList {
 	var errs field.ErrorList
 	for i, raw := range patterns {
 		errs = append(errs, validateHostnamePattern(raw, p.Index(i))...)

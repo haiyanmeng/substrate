@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/egress"
+	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/egressxds"
 	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
 	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/ingress"
 	"github.com/agent-substrate/substrate/internal/ateapiauth"
@@ -214,7 +215,22 @@ func (s *RouterServer) Run(ctx context.Context) error {
 				return fmt.Errorf("loading --actor-identity-ca-file %q: %w", s.cfg.ActorIdentityCAFile, err)
 			}
 		}
-		egressHandler := egress.New(s.apiClient, actorIdentityRoots)
+		// The dispatch listener is the one piece of the egress gateway that
+		// cannot be static: which destinations skip TLS interception depends on
+		// actor policy, and Envoy can only decide that against configured
+		// literals. The handler registers each exemption set it sees here, and
+		// this server renders them.
+		egressExemptions := egressxds.New()
+		g.Go(func() error {
+			lis, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", s.cfg.EgressXdsPort))
+			if err != nil {
+				return fmt.Errorf("failed to listen on egress xDS port %d: %w", s.cfg.EgressXdsPort, err)
+			}
+			slog.InfoContext(ctx, "Starting egress dispatch xDS server", slog.Int("port", s.cfg.EgressXdsPort))
+			return egressExemptions.Serve(ctx, lis)
+		})
+
+		egressHandler := egress.New(s.apiClient, actorIdentityRoots, egressExemptions)
 		handlers[egressHandler.Direction()] = egressHandler
 	}
 
@@ -229,8 +245,9 @@ func (s *RouterServer) Run(ctx context.Context) error {
 	s.health = newRouterHealth(s.cfg.HealthInterval, s.clientset, s.apiClient, s.cfg)
 
 	// The ingress control plane — the xDS server — configures the *ingress*
-	// dataplane. The egress gateway is statically configured, so an egress-only
-	// instance does not run it.
+	// dataplane. The egress gateway is static apart from its dispatch listener,
+	// which the egressxds server above serves, so an egress-only instance does
+	// not run this one.
 	if s.cfg.Mode.ServesIngress() {
 		if err := s.startDataplane(ctx, g, parkCfg, sampling.RootSamplingPercent()); err != nil {
 			return err
