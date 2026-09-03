@@ -79,6 +79,22 @@ func TestDirectionOf(t *testing.T) {
 			want:      DirectionEgress,
 		},
 		{
+			// The MITM leg is a different question from the CONNECT, so it is a
+			// different handler, and only the chain name distinguishes them:
+			// both chains live on the same listener behind the same ext_proc
+			// cluster.
+			name:      "MITM filter chain",
+			filterKey: "envoy.filters.http.ext_proc",
+			chain:     EgressMITMFilterChainName,
+			want:      DirectionEgressMITM,
+		},
+		{
+			name:      "cleartext MITM filter chain",
+			filterKey: "envoy.filters.http.ext_proc",
+			chain:     EgressMITMCleartextFilterChainName,
+			want:      DirectionEgressMITM,
+		},
+		{
 			// The pre-listener-dispatch hole: an external client sending
 			// CONNECT to the ingress gateway must not reach the egress handler,
 			// whose denials would otherwise report whether an arbitrary actor
@@ -119,16 +135,37 @@ func TestDirectionOf(t *testing.T) {
 }
 
 func TestDirectionOfAgentgatewayAttribute(t *testing.T) {
+	for _, want := range []Direction{DirectionEgress, DirectionEgressMITM} {
+		t.Run(string(want), func(t *testing.T) {
+			req := connectRequest("", "")
+			req.Attributes = map[string]*structpb.Struct{
+				"envoy.filters.http.ext_proc": {
+					Fields: map[string]*structpb.Value{
+						directionAttribute: structpb.NewStringValue(string(want)),
+					},
+				},
+			}
+			if got := directionOf(req); got != want {
+				t.Errorf("directionOf() = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// A direction attribute naming something the mux does not serve falls back to
+// ingress rather than to whatever the string happens to be, so a typo in a
+// dataplane config cannot invent a direction with no handler behind it.
+func TestDirectionOfRejectsAnUnknownDirection(t *testing.T) {
 	req := connectRequest("", "")
 	req.Attributes = map[string]*structpb.Struct{
 		"envoy.filters.http.ext_proc": {
 			Fields: map[string]*structpb.Value{
-				directionAttribute: structpb.NewStringValue(string(DirectionEgress)),
+				directionAttribute: structpb.NewStringValue("egress-mtim"),
 			},
 		},
 	}
-	if got := directionOf(req); got != DirectionEgress {
-		t.Errorf("directionOf() = %v, want %v", got, DirectionEgress)
+	if got := directionOf(req); got != DirectionIngress {
+		t.Errorf("directionOf() = %v for an unknown direction, want %v", got, DirectionIngress)
 	}
 }
 

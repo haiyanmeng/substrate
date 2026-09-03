@@ -195,9 +195,9 @@ data:
               #
               # For a tunnel that carries neither TLS nor HTTP there is no SNI and
               # no Host header, so that address is the only record of where the
-              # traffic was going. The MITM leg's two HTTP chains recover it from
-              # inside the tunnel instead and never needed this; the raw TCP chain
-              # has nothing to read and does.
+              # traffic was going. The MITM leg's two HTTP chains recover the
+              # destination NAME from inside the tunnel; the raw TCP chain has
+              # nothing to read and needs the address to dial at all.
               - name: envoy.filters.http.set_filter_state
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config
@@ -207,6 +207,23 @@ data:
                       text_format_source:
                         inline_string: "%REQ(:AUTHORITY)%"
                     shared_with_upstream: ONCE
+                  # The same address again, under a key substrate owns, for the
+                  # MITM leg's policy ext_proc to read as a value rather than as
+                  # an Envoy address object. EgressPolicy's IPBlockRule is
+                  # written against the original destination IP, and this is the
+                  # only record of it once the tunnel is open. Must match
+                  # EgressDestinationFilterStateKey in
+                  # cmd/atenet/internal/router/extproc/attributes.go.
+                  - object_key: dev.ate.egress.destination
+                    factory_key: envoy.string
+                    shared_with_upstream: ONCE
+                    skip_if_empty: true
+                    format_string:
+                      text_format_source:
+                        inline_string: "%REQ(:AUTHORITY)%"
+                      # Without this an absent authority renders as "-", which
+                      # parses as no address but reads as a value that is set.
+                      omit_empty_values: true
               - name: envoy.filters.http.router
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -230,16 +247,19 @@ data:
       # of the stream as a request line, finds no request, and drops the
       # connection with nothing in the access log to say why.
       #
-      # The two HTTP chains carry an #ATE_MITM_EXTPROC_FILTER marker, and the
-      # cluster list a matching #ATE_MITM_EXTPROC_CLUSTER. They are inert
-      # comments until hack/install-ate.sh is run with
+      # The two HTTP chains each run substrate's egress-policy ext_proc, which
+      # is where a destination hostname is authorized against the actor's
+      # EgressPolicy. They also carry an #ATE_MITM_EXTPROC_FILTER marker after
+      # it, and the cluster list a matching #ATE_MITM_EXTPROC_CLUSTER. Those two
+      # are inert comments until hack/install-ate.sh is run with
       # --experimental-additional-egress-extproc-service, which replaces each
-      # with a generated block.
+      # with a generated block for an operator-supplied processor.
       #
-      # The passthrough chain carries no marker. It is a tcp_proxy, so there is
-      # no HTTP filter chain to put one in, and an opaque stream has no request
-      # to authorize -- which is the limit of what that chain can be policed on,
-      # not an oversight here.
+      # The passthrough chain runs neither. It is a tcp_proxy, so there is no
+      # HTTP filter chain to put one in, and an opaque stream has no request to
+      # authorize -- which is the limit of what that chain can be policed on,
+      # not an oversight here. Traffic that reaches it has still passed the
+      # CONNECT leg's identity check; it is the destination that goes unpoliced.
       # ---------------------------------------------------------------------
       - name: mitm_listener
         stat_prefix: mitm
@@ -265,7 +285,11 @@ data:
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.listener.http_inspector.v3.HttpInspector
         filter_chains:
-        - filter_chain_match:
+        # Named so the policy ext_proc below can read it back as
+        # xds.filter_chain_name. Must match EgressMITMFilterChainName in
+        # cmd/atenet/internal/router/extproc/dispatch.go.
+        - name: egress_mitm
+          filter_chain_match:
             transport_protocol: tls
           filters:
           - name: envoy.filters.network.http_connection_manager
@@ -353,6 +377,28 @@ data:
                       # SSE or long-poll response needs to survive at all.
                       timeout: 0s
               http_filters:
+              # Egress-policy authorization. See the shared notes on the
+              # cleartext chain's copy of this filter below.
+              - name: envoy.filters.http.ext_proc
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                  grpc_service:
+                    envoy_grpc:
+                      cluster_name: ext_proc_server
+                    timeout: 2s
+                  failure_mode_allow: false
+                  message_timeout: 5s
+                  request_attributes:
+                  - xds.filter_chain_name
+                  - filter_state['dev.ate.actor.identity']
+                  - filter_state['dev.ate.egress.destination']
+                  processing_mode:
+                    request_header_mode: SEND
+                    response_header_mode: SKIP
+                    request_body_mode: NONE
+                    response_body_mode: NONE
+                    request_trailer_mode: SKIP
+                    response_trailer_mode: SKIP
               #ATE_MITM_EXTPROC_FILTER -- see the mitm_listener comment above.
               - name: envoy.filters.http.dynamic_forward_proxy
                 typed_config:
@@ -407,7 +453,10 @@ data:
         #
         # application_protocols is what confines it to traffic http_inspector
         # actually recognised as HTTP.
-        - filter_chain_match:
+        # Must match EgressMITMCleartextFilterChainName in
+        # cmd/atenet/internal/router/extproc/dispatch.go; see the TLS chain.
+        - name: egress_mitm_cleartext
+          filter_chain_match:
             transport_protocol: raw_buffer
             application_protocols: ["http/1.0", "http/1.1", "h2c"]
           filters:
@@ -452,6 +501,62 @@ data:
                       cluster: egress_forward_proxy_cleartext
                       timeout: 0s
               http_filters:
+              # Egress-policy authorization: on every request out of the
+              # tunnel, ext_proc names the actor from the identity the CONNECT
+              # leg published as filter state, fetches that actor's
+              # EgressPolicy from the ate API, and matches the destination
+              # against its rules. A destination no rule matches -- and an
+              # actor with no policy at all -- comes back as an immediate 403.
+              #
+              # It runs ahead of dynamic_forward_proxy, so a denial is answered
+              # before the gateway resolves or dials anything, and ahead of the
+              # marker below, so substrate's own decision is made before the
+              # request is handed to an operator-supplied processor.
+              #
+              # This is the second of the gateway's two ext_proc checkpoints.
+              # The one on the CONNECT leg settles who the actor is, which is
+              # all an IP:port authority supports; the destination hostname
+              # exists only here, inside the terminated tunnel. Fails closed if
+              # the router is down.
+              - name: envoy.filters.http.ext_proc
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                  grpc_service:
+                    envoy_grpc:
+                      cluster_name: ext_proc_server
+                    timeout: 2s
+                  failure_mode_allow: false
+                  # Default is 200ms. Every request here costs a
+                  # GetActorEgressPolicy round trip to the ate API server, so
+                  # the budget matches the CONNECT leg's rather than the
+                  # default tuned for a purely local decision.
+                  message_timeout: 5s
+                  request_attributes:
+                  # Selects the handler. Must match
+                  # EgressMITMFilterChainName / EgressMITMCleartextFilterChainName
+                  # in cmd/atenet/internal/router/extproc/dispatch.go; a chain
+                  # renamed without updating those fails closed, classified as
+                  # ingress and refused with a 404 by this --mode=egress
+                  # instance.
+                  - xds.filter_chain_name
+                  # The actor's verified identity, as the SPIFFE URI SAN of the
+                  # certificate Envoy validated on the CONNECT leg. Filter
+                  # state, not a header: Envoy terminated the CONNECT, so a
+                  # header from inside the tunnel is a channel the actor
+                  # controls end to end and would let one actor claim another's
+                  # policy.
+                  - filter_state['dev.ate.actor.identity']
+                  # The address the actor's kernel dialed, which the hostname
+                  # inside the tunnel does not carry. EgressPolicy's
+                  # IPBlockRule is written against it.
+                  - filter_state['dev.ate.egress.destination']
+                  processing_mode:
+                    request_header_mode: SEND
+                    response_header_mode: SKIP
+                    request_body_mode: NONE
+                    response_body_mode: NONE
+                    request_trailer_mode: SKIP
+                    response_trailer_mode: SKIP
               #ATE_MITM_EXTPROC_FILTER -- Don't modify this line.
               # Same reasoning as the TLS chain: resolve from the request's own
               # Host, so the name that was policed is the name that is dialled.

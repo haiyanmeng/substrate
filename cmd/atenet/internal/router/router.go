@@ -216,6 +216,14 @@ func (s *RouterServer) Run(ctx context.Context) error {
 		}
 		egressHandler := egress.New(s.apiClient, actorIdentityRoots)
 		handlers[egressHandler.Direction()] = egressHandler
+
+		// The MITM gateway's decrypted leg, where the destination is a hostname
+		// rather than the IP:port the CONNECT carried. Registered
+		// unconditionally: only the sdsmint gateway has a MITM listener to send
+		// this direction from, and an instance fronting the passthrough gateway
+		// simply never sees it.
+		mitmHandler := egress.NewMITM(s.apiClient)
+		handlers[mitmHandler.Direction()] = mitmHandler
 	}
 
 	if s.extprocSrv == nil {
