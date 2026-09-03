@@ -37,14 +37,28 @@ const (
 
 	// ActorIdentityFilterStateKey is the filter-state key holding the actor
 	// identity the egress gateway read from the peer certificate it verified
-	// against the actor-identity CA. Egress-only, and set and read entirely in
-	// manifests/ate-install/atenet-egress-with-sdsmint.yaml: the MITM access
-	// logs stamp it, and the optional additional ext_proc service
-	// (hack/experimental-additional-egress-extproc.sh) requests it. No Go in
-	// this repository reads it — this handler authenticates the certificate
-	// itself — but it is part of the same namespace and drifts if it is not
-	// declared with the rest.
+	// against the actor-identity CA, as that certificate's SPIFFE URI SAN.
+	// Egress-only, set on the CONNECT leg in
+	// manifests/ate-install/atenet-egress-with-sdsmint.yaml. The CONNECT-leg
+	// handler does not read it — it authenticates the certificate itself — but
+	// it is the only sound carrier of the actor's identity across the
+	// CONNECT/MITM boundary, so the MITM handler names the actor from it.
 	ActorIdentityFilterStateKey = "dev.ate.actor.identity"
+	// ActorIdentityFilterStateAttribute is the CEL expression ext_proc
+	// evaluates to read ActorIdentityFilterStateKey back out.
+	ActorIdentityFilterStateAttribute = "filter_state['" + ActorIdentityFilterStateKey + "']"
+
+	// EgressDestinationFilterStateKey is the filter-state key holding the
+	// egress CONNECT's authority — the address the actor's kernel was dialing,
+	// which atunnel takes from SO_ORIGINAL_DST and so is always a literal
+	// IP:port. Set on the CONNECT leg and carried across the internal-listener
+	// hop, because the MITM leg sees only what is inside the tunnel: a
+	// hostname, with the original destination IP nowhere in the request.
+	// EgressPolicy's IPBlockRule is written against that IP.
+	EgressDestinationFilterStateKey = "dev.ate.egress.destination"
+	// EgressDestinationFilterStateAttribute is the CEL expression ext_proc
+	// evaluates to read EgressDestinationFilterStateKey back out.
+	EgressDestinationFilterStateAttribute = "filter_state['" + EgressDestinationFilterStateKey + "']"
 
 	// directionAttribute carries the Direction outright, for dataplanes that
 	// have no Envoy filter chain to name. It is set from a dataplane expression,

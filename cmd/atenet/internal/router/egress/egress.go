@@ -12,17 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package egress implements the ext_proc handler for outbound actor traffic:
-// it authenticates the actor behind an egress CONNECT before the gateway
-// tunnels it out.
+// Package egress implements the ext_proc handlers for outbound actor traffic,
+// one per checkpoint the egress gateway offers:
 //
-// The identity this handler acts on comes from the actor certificate presented
+//   - Handler authenticates the actor behind an egress CONNECT, before the
+//     gateway tunnels it out. A CONNECT names an IP:port, so this is where
+//     "who is this" is settled and the only place it can be.
+//   - MITMHandler authorizes each request inside an already-authenticated
+//     tunnel against its actor's EgressPolicy, on the MITM gateway's decrypted
+//     leg. The destination hostname exists only inside the tunnel, so this is
+//     where "may they reach that" is settled and the only place it can be.
+//
+// The identity both handlers act on comes from the actor certificate presented
 // in the mTLS handshake and signed by the actor-identity CA — never from a
-// request header. That is the opposite of the ingress package's model, where
-// every header is unauthenticated client input. Keeping the two in separate
-// packages keeps that difference explicit; the ext_proc mux is what guarantees
-// a request only ever reaches the handler for the filter chain that accepted
-// it.
+// request header. Handler reads it out of the certificate itself; MITMHandler
+// reads it from the filter state the CONNECT leg derived from that same
+// verified certificate, because Envoy terminated the CONNECT and a header sent
+// from inside the tunnel is a channel the actor controls end to end.
+//
+// That is the opposite of the ingress package's model, where every header is
+// unauthenticated client input. Keeping the two in separate packages keeps that
+// difference explicit; the ext_proc mux is what guarantees a request only ever
+// reaches the handler for the filter chain that accepted it.
 package egress
 
 import (

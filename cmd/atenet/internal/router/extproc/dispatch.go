@@ -26,14 +26,46 @@ type Direction string
 const (
 	// DirectionIngress is inbound traffic addressed to an actor.
 	DirectionIngress Direction = "ingress"
-	// DirectionEgress is outbound traffic tunneled out of an actor.
+	// DirectionEgress is an actor's outbound CONNECT, before the gateway
+	// tunnels it out.
 	DirectionEgress Direction = "egress"
+	// DirectionEgressMITM is one request from inside an already-authenticated
+	// tunnel, seen on the MITM gateway's decrypted leg. It is a separate
+	// direction from DirectionEgress because it is a separate question: the
+	// CONNECT asks who the actor is, and this asks whether that actor may reach
+	// the destination the request names.
+	DirectionEgressMITM Direction = "egress-mitm"
 )
 
-// EgressFilterChainName is the Envoy filter chain that terminates actor egress
-// CONNECTs, and so the one that selects the egress handler. It must stay in sync
-// with the filter chain name in manifests/ate-install/atenet-egress.yaml.
-const EgressFilterChainName = "egress"
+const (
+	// EgressFilterChainName is the Envoy filter chain that terminates actor
+	// egress CONNECTs, and so the one that selects the egress handler. It must
+	// stay in sync with the filter chain name in
+	// manifests/ate-install/atenet-egress.yaml and
+	// manifests/ate-install/atenet-egress-with-sdsmint.yaml.
+	EgressFilterChainName = "egress"
+	// EgressMITMFilterChainName and EgressMITMCleartextFilterChainName are the
+	// MITM listener's two HTTP filter chains — tunneled TLS that the gateway
+	// terminates with a minted leaf, and tunneled cleartext. They select the
+	// same handler; they are two chains only because one has a transport socket
+	// to terminate and the other does not. Both must stay in sync with
+	// manifests/ate-install/atenet-egress-with-sdsmint.yaml.
+	//
+	// The listener's third chain, the raw TCP passthrough, is deliberately
+	// absent: it is a tcp_proxy with no HTTP filter chain to run ext_proc in,
+	// and an opaque byte stream names no destination to authorize.
+	EgressMITMFilterChainName          = "egress_mitm"
+	EgressMITMCleartextFilterChainName = "egress_mitm_cleartext"
+)
+
+// egressFilterChains maps each filter chain the egress gateway names to the
+// direction whose handler serves it. A chain missing from this map is treated
+// as ingress, the fail-safe direction — see directionOf.
+var egressFilterChains = map[string]Direction{
+	EgressFilterChainName:              DirectionEgress,
+	EgressMITMFilterChainName:          DirectionEgressMITM,
+	EgressMITMCleartextFilterChainName: DirectionEgressMITM,
+}
 
 // directionOf reports which direction's handler an ext_proc RequestHeaders
 // callback belongs to.
@@ -50,11 +82,12 @@ const EgressFilterChainName = "egress"
 // an egress request misrouted to the ingress handler fails to parse as an actor
 // DNS name and 404s, whereas the reverse leaks control-plane state.
 func directionOf(req *extprocv3.ProcessingRequest) Direction {
-	if requestAttribute(req, directionAttribute) == string(DirectionEgress) {
-		return DirectionEgress
+	switch dir := Direction(requestAttribute(req, directionAttribute)); dir {
+	case DirectionEgress, DirectionEgressMITM:
+		return dir
 	}
-	if filterChainName(req) == EgressFilterChainName {
-		return DirectionEgress
+	if dir, ok := egressFilterChains[filterChainName(req)]; ok {
+		return dir
 	}
 	return DirectionIngress
 }

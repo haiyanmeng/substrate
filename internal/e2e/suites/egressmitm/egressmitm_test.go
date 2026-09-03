@@ -89,6 +89,11 @@ func TestActorEgressMITMTrust(t *testing.T) {
 
 	const id = "probe-mitm"
 	createAndResumeActor(t, ctx, clients, id)
+	// The MITM gateway checks an EgressPolicy on every request out of the
+	// tunnel and denies when the actor has none. This suite is about trust, not
+	// about policy, so it grants everything and leaves the destination to the
+	// assertions below.
+	e2e.AllowAllEgress(t, ctx, clients, probeNamespace, id)
 	waitForActorState(t, ctx, clients, id, ateapipb.ActorState_ACTOR_STATE_RUNNING)
 
 	rc, err := e2e.NewRouterClient(ctx)

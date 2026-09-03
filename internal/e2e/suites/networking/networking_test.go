@@ -64,6 +64,23 @@ func egressFixture() e2e.Fixture {
 	}
 }
 
+// createAndResumeEgressActor stands up an Actor of the egress demo fixture and
+// grants it unrestricted egress.
+//
+// The grant is what the MITM gateway needs and the passthrough gateway ignores.
+// Only the MITM variant has a decrypted leg, and there it authorizes every
+// request out of the tunnel against the Actor's EgressPolicy and denies when
+// there is none — so without this these tests would fail with a 403 from the
+// gateway under E2E_EGRESS_MITM and pass without it. What the tests are about
+// is the egress path reaching the origin, not which destinations a policy
+// admits, so the policy admits all of them.
+func createAndResumeEgressActor(t *testing.T, ctx context.Context, prefix string) string {
+	t.Helper()
+	actorName, _ := createAndResumeActor(t, ctx, prefix, egressFixture())
+	e2e.AllowAllEgress(t, ctx, e2e.GetClients(), networkingAtespace, actorName)
+	return actorName
+}
+
 func TestActorDirectAccess(t *testing.T) {
 	ctx := context.Background()
 	actorName, actor := createAndResumeSubstrateActor(t, ctx, "direct", e2e.SubstrateCounterFixture())
@@ -90,7 +107,7 @@ func TestActorDirectAccess(t *testing.T) {
 // asserts the gateway is deployed and that it did not reject the Actor.
 func TestActorEgress(t *testing.T) {
 	ctx := context.Background()
-	actorName, _ := createAndResumeActor(t, ctx, "egress", egressFixture())
+	actorName := createAndResumeEgressActor(t, ctx, "egress")
 	router := mustRouterClient(t, ctx)
 	defer router.Close()
 
@@ -109,7 +126,7 @@ func TestActorEgress(t *testing.T) {
 // between the Actor and the origin.
 func TestActorEgressHTTPS(t *testing.T) {
 	ctx := context.Background()
-	actorName, _ := createAndResumeActor(t, ctx, "egress-https", egressFixture())
+	actorName := createAndResumeEgressActor(t, ctx, "egress-https")
 	router := mustRouterClient(t, ctx)
 	defer router.Close()
 
@@ -155,7 +172,7 @@ func TestActorEgressNonStandardPort(t *testing.T) {
 	// resumed Actor idling in the cluster waiting for a destination.
 	target := e2e.DeployServerPod(t, ctx, httpTarget)
 
-	actorName, _ := createAndResumeActor(t, ctx, "egress-port", egressFixture())
+	actorName := createAndResumeEgressActor(t, ctx, "egress-port")
 	router := mustRouterClient(t, ctx)
 	defer router.Close()
 

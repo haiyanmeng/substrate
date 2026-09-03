@@ -27,6 +27,13 @@ Router has several responsibilities:
   gateway's ext_proc handler re-verifies the actor's client certificate against
   the actor-identity CA, reads the `ActorIdentity` X.509 extension out of it,
   and checks the certified UID against the ATE API.
+* Authorizes destinations on egress, on the MITM gateway only: every request
+  out of an already-authenticated tunnel is matched against the actor's
+  `EgressPolicy`, fetched per request so a policy change lands on the next
+  request rather than the next tunnel. An actor with no policy is denied. This
+  is the question the CONNECT check cannot answer — the destination hostname
+  exists only inside the tunnel — so it is a second handler on a second leg,
+  not an extension of the first.
 * Serves arbitrary-port ingress: a client reaches a port on the actor other
   than its default (80) by sending an HTTP CONNECT to
   `<actor-dns>:<port>` on `--port-connect`/`--port-connect-tls`, rather than
@@ -52,13 +59,18 @@ packages that cannot reach into each other:
   the vocabulary both handlers share (`RequestMetadata`, `Result`, `ReqError`).
   It imports neither handler package.
 * `ingress` — resume, park, and route to the actor's worker.
-* `egress` — certificate-based actor-identity authentication for outbound
-  CONNECTs.
+* `egress` — the gateway's two checkpoints. `Handler` authenticates the actor
+  from its certificate on the CONNECT; `MITMHandler` authorizes each request
+  inside the tunnel against that actor's `EgressPolicy`, on the MITM gateway's
+  decrypted leg. Neither re-derives identity from anything in a request.
 
 Direction is decided by the filter chain the dataplane says accepted the
 request (`xds.filter_chain_name`, an Envoy attribute the egress gateway is
 configured to send), never by anything in the request itself, so a client
-cannot pick the egress path by crafting one. `router` itself does the wiring.
+cannot pick the egress path by crafting one. The two egress legs are separate
+directions for the same reason they are separate handlers: `egress` for the
+CONNECT chain, `egress-mitm` for the decrypted chains behind it. `router`
+itself does the wiring.
 
 ## adding a dataplane attribute
 
@@ -95,8 +107,9 @@ reserved.
 ### keep it trustworthy
 
 An attribute is only as trustworthy as the thing that set it. Every value here
-comes from something the dataplane itself derived — a peer certificate Envoy
-verified against the actor-identity CA, an `:authority` captured before the
+comes from something the dataplane itself derived — `dev.ate.actor.identity`
+from a peer certificate Envoy verified against the actor-identity CA,
+`dev.ate.egress.destination` from the CONNECT `:authority` captured before the
 request entered a tunnel — never from a client header, which an actor controls
 end to end. That is what makes filter state a sound carrier across the
 CONNECT/MITM boundary in the first place, and a new attribute sourced from a
@@ -109,8 +122,12 @@ One binary serves both directions. `--mode` selects which:
 | `--mode` | ext_proc handlers | xDS server | Kubernetes access |
 | --- | --- | --- | --- |
 | `ingress` | ingress | yes | yes |
-| `egress` | egress | no | none |
-| `all` (default) | both | yes | yes |
+| `egress` | egress, egress-mitm | no | none |
+| `all` (default) | all | yes | yes |
+
+`egress-mitm` is registered whenever egress is, because only the sdsmint
+gateway has a MITM listener to send it from: an instance fronting the
+passthrough gateway simply never sees the direction.
 
 The mux refuses a direction this instance was not started to serve (404) rather
 than falling back to the other handler, which would run the request through the
