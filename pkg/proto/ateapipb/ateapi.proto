@@ -372,6 +372,26 @@ message EgressPolicy {
   // +k8s:maxItems=256
   // +k8s:listType=atomic # rule order matters
   repeated EgressRule rules = 2;
+
+  // Destinations the egress gateway must reach without terminating their TLS.
+  // A connection whose SNI matches is tunneled straight to the origin, so the
+  // actor validates the origin's own certificate and a client that pins one
+  // still works. Everything not listed is intercepted.
+  //
+  // Exemption is not authorization: it says how a destination is reached, not
+  // whether it may be. It is also the opposite of an effect — the gateway
+  // cannot read an exempted connection, so no rule effect that needs the
+  // plaintext (header injection above all) can apply to one.
+  //
+  // Patterns use the same grammar as HostnameRule.patterns, and are matched
+  // against the SNI rather than against a Host header: a connection carrying
+  // no SNI is never exempt.
+  //
+  // +k8s:optional
+  // +k8s:maxItems=256
+  // +k8s:listType=set
+  // +k8s:customValidation # format
+  repeated string tls_interception_exemptions = 3;
 }
 
 // EgressRule authorizes a request using exactly one destination matcher.

@@ -47,9 +47,10 @@ const (
 	// configures its dataplane. Only the Envoy dataplane takes configuration
 	// from it; agentgateway is statically configured.
 	ModeIngress Mode = "ingress"
-	// ModeEgress serves actor CONNECTs leaving through the egress gateway.
-	// Nothing else runs: the egress gateway is statically configured, so there
-	// is no xDS server and no Kubernetes client.
+	// ModeEgress serves actor CONNECTs leaving through the egress gateway, and
+	// serves that gateway its TLS-interception dispatch listener over xDS —
+	// the only part of an otherwise static bootstrap that depends on actor
+	// policy. No Kubernetes client runs.
 	ModeEgress Mode = "egress"
 	// ModeAll serves both directions from one instance. This is the default,
 	// and what a single-gateway or local development setup wants.
@@ -74,13 +75,17 @@ type authConfig struct {
 // routerConfig holds deployment setup and endpoint options for the router node instance.
 type routerConfig struct {
 	// Mode restricts the instance to one traffic direction. Empty means ModeAll.
-	Mode           Mode
-	AtenetRouter   string
-	Namespace      string
-	Kubeconfig     string
-	AteapiAddr     string
-	HttpPort       int
-	XdsPort        int
+	Mode         Mode
+	AtenetRouter string
+	Namespace    string
+	Kubeconfig   string
+	AteapiAddr   string
+	HttpPort     int
+	XdsPort      int
+	// EgressXdsPort serves the egress gateway's dispatch listener. Separate
+	// from XdsPort because --mode=all runs both control planes in one process,
+	// for two different dataplanes.
+	EgressXdsPort  int
 	ExtprocPort    int
 	ExtprocAddr    string
 	StatusPort     int

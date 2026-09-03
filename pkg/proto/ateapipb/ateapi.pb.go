@@ -1024,9 +1024,28 @@ type EgressPolicy struct {
 	// +k8s:optional
 	// +k8s:maxItems=256
 	// +k8s:listType=atomic # rule order matters
-	Rules         []*EgressRule `protobuf:"bytes,2,rep,name=rules,proto3" json:"rules,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Rules []*EgressRule `protobuf:"bytes,2,rep,name=rules,proto3" json:"rules,omitempty"`
+	// Destinations the egress gateway must reach without terminating their TLS.
+	// A connection whose SNI matches is tunneled straight to the origin, so the
+	// actor validates the origin's own certificate and a client that pins one
+	// still works. Everything not listed is intercepted.
+	//
+	// Exemption is not authorization: it says how a destination is reached, not
+	// whether it may be. It is also the opposite of an effect — the gateway
+	// cannot read an exempted connection, so no rule effect that needs the
+	// plaintext (header injection above all) can apply to one.
+	//
+	// Patterns use the same grammar as HostnameRule.patterns, and are matched
+	// against the SNI rather than against a Host header: a connection carrying
+	// no SNI is never exempt.
+	//
+	// +k8s:optional
+	// +k8s:maxItems=256
+	// +k8s:listType=set
+	// +k8s:customValidation # format
+	TlsInterceptionExemptions []string `protobuf:"bytes,3,rep,name=tls_interception_exemptions,json=tlsInterceptionExemptions,proto3" json:"tls_interception_exemptions,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *EgressPolicy) Reset() {
@@ -1069,6 +1088,13 @@ func (x *EgressPolicy) GetMetadata() *ResourceMetadata {
 func (x *EgressPolicy) GetRules() []*EgressRule {
 	if x != nil {
 		return x.Rules
+	}
+	return nil
+}
+
+func (x *EgressPolicy) GetTlsInterceptionExemptions() []string {
+	if x != nil {
+		return x.TlsInterceptionExemptions
 	}
 	return nil
 }
@@ -6600,10 +6626,11 @@ const file_ateapi_proto_rawDesc = "" +
 	"\x0eactor_template\x18\x04 \x01(\v2\x11.ateapi.ObjectRefR\ractorTemplate\x129\n" +
 	"\x0fworker_selector\x18\x05 \x01(\v2\x10.ateapi.SelectorR\x0eworkerSelector\x12A\n" +
 	"\x13source_snapshot_tag\x18\x06 \x01(\v2\x11.ateapi.ObjectRefR\x11sourceSnapshotTag\x12+\n" +
-	"\x06status\x18\a \x01(\v2\x13.ateapi.ActorStatusR\x06status\"n\n" +
+	"\x06status\x18\a \x01(\v2\x13.ateapi.ActorStatusR\x06status\"\xae\x01\n" +
 	"\fEgressPolicy\x124\n" +
 	"\bmetadata\x18\x01 \x01(\v2\x18.ateapi.ResourceMetadataR\bmetadata\x12(\n" +
-	"\x05rules\x18\x02 \x03(\v2\x12.ateapi.EgressRuleR\x05rules\"\x9c\x01\n" +
+	"\x05rules\x18\x02 \x03(\v2\x12.ateapi.EgressRuleR\x05rules\x12>\n" +
+	"\x1btls_interception_exemptions\x18\x03 \x03(\tR\x19tlsInterceptionExemptions\"\x9c\x01\n" +
 	"\n" +
 	"EgressRule\x122\n" +
 	"\thostnames\x18\x01 \x01(\v2\x14.ateapi.HostnameRuleR\thostnames\x120\n" +
