@@ -40,6 +40,7 @@ import (
 	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
 	"github.com/agent-substrate/substrate/internal/resources"
@@ -74,13 +75,17 @@ type Handler struct {
 	// certificate must chain to. Nil means the gateway cannot authenticate
 	// anyone, and every CONNECT fails closed.
 	actorIdentityRoots *x509.CertPool
+	// exemptions publishes the TLS-interception exemption sets the handler
+	// discovers. Nil disables exemptions entirely, so every connection is
+	// intercepted.
+	exemptions ExemptionRegistry
 }
 
 // New builds the egress handler. actorIdentityRoots is the same trust bundle
 // the egress listener uses as its trusted_ca; see verifyActorCertificate for
 // why the check is made again here.
-func New(apiClient ateapipb.ControlClient, actorIdentityRoots *x509.CertPool) *Handler {
-	return &Handler{apiClient: apiClient, actorIdentityRoots: actorIdentityRoots}
+func New(apiClient ateapipb.ControlClient, actorIdentityRoots *x509.CertPool, exemptions ExemptionRegistry) *Handler {
+	return &Handler{apiClient: apiClient, actorIdentityRoots: actorIdentityRoots, exemptions: exemptions}
 }
 
 func (h *Handler) Direction() extproc.Direction { return extproc.DirectionEgress }
@@ -124,20 +129,99 @@ func (h *Handler) HandleRequestHeaders(ctx context.Context, md *extproc.RequestM
 		return extproc.Result{}, err
 	}
 
+	exemptionSetID, err := h.exemptionSetID(ctx, identity)
+	if err != nil {
+		return extproc.Result{}, err
+	}
+
 	slog.InfoContext(ctx, "egress identity authenticated",
 		slog.String("atespace", identity.Atespace),
 		slog.String("actor", identity.ActorName),
 		slog.String("actorUid", identity.ActorUid),
 		// For a CONNECT the :authority is the actor's original destination
 		// (IP:port).
-		slog.String("destination", md.Host))
+		slog.String("destination", md.Host),
+		slog.String("exemptionSet", exemptionSetID))
 
-	// Identity is authenticated; let the CONNECT proceed unchanged.
-	return extproc.Result{
+	// Identity is authenticated; let the CONNECT proceed unchanged apart from
+	// the exemption set the dispatch listener matches the SNI against.
+	result := extproc.Result{
 		Response: &extprocv3.HeadersResponse{
 			Response: &extprocv3.CommonResponse{},
 		},
-	}, nil
+	}
+	if exemptionSetID != "" {
+		metadata, err := structpb.NewStruct(map[string]any{
+			ExemptionMetadataNamespace: map[string]any{ExemptionMetadataKey: exemptionSetID},
+		})
+		if err != nil {
+			return extproc.Result{}, extproc.WrapReqError(envoy_type.StatusCode_InternalServerError, err,
+				"egress failed: encoding the TLS interception exemption set")
+		}
+		result.DynamicMetadata = metadata
+	}
+	return result, nil
+}
+
+const (
+	// ExemptionMetadataNamespace and ExemptionMetadataKey are where this handler
+	// publishes the ID of the connection's exemption set. A set_filter_state
+	// filter downstream of ext_proc copies it into filter state, which is what
+	// survives the hop into the internal dispatch listener; dynamic metadata on
+	// its own does not, because the CONNECT stream ends at that hop.
+	ExemptionMetadataNamespace = "dev.ate.egress"
+	ExemptionMetadataKey       = "tls_exempt_set"
+
+	// ExemptionFilterStateKey is the object that set_filter_state writes the ID
+	// to and the dispatch listener matches on. The gateway manifest names it
+	// literally, so it has to stay in step with this.
+	ExemptionFilterStateKey = ExemptionMetadataNamespace + "." + ExemptionMetadataKey
+)
+
+// exemptionSetID resolves the exemption set that applies to this actor and makes
+// sure the gateway is configured for it, returning the ID the dispatch listener
+// keys on. An empty ID means "intercept", which is both the default and the
+// fallback for every way this can go wrong short of the control plane being
+// unreachable.
+func (h *Handler) exemptionSetID(ctx context.Context, identity *substratex509.ActorIdentity) (string, error) {
+	if h.exemptions == nil {
+		return "", nil
+	}
+
+	policy, err := h.apiClient.GetActorEgressPolicy(ctx, &ateapipb.GetActorEgressPolicyRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: identity.Atespace, Name: identity.ActorName},
+	})
+	if err != nil {
+		// An actor with no policy exempts nothing. Any other failure is the same
+		// class of problem as a failed identity check, and gets the same
+		// fail-closed treatment: we cannot tell an actor with no exemptions from
+		// one whose exemptions we could not read.
+		if status.Code(err) == codes.NotFound {
+			return "", nil
+		}
+		return "", extproc.WrapReqError(envoy_type.StatusCode_ServiceUnavailable, err,
+			"egress policy lookup unavailable for %q/%q: %v", identity.Atespace, identity.ActorName, err)
+	}
+
+	set := NewExemptionSet(policy.GetTlsInterceptionExemptions())
+	if set.IsEmpty() {
+		// The common case. Nothing to publish, and no listener churn.
+		return "", nil
+	}
+
+	if err := h.exemptions.Register(ctx, set); err != nil {
+		// The gateway has not confirmed it can match this set, so naming it
+		// would risk dispatching to a chain that does not exist. Intercepting
+		// instead degrades one actor's pinned connections; failing the CONNECT
+		// would turn a control-plane hiccup into a total egress outage.
+		slog.WarnContext(ctx, "egress exemption set unavailable; intercepting",
+			slog.String("atespace", identity.Atespace),
+			slog.String("actor", identity.ActorName),
+			slog.String("exemptionSet", set.ID()),
+			slog.Any("err", err))
+		return "", nil
+	}
+	return set.ID(), nil
 }
 
 // validateIdentity checks that the identity a verified actor certificate

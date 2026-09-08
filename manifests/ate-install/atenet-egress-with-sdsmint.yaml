@@ -24,9 +24,10 @@ metadata:
   namespace: ate-system
 #
 # No RBAC is bound to this ServiceAccount on purpose: the ext_proc sidecar runs
-# with --mode=egress, which serves the egress ext_proc handler and nothing else
-# — no xDS server, so no Kubernetes access. It reaches the control plane over
-# the ate API only.
+# with --mode=egress, which serves the egress ext_proc handler and the
+# egress_dispatch listener. Neither reads Kubernetes: the dispatch listener is
+# built from the egress policies actors present as they connect. It reaches the
+# control plane over the ate API only.
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -53,6 +54,33 @@ data:
     - name: envoy.bootstrap.internal_listener
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.bootstrap.internal_listener.v3.InternalListener
+
+    # One dynamic resource: the egress_dispatch listener, which decides per
+    # connection whether to intercept. It cannot be static because the answer
+    # depends on each actor's tls_interception_exemptions, and Envoy can only
+    # match an SNI against literals it was configured with -- there is no way to
+    # hand it a list on the connection and have it searched. atenet renders one
+    # filter chain subtree per distinct exemption set and serves it from here.
+    #
+    # Everything else, clusters included, stays in static_resources: nothing
+    # about them varies with policy, and an egress gateway that loses its
+    # control plane should keep tunneling.
+    dynamic_resources:
+      lds_config:
+        resource_api_version: V3
+        ads: {}
+        # Bounded because the fallback is safe: with no dispatch listener the
+        # CONNECT route has nowhere to go and the tunnel fails, but ext_proc
+        # refuses to mark anything exempt until it sees an ACK anyway, so the
+        # only cost of a slow control plane is a slow start, not a wrong
+        # interception decision.
+        initial_fetch_timeout: 10s
+      ads_config:
+        api_type: GRPC
+        transport_api_version: V3
+        grpc_services:
+        - envoy_grpc:
+            cluster_name: xds_server
 
     static_resources:
       listeners:
@@ -118,12 +146,14 @@ data:
                   routes:
                   - match: { connect_matcher: {} }
                     route:
-                      # the tunnel is handed to the MITM
-                      # listener below, which terminates the tunnelled TLS and
-                      # re-originates it. Sending it straight to
-                      # egress_forward_proxy here would be a raw TCP passthrough
-                      # with no per-destination visibility at all.
-                      cluster: mitm_internal
+                      # The tunnel is handed to the dispatch listener, which
+                      # picks between the MITM leg -- terminating the tunnelled
+                      # TLS and re-originating it -- and a straight passthrough
+                      # for destinations the actor exempted from interception.
+                      # Sending it to egress_forward_proxy here instead would be
+                      # a raw TCP passthrough for everything, with no
+                      # per-destination visibility at all.
+                      cluster: dispatch_internal
                       # Set request timeout to disabled (0) as CONNECT is a long-running stream.
                       # There will still be a stream_idle_timeout (5 minutes by default).
                       timeout: 0s
@@ -145,7 +175,10 @@ data:
                   on_request_headers:
                   - object_key: dev.ate.actor.identity
                     factory_key: envoy.string
-                    shared_with_upstream: ONCE
+                    # TRANSITIVE, not ONCE: there are two internal hops between
+                    # here and where this is read -- egress_dispatch, then
+                    # mitm_listener -- and ONCE would drop it at the first.
+                    shared_with_upstream: TRANSITIVE
                     skip_if_empty: true
                     format_string:
                       text_format_source:
@@ -206,7 +239,39 @@ data:
                     format_string:
                       text_format_source:
                         inline_string: "%REQ(:AUTHORITY)%"
-                    shared_with_upstream: ONCE
+                    # Read by egress_tcp_passthrough, which both the dispatch
+                    # listener's exempt chain and mitm_listener's raw chain
+                    # dial -- one internal hop away and two respectively, so
+                    # TRANSITIVE rather than ONCE.
+                    shared_with_upstream: TRANSITIVE
+              # Which TLS-interception exemption set applies to this connection.
+              # ext_proc resolved the actor's egress policy and published the
+              # set's ID as dynamic metadata; that is per-request state and dies
+              # with the CONNECT transaction, so it has to be copied into filter
+              # state to survive the hop into egress_dispatch, where the
+              # filter_chain_matcher reads it.
+              #
+              # The ID names a set of hostname patterns atenet has rendered into
+              # that listener over LDS, not the patterns themselves: Envoy
+              # matches against configured literals, so the list has to be in
+              # the config and only its name can travel on the connection. An
+              # actor with no exemptions gets no value here, matches no subtree,
+              # and is intercepted -- which is also what happens if ext_proc,
+              # atenet, or the LDS push is having a bad day.
+              - name: envoy.filters.http.set_filter_state
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config
+                  on_request_headers:
+                  - object_key: dev.ate.egress.tls_exempt_set
+                    factory_key: envoy.string
+                    shared_with_upstream: TRANSITIVE
+                    skip_if_empty: true
+                    format_string:
+                      text_format_source:
+                        inline_string: "%DYNAMIC_METADATA(dev.ate.egress:tls_exempt_set)%"
+                      # Without this an absent value renders as "-", which is a
+                      # non-empty string and would defeat skip_if_empty.
+                      omit_empty_values: true
               - name: envoy.filters.http.router
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -500,6 +565,49 @@ data:
                       termination: "%CONNECTION_TERMINATION_DETAILS%"
 
       clusters:
+      # The only way into egress_dispatch, the LDS-served listener that decides
+      # whether this connection is intercepted. Same shape as mitm_internal
+      # below and for the same reasons; see there for why the transport socket
+      # is what it is. Its endpoint is not written here: the listener arrives
+      # over LDS, and Envoy resolves the internal address by name at connect
+      # time, so the cluster is valid before the listener exists.
+      - name: dispatch_internal
+        connect_timeout: 1s
+        transport_socket:
+          name: envoy.transport_sockets.internal_upstream
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.transport_sockets.internal_upstream.v3.InternalUpstreamTransport
+            transport_socket:
+              name: envoy.transport_sockets.raw_buffer
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
+        load_assignment:
+          cluster_name: dispatch_internal
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  envoy_internal_address:
+                    server_listener_name: egress_dispatch
+
+      # atenet's xDS server, which serves egress_dispatch and nothing else. It
+      # runs in this pod's ext-proc container, so this never leaves loopback.
+      - name: xds_server
+        type: STATIC
+        connect_timeout: 1s
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            explicit_http_config:
+              http2_protocol_options: {}
+        load_assignment:
+          cluster_name: xds_server
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address: { address: 127.0.0.1, port_value: 18001 }
+
       # The only way into mitm_listener. An internal address, not a socket, so
       # the MITM leg has no listening port anywhere in the pod's netns.
       - name: mitm_internal
@@ -688,11 +796,20 @@ data:
               http_protocol_options: {}
               http2_protocol_options: {}
 
-      # The passthrough chain's upstream. Not a dynamic forward proxy like the
+      # The upstream for both passthrough chains: mitm_listener's raw chain, and
+      # egress_dispatch's exempt chain. Not a dynamic forward proxy like the
       # other two: there is no name to resolve. The destination arrives as the
       # literal IP:port the actor's kernel recorded in SO_ORIGINAL_DST, relayed
       # here as the envoy.network.transport_socket.original_dst_address filter
       # state object.
+      #
+      # For an exempted connection that means the gateway dials the address the
+      # actor was already dialing, and does not re-resolve the SNI. The SNI
+      # selects which exemption applies; it does not redirect the connection, so
+      # claiming someone else's SNI reaches nothing new. It does let an actor
+      # avoid interception for a destination it can already reach -- which the
+      # bare-TCP chain on mitm_listener also allows, and which destination
+      # authorization, not this feature, is what will close.
       - name: egress_tcp_passthrough
         type: ORIGINAL_DST
         lb_policy: CLUSTER_PROVIDED
@@ -935,9 +1052,10 @@ spec:
           mountPath: /var/run/sdsmint     
       # Co-located ext_proc server: the same atenet router binary the ingress
       # gateway runs, started with --mode=egress so it serves only the egress
-      # ext_proc handler (no xDS server, no Kubernetes access). The egress
-      # Envoy calls it over localhost to
-      # authenticate actor identity against the ate API on every CONNECT.
+      # ext_proc handler and the egress_dispatch listener's xDS server (no
+      # Kubernetes access). The egress Envoy calls it over localhost to
+      # authenticate actor identity against the ate API on every CONNECT, and
+      # subscribes to it for the dispatch listener.
       #
       # Ingress and egress are separate Deployments because they scale
       # independently, not because they need separate binaries: one instance can
@@ -950,6 +1068,9 @@ spec:
         - --namespace=ate-system
         - --port-extproc=50051
         - --extproc-address=127.0.0.1
+        # Serves egress_dispatch over LDS. Must match the xds_server cluster in
+        # envoy.yaml, and stays on loopback: it is the same pod.
+        - --port-egress-xds=18001
         - --ateapi-address=dns:///api.ate-system.svc:443
         - --ateapi-ca-file=/run/servicedns.podcert.ate.dev/trust-bundle.pem
         - --ateapi-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem

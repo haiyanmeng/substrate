@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package egressmitm e2e-tests the trust half of MITM'd egress TLS (#871):
-// an actor that projects the egress trust bundle can complete a TLS
-// handshake with the sdsmint egress gateway's per-SNI minted leaf, using
-// ONLY the projected anchors. See TestActorEgressMITMTrust for the proof
+// Package egressmitm e2e-tests the trust half of MITM'd egress TLS (#871): an
+// actor that projects the egress trust bundle can complete a TLS handshake with the
+// sdsmint egress gateway's per-SNI minted leaf, using ONLY the projected
+// anchors — and, for a destination the actor's egress policy exempts, with the
+// origin's own certificate instead. See TestActorEgressMITMTrust for the proof
 // structure and how to run this locally.
 package egressmitm
 
@@ -128,6 +129,12 @@ func TestActorEgressMITMTrust(t *testing.T) {
 	} else if !strings.Contains(neg.Error, "certificate") && !strings.Contains(neg.Error, "x509") {
 		t.Errorf("fetch with system roots failed, but not with a certificate-verification error: %s", neg.Error)
 	}
+
+	// Shares the fixture and the actor, and depends on the assertions above
+	// having established that this gateway does intercept.
+	t.Run("TLSInterceptionExemption", func(t *testing.T) {
+		testTLSInterceptionExemption(t, ctx, clients, rc, id)
+	})
 }
 
 type fetchResponse struct {

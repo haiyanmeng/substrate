@@ -749,6 +749,81 @@ func TestValidateEgressPolicyRules(t *testing.T) {
 	}
 }
 
+func TestValidateEgressPolicyTLSInterceptionExemptions(t *testing.T) {
+	exemptions := field.NewPath("egress_policy", "tls_interception_exemptions")
+	tests := []struct {
+		name       string
+		exemptions []string
+		want       field.ErrorList
+	}{{
+		name: "unset",
+	}, {
+		name:       "exact and wildcard names",
+		exemptions: []string{"api.example.com", "*.internal.example.com"},
+	}, {
+		name: "long list",
+		exemptions: func() []string {
+			var out []string
+			for i := range 256 {
+				out = append(out, fmt.Sprintf("api%d.example.com", i))
+			}
+			return out
+		}(),
+	}, {
+		name: "too-long list",
+		exemptions: func() []string {
+			var out []string
+			for i := range 257 {
+				out = append(out, fmt.Sprintf("api%d.example.com", i))
+			}
+			return out
+		}(),
+		want: field.ErrorList{
+			field.TooMany(exemptions, 257, 256).WithOrigin("maxItems"),
+		},
+	}, {
+		name:       "empty name",
+		exemptions: []string{""},
+		want: field.ErrorList{
+			field.Required(exemptions.Index(0), ""),
+		},
+	}, {
+		name:       "duplicate name",
+		exemptions: []string{"api.example.com", "api.example.com"},
+		want: field.ErrorList{
+			field.Duplicate(exemptions.Index(1), "api.example.com"),
+		},
+	}, {
+		name:       "IP literal",
+		exemptions: []string{"192.0.2.1"},
+		want: field.ErrorList{
+			field.Invalid(exemptions.Index(0), "192.0.2.1", "must be a DNS hostname, optionally with a complete leftmost-label wildcard"),
+		},
+	}, {
+		name:       "name with port",
+		exemptions: []string{"example.com:443"},
+		want: field.ErrorList{
+			field.Invalid(exemptions.Index(0), "example.com:443", "must be a DNS hostname, optionally with a complete leftmost-label wildcard"),
+		},
+	}, {
+		name:       "interior wildcard",
+		exemptions: []string{"api.*.example.com"},
+		want: field.ErrorList{
+			field.Invalid(exemptions.Index(0), "api.*.example.com", "must be a DNS hostname, optionally with a complete leftmost-label wildcard"),
+		},
+	}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &ateapipb.CreateActorEgressPolicyRequest{
+				Actor:        &ateapipb.ObjectRef{Atespace: testAtespace, Name: "actor"},
+				EgressPolicy: validEgressPolicy(),
+			}
+			req.EgressPolicy.TlsInterceptionExemptions = tc.exemptions
+			assertValidateErr(t, validateCreateActorEgressPolicyRequest(context.Background(), req), tc.want)
+		})
+	}
+}
+
 func TestActorEgressPolicy(t *testing.T) {
 	persistence, cleanup := storetest.SetupTestStore(t)
 	defer cleanup()

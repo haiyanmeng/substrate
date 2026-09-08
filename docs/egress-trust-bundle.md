@@ -22,6 +22,10 @@ If you configure this on a non-sdsmint install you will *break* the actor:
 the steps below make the gateway CA the actor's only trust anchor, and without
 a MITM gateway in front of it nothing the actor dials will chain to that CA.
 
+Some destinations cannot be reached through interception no matter how the
+actor's trust store is configured — see
+[Exempting a destination](#exempting-a-destination-from-interception).
+
 ## Project the bundle
 
 Add a `systemInfo` volume with a `trustBundle` data source, and mount it:
@@ -109,6 +113,52 @@ exactly this. Deploy it against an sdsmint install:
 Then drive an actor's egress at an HTTPS URL and confirm it returns a response
 rather than a certificate error. Because the demo sets `SSL_CERT_DIR` as well,
 a `200` is positive evidence that the projected bundle did the validating.
+
+## Exempting a destination from interception
+
+Projecting the bundle works when the actor's TLS client is something you can
+configure. Some destinations are not:
+
+* The client pins a certificate or a public key, so no minted leaf validates.
+* The origin requires mutual TLS and the actor holds the client key — the
+  gateway re-originates the connection and has no way to present it.
+* The protocol inside the tunnel is not something the gateway can carry.
+
+List those hostnames in `EgressPolicy.tls_interception_exemptions`, alongside
+the policy's `rules`, and the gateway tunnels them through untouched, exactly
+as a non-sdsmint install would. The policy is a subresource of the actor, set
+over the ate API with `CreateActorEgressPolicy` or `UpdateActorEgressPolicy`:
+
+```textproto
+metadata { atespace: "my-namespace" name: "default" }
+rules { hostnames { patterns: "api.example.com" patterns: "*.cdn.example.com" } }
+tls_interception_exemptions: "api.example.com"
+tls_interception_exemptions: "*.cdn.example.com"
+```
+
+Patterns use the same grammar as `HostnameRule.patterns`: an exact DNS name, or
+a wildcard covering the complete leftmost label. `*.cdn.example.com` matches
+`assets.cdn.example.com`, and matches neither `cdn.example.com` nor
+`a.b.cdn.example.com`. They are matched against the SNI the actor sends rather
+than a Host header, so a connection carrying no SNI is never exempt.
+
+Note what this does and does not do:
+
+* **It is not an authorization.** `rules` still decides which destinations the
+  actor may reach at all. Exempting a hostname the policy denies does not open
+  it; denying one the policy allows does not close it.
+* **It costs you the visibility.** An exempted connection is a byte pipe: the
+  gateway sees the SNI and the connection, and nothing inside it.
+* **Only the sdsmint gateway intercepts anything**, so on a plain install the
+  field is inert — every connection is already a passthrough.
+* **It is implemented on the Envoy gateway only.** Under
+  `--atenet-router=agentgateway` the MITM variant intercepts every connection
+  and the field has no effect.
+
+Anything that goes wrong falls back to intercepting: an unreachable control
+plane, a gateway that has not yet picked up the policy, an SNI that does not
+match. If an exemption does not seem to be taking effect, the actor sees a
+certificate error rather than an open tunnel, and the gateway keeps working.
 
 ## Operational notes
 
