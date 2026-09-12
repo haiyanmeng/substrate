@@ -476,7 +476,7 @@ message CIDRRule {
   // +k8s:maxItems=256
   // +k8s:listType=set
   // +k8s:customValidation # format
-  repeated string cidrs = 1;
+  repeated string cidrs = 7;
 }
 
 // EgressRuleEffects contains effects applied by a matching hostname rule.

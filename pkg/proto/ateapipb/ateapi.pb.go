@@ -1303,7 +1303,7 @@ type CIDRRule struct {
 	// +k8s:maxItems=256
 	// +k8s:listType=set
 	// +k8s:customValidation # format
-	Cidrs         []string `protobuf:"bytes,1,rep,name=cidrs,proto3" json:"cidrs,omitempty"`
+	Cidrs         []string `protobuf:"bytes,7,rep,name=cidrs,proto3" json:"cidrs,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6904,7 +6904,7 @@ const file_ateapi_proto_rawDesc = "" +
 	"\bpatterns\x18\x01 \x03(\tR\bpatterns\x123\n" +
 	"\aeffects\x18\x02 \x01(\v2\x19.ateapi.EgressRuleEffectsR\aeffects\" \n" +
 	"\bCIDRRule\x12\x14\n" +
-	"\x05cidrs\x18\x01 \x03(\tR\x05cidrs\"j\n" +
+	"\x05cidrs\x18\a \x03(\tR\x05cidrs\"j\n" +
 	"\x11EgressRuleEffects\x12U\n" +
 	"\x15inject_static_headers\x18\x01 \x03(\v2!.ateapi.CredentialHeaderInjectionR\x13injectStaticHeaders\"r\n" +
 	"\x19CredentialHeaderInjection\x12\x16\n" +
