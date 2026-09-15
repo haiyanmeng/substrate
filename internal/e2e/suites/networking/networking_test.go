@@ -82,8 +82,14 @@ func TestActorDirectAccess(t *testing.T) {
 	})
 }
 
-// egressHTTPTarget returns a copy of the origin TestActorEgress dials:
-// testserver's http subcommand, published on port 80, listening on 8080.
+// egressHTTPTarget returns a copy of the origin the plain-HTTP egress tests
+// dial: testserver's http subcommand, published on port 80, listening on 8080.
+//
+// Four tests want exactly this server, and it only ever answers /healthz, so
+// they share one through e2e.DeploySharedServerPod rather than each standing up
+// an identical pod. Keep the spec here identical across those callers: the
+// sharing is keyed on the name and verified against the contents, so a caller
+// that tweaks a field gets a loud conflict instead of a second origin.
 func egressHTTPTarget() e2e.ServerPod {
 	return e2e.ServerPod{
 		Name:       "egresshttp",
@@ -108,7 +114,7 @@ func TestActorEgress(t *testing.T) {
 
 	// Deploy the origin first so a fixture failure costs no Actor resume.
 	origin := egressHTTPTarget()
-	target := e2e.DeployServerPod(t, ctx, origin)
+	target := e2e.DeploySharedServerPod(t, ctx, origin)
 
 	actorName, _ := createAndResumeActorWithEgress(t, ctx, "egress", egressFixture(), e2e.EgressAllowAll())
 	router := mustRouterClient(t, ctx)

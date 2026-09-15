@@ -286,3 +286,99 @@ func TestRenderServerPod_Volumes(t *testing.T) {
 		}
 	}
 }
+
+// resetSharedServers isolates a test from the package-level memo, and restores
+// it afterwards so the suite it belongs to is unaffected.
+func resetSharedServers(t *testing.T) {
+	t.Helper()
+	sharedServersMu.Lock()
+	saved := sharedServers
+	sharedServers = map[string]*sharedServer{}
+	sharedServersMu.Unlock()
+
+	t.Cleanup(func() {
+		sharedServersMu.Lock()
+		sharedServers = saved
+		sharedServersMu.Unlock()
+	})
+}
+
+// TestSharedServerEntry covers the memo DeploySharedServerPod is built on. The
+// deploy itself needs a cluster; which callers are handed the same entry does
+// not, and it is the part that decides whether a suite shares one origin or
+// silently stands up several.
+func TestSharedServerEntry(t *testing.T) {
+	resetSharedServers(t)
+
+	spec := ServerPod{
+		Name:       "egresshttp",
+		ImportPath: "github.com/agent-substrate/substrate/internal/e2e/fixtures/testserver",
+		Args:       []string{"http"},
+		Port:       80,
+		TargetPort: 8080,
+	}
+
+	first, conflict := sharedServerEntry(spec)
+	if conflict {
+		t.Fatalf("the first call for %q reported a conflict", spec.Name)
+	}
+
+	// An equal spec built separately, which is what a suite's callers actually
+	// pass: egressHTTPTarget() returns a fresh value every time, so matching on
+	// identity rather than contents would deploy an origin per caller and
+	// quietly undo the sharing.
+	same := ServerPod{
+		Name:       "egresshttp",
+		ImportPath: "github.com/agent-substrate/substrate/internal/e2e/fixtures/testserver",
+		Args:       []string{"http"},
+		Port:       80,
+		TargetPort: 8080,
+	}
+	second, conflict := sharedServerEntry(same)
+	if conflict {
+		t.Errorf("an equal spec for %q reported a conflict", spec.Name)
+	}
+	if second != first {
+		t.Errorf("an equal spec got a different entry, so its caller would deploy a second origin")
+	}
+}
+
+// TestSharedServerEntryConflict covers the name collision. Handing the second
+// caller the first one's origin would leave it dialing a server it never asked
+// for, so the mismatch has to surface.
+func TestSharedServerEntryConflict(t *testing.T) {
+	resetSharedServers(t)
+
+	spec := ServerPod{Name: "origin", ImportPath: "example.com/a", Port: 80}
+	if _, conflict := sharedServerEntry(spec); conflict {
+		t.Fatalf("the first call for %q reported a conflict", spec.Name)
+	}
+
+	for _, differs := range []ServerPod{
+		{Name: "origin", ImportPath: "example.com/b", Port: 80},
+		{Name: "origin", ImportPath: "example.com/a", Port: 8080},
+		{Name: "origin", ImportPath: "example.com/a", Port: 80, Args: []string{"grpc"}},
+	} {
+		if _, conflict := sharedServerEntry(differs); !conflict {
+			t.Errorf("spec %+v reused the entry for %+v without reporting a conflict", differs, spec)
+		}
+	}
+}
+
+// TestSharedServerEntryDistinctNames covers the ordinary case of a suite with
+// more than one shared origin: different names are different servers.
+func TestSharedServerEntryDistinctNames(t *testing.T) {
+	resetSharedServers(t)
+
+	http, conflict := sharedServerEntry(ServerPod{Name: "egresshttp", Port: 80})
+	if conflict {
+		t.Fatal("the first call for egresshttp reported a conflict")
+	}
+	grpc, conflict := sharedServerEntry(ServerPod{Name: "grpcecho", Port: 50051})
+	if conflict {
+		t.Fatal("grpcecho conflicted with egresshttp, which it does not share a name with")
+	}
+	if http == grpc {
+		t.Error("two names got one entry, so one origin would answer for both")
+	}
+}

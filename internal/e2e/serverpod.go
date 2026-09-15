@@ -18,8 +18,10 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -96,19 +98,110 @@ func (s Server) Address() string {
 }
 
 // DeployServerPod builds spec's image, applies the shared server manifest, waits
-// for readiness and returns the address to dial.
+// for readiness and returns the address to dial. The pod goes when the test that
+// deployed it is done; for an origin several tests in a suite dial, see
+// DeploySharedServerPod.
 //
 // It registers no cleanup: everything the manifest creates is namespaced, so it
 // goes with the namespace CreateNamespace made — and, on failure, is retained
 // with it for `kubectl logs`.
 func DeployServerPod(t *testing.T, ctx context.Context, spec ServerPod) Server {
 	t.Helper()
+	return deployServerPod(t, ctx, spec, CreateNamespace)
+}
+
+// sharedServer is one memoized origin and the spec it was deployed from.
+type sharedServer struct {
+	spec ServerPod
+	once sync.Once
+	// server and ok are written inside once.Do and read after it returns,
+	// which the Once orders for us.
+	server Server
+	ok     bool
+}
+
+// sharedServers memoizes DeploySharedServerPod's origins by name. Package-level
+// state is suite-scoped state: go test builds one binary per package, so this
+// map is born and dies with the suite that uses it.
+var (
+	sharedServersMu sync.Mutex
+	sharedServers   = map[string]*sharedServer{}
+)
+
+// DeploySharedServerPod is DeployServerPod for an origin several tests in a
+// suite dial: the first caller deploys it, every later one gets the same Server
+// back.
+//
+// Worth it because an origin is the cheap half of a fixture — a Pod asking for
+// 10m of CPU, and a Service — while standing one up costs a namespace, an apply,
+// a schedule and a readiness wait every time. Four tests dialing four identical
+// HTTP origins pay all of that four times to observe the same thing.
+//
+// The pod outlives the test that deployed it, in a namespace from
+// CreateSuiteNamespace, and goes at the end of the run with every other
+// namespace: deleted if the suite passed, kept for `kubectl logs` if it did not.
+//
+// Two things to weigh before reaching for it:
+//
+//   - The deploy is attributed to whichever test ran first, so its logs, its
+//     failure and its serverPodReadyTimeout land on that test — and move when
+//     -run picks a different one. An origin a single test dials is better served
+//     by DeployServerPod, which hands the namespace back as soon as that test is
+//     done.
+//   - One server now answers several tests, so it has to be one that carries no
+//     state between them. Every fixture in internal/e2e/fixtures/testserver
+//     qualifies; something that recorded what it was sent would not.
+func DeploySharedServerPod(t *testing.T, ctx context.Context, spec ServerPod) Server {
+	t.Helper()
+	shared, conflict := sharedServerEntry(spec)
+	if conflict {
+		t.Fatalf("shared server pod %q was already deployed from a different spec\n have: %+v\n want: %+v",
+			spec.Name, shared.spec, spec)
+	}
+
+	shared.once.Do(func() {
+		shared.server = deployServerPod(t, ctx, spec, CreateSuiteNamespace)
+		// Reached only if the deploy did not Fatalf. sync.Once marks itself
+		// done on the way out even when its function ends in a Goexit, which
+		// is what t.Fatalf does -- so a failed deploy is remembered as one
+		// rather than retried by the next test, which would spend another
+		// serverPodReadyTimeout learning the same thing.
+		shared.ok = true
+	})
+	if !shared.ok {
+		t.Fatalf("shared server pod %q is not running: the test that deployed it failed", spec.Name)
+	}
+	return shared.server
+}
+
+// sharedServerEntry returns the memo entry for spec's name, creating it on first
+// use. conflict reports that the name is already held by a different spec, which
+// is two servers colliding over one name rather than a request for a second
+// server -- and worth saying so, since the alternative is a test quietly dialing
+// someone else's origin.
+func sharedServerEntry(spec ServerPod) (entry *sharedServer, conflict bool) {
+	sharedServersMu.Lock()
+	defer sharedServersMu.Unlock()
+
+	if existing, found := sharedServers[spec.Name]; found {
+		return existing, !reflect.DeepEqual(existing.spec, spec)
+	}
+	entry = &sharedServer{spec: spec}
+	sharedServers[spec.Name] = entry
+	return entry, false
+}
+
+// deployServerPod is the body both variants share. newNamespace is what decides
+// the pod's lifetime: a namespace released with the deploying test, or one held
+// for the suite.
+func deployServerPod(t *testing.T, ctx context.Context, spec ServerPod, newNamespace func(*testing.T) *Namespace) Server {
+	t.Helper()
 	if _, err := CheckEnv("KO_DOCKER_REPO"); err != nil {
 		t.Fatalf("CheckEnv failed: %v", err)
 	}
 	namespace := spec.Namespace
 	if namespace == "" {
-		namespace = CreateNamespace(t).Name
+		namespace = newNamespace(t).Name
 	}
 
 	koApply(t, renderServerPod(t, spec, namespace))
