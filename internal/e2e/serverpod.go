@@ -59,6 +59,10 @@ type ServerPod struct {
 	// publish a port the container -- uid 65532, every capability dropped --
 	// cannot bind, such as 80; the Service maps Port down to it.
 	TargetPort int
+	// Env is the container's environment. Typed for the same reason the volumes
+	// are: a server whose behavior depends on a GODEBUG setting -- extended
+	// CONNECT, say -- says so beside the code that relies on it.
+	Env []corev1.EnvVar
 	// Namespace deploys into an existing namespace instead of a fresh one, for
 	// a suite that has to populate that namespace first: credentials the pod
 	// mounts have to exist before it is scheduled, and DeployServerPod cannot
@@ -146,6 +150,7 @@ func renderServerPod(t *testing.T, spec ServerPod, namespace string) string {
 	}
 	blocks := map[string]string{
 		"${ARGS}":            serverArgs(spec, targetPortStr),
+		"${ENV}":             yamlListBlock(t, "env", spec.Env, 4),
 		"${READINESS_PROBE}": serverReadinessProbe(spec, targetPortStr),
 		// Indented to their parents: volumeMounts is a container field, volumes
 		// a pod one. An empty list takes its whole line, key included.
