@@ -116,6 +116,27 @@ func koApply(t *testing.T, manifest string) {
 	RunCmdWithEnv(t, []string{"KO_CONFIG_PATH=" + root}, filepath.Join(root, "hack/run-tool.sh"), applyArgs...)
 }
 
+// KoBuild builds and pushes the image for importPath and returns the digest
+// reference ko printed. Same pinned ko and KO_CONFIG_PATH rules as koApply.
+//
+// For the caller whose image reference does not live in a manifest at all: an
+// ActorTemplate assembled in Go, whose container image is a proto field, has
+// nothing for ko resolve to substitute into.
+func KoBuild(t *testing.T, importPath string) string {
+	t.Helper()
+	root, err := FindRepoRoot()
+	if err != nil {
+		t.Fatalf("FindRepoRoot: %v", err)
+	}
+	out := RunCmdOutput(t, []string{"KO_CONFIG_PATH=" + root}, filepath.Join(root, "hack/run-tool.sh"), "ko", "build", "--push", importPath)
+	// ko prints progress on stderr and the reference, alone, on stdout.
+	image := strings.TrimSpace(string(out))
+	if image == "" {
+		t.Fatalf("ko build %s printed no image reference", importPath)
+	}
+	return image
+}
+
 // koResolve builds and pushes the ko:// images named in manifest and returns
 // the manifest with those references replaced by pushed digests. Same pinned
 // ko and KO_CONFIG_PATH rules as koApply; resolve is how a manifest that is
