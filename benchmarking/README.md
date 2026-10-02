@@ -326,6 +326,35 @@ The web UI shows the same fields; `0` keeps the value boomer-worker started with
 The `actors_per_*` ratios in `trial_summary` are wrong for this test: they
 count users × `--actors-per-user`, not `--total-actors`.
 
+### Fake Data Plane
+
+A real cold resume is limited by the node's restore capacity, which hides the
+limits of ate-api-server and Postgres. The fake data plane takes the nodes out:
+
+```bash
+./benchmarking/workloads/deploy.sh --deploy --fake-data-plane \
+  --fake-nodes 2 --fake-workers-per-node 100 --fake-delay 500ms
+```
+
+Instead of the WorkerPool, this deploys two fakes from `cmd/benchmarking/`:
+
+* `fake-atelet` takes atelet's place on `--fake-nodes` nodes and answers every
+  lifecycle call with success after `--fake-delay`, without running or saving
+  any workload. It writes one placeholder object per snapshot, because
+  ate-api-server refuses to tag an empty one.
+* `fake-workersync` registers `--fake-workers-per-node` Workers on each of
+  those nodes, none backed by a pod.
+
+The mode moves the real atelet off the chosen nodes and scales ate-controller
+to zero, whose worker syncer would delete the fake Workers. `deploy.sh
+--delete` undoes both whenever it finds a fake data plane. Never use it on a
+cluster that serves real actors: actors placed on fake Workers do not exist.
+
+Since nothing answers behind the router, run boomer with `--skip-ping`
+(`runner.py` forwards it): `spawn` counts an actor ready when `ResumeActor`
+returns, and `glutton` cycles resume then suspend. In `tests.yaml`, a
+`fakeDataPlane` block selects the mode; see `spawn_fake_dataplane_1000_actors`.
+
 ### Viewing Traces
 You must have enabled otel tracing for your cluster to view traces.
 
