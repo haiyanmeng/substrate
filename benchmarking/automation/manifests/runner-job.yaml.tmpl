@@ -112,6 +112,9 @@ spec:
         operator: Equal
         value: "true"
         effect: NoSchedule
+      # Pins the runner to its node when the test's ateapi.pinNodes is on;
+      # {} otherwise.
+      affinity: ${RUNNER_AFFINITY}
       containers:
       - name: runner
         image: ${IMAGE}
@@ -135,6 +138,11 @@ spec:
         env:
         - name: OTEL_EXPORTER_OTLP_ENDPOINT
           value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317
+        # boomer's /metrics; the boomer-worker job of
+        # benchmarking/monitoring.yaml scrapes it.
+        ports:
+        - name: boomer-metrics
+          containerPort: 8001
         volumeMounts:
         - name: servicedns-ca
           mountPath: /run/servicedns-ca
@@ -142,10 +150,12 @@ spec:
         - name: podidentity
           mountPath: /run/podidentity.podcert.ate.dev
           readOnly: true
+        # No limits: a throttled load generator measures itself. Size
+        # runnerCpu for the top rate and check the runner's CPU in cAdvisor.
         resources:
           requests:
-            cpu: "500m"
-            memory: "512Mi"
+            cpu: "${RUNNER_CPU}"
+            memory: "${RUNNER_MEMORY}"
       volumes:
       - name: servicedns-ca
         projected:

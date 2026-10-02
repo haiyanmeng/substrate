@@ -69,6 +69,29 @@
 # `--trace-probability` in `flags` is the rate before the first such step.
 # Thus a ladder with no probability in any step keeps the rate of the flag.
 #
+# A step can end in `@target_rps` (e.g. `200:3m@4000`), which caps the
+# requests per second of the whole boomer worker from the step's start; 0
+# removes the cap. Boomer users that pace themselves (resumecold) honor it.
+# Keep `users` at or above the rate times the p99 latency in seconds, or the
+# step falls short of its rate.
+#
+# `runnerCpu` and `runnerMemory` (defaults "500m" and "512Mi") are the runner
+# Job's requests; it sets no limits. Size `runnerCpu` for the top rate.
+#
+# An optional `ateapi:` block shapes the control plane for a capacity run of
+# ate-api-server and Postgres; pre_test applies it after the deploy:
+#   cpu            Required. CPU of each ate-api-server replica, set as both
+#                  request and limit (e.g. 2 or "1500m").
+#   memory         Optional (default "4Gi"). Memory request and limit.
+#   replicas       Optional (default 1).
+#   poolMaxConns   Optional. pgxpool max connections per replica, written
+#                  into the DSN Secret. Unset keeps the installed value.
+#   pgStats        Optional (default true). Load pg_stat_statements and add
+#                  a postgres_exporter sidecar, scraped by monitoring.yaml.
+#   pinNodes       Optional (default true). Label one node for ateapi and
+#                  another for the runner, away from the Postgres node, and
+#                  pin each there.
+#
 # ---- type: nighthawk-ingress --------------------------------------------------------
 #
 # Runs the Nighthawk adaptive router-capacity benchmark. `duration` is the
@@ -568,6 +591,55 @@ tests:
       - "1.0"
       - "--max-wait-time"
       - "1.0"
+  # ate-api-server and Postgres cold resume ceiling, with atelet stubbed out.
+  # Every user takes a paused actor from the shared fleet, resumes it and
+  # pauses it again; FleetExhausted failures mark a step the fleet could not
+  # cover. Needs every atelet started with --benchmark-stub-herder
+  # --benchmark-stub-herder-delay=150ms (a measured pause restore plus
+  # checkpoint), which the automation does not set: patch the atelet
+  # DaemonSet by hand, and revert it after the run.
+  - name: ateapi_cold_resume_pause_stub_2cpu
+    type: locust
+    description: "ate-api-server cold resume against a stubbed atelet: ResumeActor then PauseActor, rate ladder 100-1500 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 23m
+    users: 1000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    ateapi:
+      cpu: 2
+      memory: 4Gi
+      poolMaxConns: 64
+    flags:
+      - "--actors"
+      - "1000"
+      - "--ladder-spawn-rate"
+      - "1000"
+      - "--ladder"
+      - "1000:3m@100,1000:3m@200,1000:3m@400,1000:3m@600,1000:3m@800,1000:3m@1000,1000:3m@1500"
+  - name: ateapi_cold_resume_pause_stub_8cpu
+    type: locust
+    description: "ate-api-server cold resume against a stubbed atelet, ate-api-server at 8 CPUs: rate ladder 250-3000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 23m
+    users: 2000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    ateapi:
+      cpu: 8
+      memory: 4Gi
+      poolMaxConns: 64
+    flags:
+      - "--actors"
+      - "2000"
+      - "--ladder-spawn-rate"
+      - "2000"
+      - "--ladder"
+      - "2000:3m@250,2000:3m@500,2000:3m@1000,2000:3m@1500,2000:3m@2000,2000:3m@2500,2000:3m@3000"
   - name: ingress_routercap_envoy_2cpu
     description: "Router capacity: Nighthawk adaptive max-RPS search under a 25ms tail-latency SLO, Envoy at 2 CPUs"
     type: nighthawk-ingress
