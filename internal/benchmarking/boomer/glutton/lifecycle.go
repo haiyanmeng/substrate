@@ -156,6 +156,26 @@ func (r *taskRuntime) iterate() {
 		}
 		return
 	}
+	// On the fake data plane no actor answers, so the cycle sends it nothing:
+	// it holds the actor for the live window, then suspends it.
+	var deadline time.Time
+	if r.cfg.SkipPing {
+		deadline = time.Now().Add(r.liveWait())
+	} else {
+		deadline = r.exerciseActor(ctx, actor)
+	}
+	if remaining := time.Until(deadline); remaining > 0 {
+		time.Sleep(remaining)
+	}
+	if err := actor.hibernate(ctx); err != nil && actor.noteFailure(err) {
+		user.replaceActor(ctx, actor)
+	}
+}
+
+// exerciseActor runs the requests a cycle sends the resumed actor itself: the
+// memory and CPU load, then pings until the ping cap or the end of the live
+// window, which starts once the load is in place. It returns the window's end.
+func (r *taskRuntime) exerciseActor(ctx context.Context, actor *gluttonActor) time.Time {
 	// Fill before the first suspend so every snapshot from cycle one on
 	// carries the full working set; glutton keeps the allocations across
 	// suspend/resume, so this runs once per actor (retried if it fails).
@@ -191,12 +211,7 @@ func (r *taskRuntime) iterate() {
 		time.Sleep(gap)
 		actor.ping(ctx)
 	}
-	if remaining := time.Until(deadline); remaining > 0 {
-		time.Sleep(remaining)
-	}
-	if err := actor.hibernate(ctx); err != nil && actor.noteFailure(err) {
-		user.replaceActor(ctx, actor)
-	}
+	return deadline
 }
 
 func (r *taskRuntime) startUser(ctx context.Context) (*gluttonUser, error) {
