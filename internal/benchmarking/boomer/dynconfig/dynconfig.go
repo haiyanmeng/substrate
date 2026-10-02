@@ -55,18 +55,19 @@ type Config struct {
 	MinLive           time.Duration // time a GluttonUser actor stays resumed between its first ping and suspend, lower bound
 	MaxLive           time.Duration // upper bound of the live window; zero (the default) suspends right after the ping
 	TraceProbability  float64
-	DurDirFileSize    int64  // bytes
-	ResumeMode        string // ResumeModeExplicit | ResumeModeImplicit
-	LifecycleMode     string // LifecycleModeSuspend | LifecycleModePause
-	DurDirReadMode    string // ReadModeData | ReadModeDigest
-	DurDirTemplate    string // ActorTemplate name
-	MemTarget         string // resident RAM the GluttonUser fills via WriteRAM, suffixed (e.g. "2Gi"); "" disables
-	MemChurn          string // RAM re-randomized in place each cycle via WriteRAM rotate, suffixed (e.g. "64Mi"); "" disables
-	MemRead           string // RAM walked (one byte per page) via ReadRAM after each resume, suffixed (e.g. "1Gi") or "all"; "" disables
-	MaxPingsPerWake   int    // cap on pings a GluttonUser sends during one resume/suspend cycle; values < 1 read as 1
-	SweperfTemplate   string // ActorTemplate name for the sweperf workload; "" falls back to default
-	SweperfTotalSteps int    // total steps in trace; 0 falls back to default
-	SweperfNumCycles  int    // number of cycles to partition steps into; 0 falls back to default
+	DurDirFileSize    int64   // bytes
+	ResumeMode        string  // ResumeModeExplicit | ResumeModeImplicit
+	LifecycleMode     string  // LifecycleModeSuspend | LifecycleModePause
+	DurDirReadMode    string  // ReadModeData | ReadModeDigest
+	DurDirTemplate    string  // ActorTemplate name
+	MemTarget         string  // resident RAM the GluttonUser fills via WriteRAM, suffixed (e.g. "2Gi"); "" disables
+	MemChurn          string  // RAM re-randomized in place each cycle via WriteRAM rotate, suffixed (e.g. "64Mi"); "" disables
+	MemRead           string  // RAM walked (one byte per page) via ReadRAM after each resume, suffixed (e.g. "1Gi") or "all"; "" disables
+	MaxPingsPerWake   int     // cap on pings a GluttonUser sends during one resume/suspend cycle; values < 1 read as 1
+	SweperfTemplate   string  // ActorTemplate name for the sweperf workload; "" falls back to default
+	SweperfTotalSteps int     // total steps in trace; 0 falls back to default
+	SweperfNumCycles  int     // number of cycles to partition steps into; 0 falls back to default
+	TargetRPS         float64 // requests per second the whole worker paces to, for user classes that pace; 0 means unpaced
 }
 
 // Holder lets readers Load() the current Config and writers Store() a new
@@ -114,6 +115,7 @@ type payload struct {
 	SweperfTemplate   *string  `json:"sweperf_template"`
 	SweperfTotalSteps *float64 `json:"sweperf_total_steps"`
 	SweperfNumCycles  *float64 `json:"sweperf_num_cycles"`
+	TargetRPS         *float64 `json:"target_rps"`
 }
 
 // Parse decodes a JSON blob (typically from a CLI flag) and merges its
@@ -204,6 +206,9 @@ func (c Config) Validate() error {
 	if c.SweperfNumCycles < 0 {
 		return fmt.Errorf("sweperf_num_cycles cannot be negative: %d", c.SweperfNumCycles)
 	}
+	if c.TargetRPS < 0 {
+		return fmt.Errorf("target_rps cannot be negative: %v", c.TargetRPS)
+	}
 	// MaxPingsPerWake < 1 is treated as 1 at read time (see iterate() in
 	// glutton/lifecycle.go), so Config's zero value stays usable — no
 	// validate rejection here.
@@ -269,6 +274,9 @@ func (p payload) merge(current Config) Config {
 	}
 	if p.SweperfNumCycles != nil {
 		out.SweperfNumCycles = int(*p.SweperfNumCycles)
+	}
+	if p.TargetRPS != nil {
+		out.TargetRPS = *p.TargetRPS
 	}
 	return out
 }
@@ -345,6 +353,7 @@ func StartPoll(
 					slog.String("sweperf_template", next.SweperfTemplate),
 					slog.Int("sweperf_total_steps", next.SweperfTotalSteps),
 					slog.Int("sweperf_num_cycles", next.SweperfNumCycles),
+					slog.Float64("target_rps", next.TargetRPS),
 				)
 			}
 		}
@@ -391,6 +400,7 @@ func SubscribeSpawn(url string, holder *Holder, sampler ProbabilityUpdater, fetc
 			slog.String("sweperf_template", next.SweperfTemplate),
 			slog.Int("sweperf_total_steps", next.SweperfTotalSteps),
 			slog.Int("sweperf_num_cycles", next.SweperfNumCycles),
+			slog.Float64("target_rps", next.TargetRPS),
 		)
 	})
 }
