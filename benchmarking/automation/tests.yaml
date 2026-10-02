@@ -640,6 +640,72 @@ tests:
       - "2000"
       - "--ladder"
       - "2000:3m@250,2000:3m@500,2000:3m@1000,2000:3m@1500,2000:3m@2000,2000:3m@2500,2000:3m@3000"
+  - name: ateapi_cold_resume_pause_stub_4cpu
+    type: locust
+    description: "ate-api-server cold resume against a stubbed atelet, ate-api-server at 4 CPUs: rate ladder 250-2500 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 23m
+    users: 2000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    ateapi:
+      cpu: 4
+      memory: 4Gi
+      poolMaxConns: 64
+    flags:
+      - "--actors"
+      - "2000"
+      - "--ladder-spawn-rate"
+      - "2000"
+      - "--ladder"
+      - "2000:3m@250,2000:3m@500,2000:3m@1000,2000:3m@1500,2000:3m@1750,2000:3m@2000,2000:3m@2500"
+  # Two replicas share size0's max_connections of 100, so each pool is 40.
+  - name: ateapi_cold_resume_pause_stub_2x2cpu
+    type: locust
+    description: "ate-api-server cold resume against a stubbed atelet, 2 ate-api-server replicas at 2 CPUs: rate ladder 250-2500 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 23m
+    users: 2000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    ateapi:
+      cpu: 2
+      replicas: 2
+      memory: 4Gi
+      poolMaxConns: 40
+    flags:
+      - "--actors"
+      - "2000"
+      - "--ladder-spawn-rate"
+      - "2000"
+      - "--ladder"
+      - "2000:3m@250,2000:3m@500,2000:3m@1000,2000:3m@1500,2000:3m@1750,2000:3m@2000,2000:3m@2500"
+  - name: ateapi_cold_resume_pause_stub_2x4cpu
+    type: locust
+    description: "ate-api-server cold resume against a stubbed atelet, 2 ate-api-server replicas at 4 CPUs: rate ladder 500-4000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 23m
+    users: 4000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    ateapi:
+      cpu: 4
+      replicas: 2
+      memory: 4Gi
+      poolMaxConns: 40
+    flags:
+      - "--actors"
+      - "4000"
+      - "--ladder-spawn-rate"
+      - "4000"
+      - "--ladder"
+      - "4000:3m@500,4000:3m@1000,4000:3m@2000,4000:3m@2500,4000:3m@3000,4000:3m@3500,4000:3m@4000"
   - name: ingress_routercap_envoy_2cpu
     description: "Router capacity: Nighthawk adaptive max-RPS search under a 25ms tail-latency SLO, Envoy at 2 CPUs"
     type: nighthawk-ingress
