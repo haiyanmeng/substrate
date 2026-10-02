@@ -37,6 +37,7 @@ import (
 
 	// Register user classes via init():
 	_ "github.com/agent-substrate/substrate/internal/benchmarking/boomer/glutton"
+	_ "github.com/agent-substrate/substrate/internal/benchmarking/boomer/resumecold"
 	_ "github.com/agent-substrate/substrate/internal/benchmarking/boomer/sweperf"
 )
 
@@ -51,6 +52,7 @@ func main() {
 		configPollInterval      = flag.Duration("config-poll-interval", 10*time.Second, "With --master-web-port, also fetch dynconfig on this interval. A spawn message comes only when the number of users or the spawn rate changes, thus a load shape that changes the sample rate alone needs this. Zero stops the polling.")
 		userClass               = flag.String("user-class", "glutton", fmt.Sprintf("Locust user class to run, lowercase; one of %s.", strings.Join(userclass.Names(), "|")))
 		actorsPerUser           = flag.Int("actors-per-user", 1, "Number of actors each user (VU) creates and cycles through in round-robin: on iteration i, the user targets actor i%actors-per-user. Startup creates all actors; shutdown hibernates+deletes them.")
+		actors                  = flag.Int("actors", 200, "Size of the actor fleet shared by every user, for user classes whose actor count is independent of the user count (resumecold). Startup creates and warms all of them; shutdown deletes them.")
 		httpMaxIdleConnsPerHost = flag.Int("http-max-idle-conns-per-host", 10000, "Idle HTTP connections the router client keeps per host. Set it to at least the number of users this worker runs, so each VU reuses its connection to the router across wakes instead of opening a new one per request.")
 	)
 	// boomer.Run will call flag.Parse() if we haven't yet; calling here so
@@ -59,6 +61,10 @@ func main() {
 
 	class := strings.ToLower(*userClass)
 
+	if *actors < 1 {
+		slog.Error("fatal: --actors must be >= 1", slog.Int("actors", *actors))
+		os.Exit(1)
+	}
 	if *actorsPerUser < 1 {
 		slog.Error("fatal: --actors-per-user must be >= 1",
 			slog.Int("actors_per_user", *actorsPerUser))
@@ -155,6 +161,7 @@ func main() {
 		Atespace:      *atespace,
 		Dyn:           dyn,
 		ActorsPerUser: *actorsPerUser,
+		Actors:        *actors,
 	}
 
 	entry, ok := userclass.Lookup(class)

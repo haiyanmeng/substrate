@@ -46,4 +46,8 @@ type Config struct {
 	// that honor this knob; classes that don't honor it treat every VU as
 	// owning exactly one actor.
 	ActorsPerUser int
+	// Actors is the size of a fleet shared by every VU, for user classes
+	// whose actor count is independent of the user count (resumecold).
+	// Classes that give each VU its own actors ignore it.
+	Actors int
 }

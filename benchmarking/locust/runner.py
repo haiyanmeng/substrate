@@ -99,9 +99,9 @@ def parse_args() -> argparse.Namespace:
             "no request on purpose"
         ),
     )
-    # Boomer startup flag; not a locust or dynconfig flag, so runner.py
-    # parses it here (keeping it out of locust_extra, which locust would
-    # reject) and appends it to the boomer command line in run_test().
+    # Boomer startup flags; not locust or dynconfig flags, so runner.py
+    # parses them here (keeping them out of locust_extra, which locust would
+    # reject) and appends them to the boomer command line in run_test().
     p.add_argument(
         "--actors-per-user",
         type=int,
@@ -111,6 +111,16 @@ def parse_args() -> argparse.Namespace:
             "round-robin (iteration i targets actor i%%N). Forwarded to "
             "boomer-glutton as --actors-per-user. Omit to keep boomer's "
             "default of 1."
+        ),
+    )
+    p.add_argument(
+        "--actors",
+        type=int,
+        default=None,
+        help=(
+            "Size of the actor fleet every user shares, for user classes "
+            "whose actor count is independent of the user count (resumecold). "
+            "Forwarded to boomer as --actors. Omit to keep boomer's default."
         ),
     )
     p.add_argument(
@@ -324,6 +334,8 @@ def run_test(args: argparse.Namespace, csv_prefix: Path, logs: TextIO, traces: T
             boomer_cmd += ["--config-json", cfg_json]
         if args.actors_per_user is not None:
             boomer_cmd += ["--actors-per-user", str(args.actors_per_user)]
+        if args.actors is not None:
+            boomer_cmd += ["--actors", str(args.actors)]
         # Read the endpoint again at each spawn message. Thus a value that
         # changes while the run continues, such as the sample rate of a load
         # shape, reaches boomer at the change. boomer's --master-host default

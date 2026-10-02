@@ -23,6 +23,8 @@ Flag registration lives in the modules that own each flag:
   * --durdir-*                      → common.durdir_config.add_durdir_arguments
   * --mem-target / --mem-churn / --mem-read → common.memload_config.add_memload_arguments
   * --max-pings-per-wake            → common.ping_config.add_ping_arguments
+  * --sweperf-*                     → common.sweperf_config.add_sweperf_arguments
+  * --target-rps                    → common.rate_config.add_rate_arguments
 
 This module ties them together so boomer-Go workers can pick up the values
 the operator set in the web UI form:
@@ -66,6 +68,7 @@ _FLAGS = {
     "--sweperf-template": str,
     "--sweperf-total-steps": int,
     "--sweperf-num-cycles": int,
+    "--target-rps": float,
 }
 
 
@@ -145,6 +148,7 @@ def init_boomer_config() -> None:
     from common.lifecycle_mode import add_lifecycle_mode_arguments
     from common.memload_config import add_memload_arguments
     from common.ping_config import add_ping_arguments
+    from common.rate_config import add_rate_arguments
     from common.resume_mode import add_resume_mode_arguments
     from common.sweperf_config import add_sweperf_arguments
     from common.trace import init_tracing
