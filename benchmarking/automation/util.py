@@ -65,3 +65,42 @@ def parse_duration_seconds(s: str) -> int:
     n = int(m.group(1))
     unit = m.group(2) or "s"
     return n * {"s": 1, "m": 60, "h": 3600}[unit]
+
+
+# The keys of a tests.yaml fakeDataPlane block and the
+# benchmarking/workloads/deploy.sh flag each one sets.
+FAKE_DATA_PLANE_FLAGS = {
+    "nodes": "--fake-nodes",
+    "workersPerNode": "--fake-workers-per-node",
+    "run": "--fake-run",
+    "delay": "--fake-delay",
+    "capacityActors": "--fake-capacity-actors",
+    "capacityResources": "--fake-capacity-resources",
+}
+
+
+def fake_data_plane_args(block: dict | None) -> list[str]:
+    """Return the deploy.sh flags for a tests.yaml fakeDataPlane block, or
+    none when the entry has no block. Raises ValueError on an unknown key or
+    a count that is not a positive integer, so a bad entry fails before any
+    cluster work rather than in deploy.sh."""
+    if block is None:
+        return []
+    if not isinstance(block, dict):
+        raise ValueError(f"fakeDataPlane must be a mapping, got {block!r}")
+    unknown = sorted(set(block) - set(FAKE_DATA_PLANE_FLAGS))
+    if unknown:
+        raise ValueError(
+            f"fakeDataPlane has unknown keys {unknown} "
+            f"(want some of {sorted(FAKE_DATA_PLANE_FLAGS)})"
+        )
+    args = ["--fake-data-plane"]
+    for key, flag in FAKE_DATA_PLANE_FLAGS.items():
+        if key not in block:
+            continue
+        value = block[key]
+        if key in ("nodes", "workersPerNode", "capacityActors"):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"fakeDataPlane.{key} must be a positive integer, got {value!r}")
+        args += [flag, str(value)]
+    return args

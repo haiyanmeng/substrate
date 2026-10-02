@@ -53,4 +53,9 @@ type Config struct {
 	SpawnConcurrency int
 	// ActorDeadline is the per-actor timeout covering CreateActor + ResumeActor + Ping (spawn benchmark).
 	ActorDeadline time.Duration
+	// SkipPing leaves out every request to the actor itself, for a cluster on
+	// the fake data plane, where actors do not exist: spawn counts an actor
+	// ready when ResumeActor returns, and glutton's cycle is resume then
+	// suspend.
+	SkipPing bool
 }

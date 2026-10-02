@@ -44,6 +44,17 @@
 #   ateArgs        Optional. List of strings appended verbatim to
 #                  `hack/install-ate.sh --deploy-ate-system` when this
 #                  test's substrate is deployed (e.g. ["--atenet-dataplane=agentgateway"]).
+#   fakeDataPlane  Optional. Replaces the WorkerPool with the fake data
+#                  plane (workloads/deploy.sh --fake-data-plane): fake-atelet
+#                  takes atelet's place on `nodes` nodes and answers every
+#                  lifecycle call after `delay`, and fake-workersync
+#                  registers `workersPerNode` Workers on each, so
+#                  ate-api-server and Postgres can be driven past what real
+#                  nodes restore. Keys: nodes, workersPerNode, run, delay,
+#                  capacityActors, capacityResources (deploy.sh's defaults
+#                  when omitted). workerCount is ignored. Actors do not
+#                  exist, so a locust entry also passes --skip-ping in
+#                  `flags`. The teardown undoes it.
 #
 # ---- type: locust -----------------------------------------------------------
 #
@@ -567,6 +578,26 @@ tests:
       - "1.0"
       - "--max-wait-time"
       - "1.0"
+  - name: spawn_fake_dataplane_1000_actors
+    type: locust
+    description: "Control-plane spawn: 1000 actors on 200 fake Workers across 2 nodes, no data plane"
+    targetCluster: dev
+    file: /app/tests/spawn.py,/app/shapes/spawn_shape.py
+    duration: 10m
+    users: 1
+    fakeDataPlane:
+      nodes: 2
+      workersPerNode: 100
+      delay: 500ms
+      capacityActors: 10
+    flags:
+      - "--total-actors"
+      - "1000"
+      - "--spawn-concurrency"
+      - "50"
+      - "--actor-deadline"
+      - "120"
+      - "--skip-ping"
   - name: spawn_smoke_10_actors
     type: locust
     description: "Spawn benchmark smoke: 10 actors created with concurrency 2"

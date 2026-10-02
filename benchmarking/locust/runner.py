@@ -137,6 +137,15 @@ def parse_args() -> argparse.Namespace:
         help="Per-actor timeout in seconds (forwarded to boomer-worker).",
     )
     p.add_argument(
+        "--skip-ping",
+        action="store_true",
+        help=(
+            "Send no request to the actors themselves, for a cluster on the "
+            "fake data plane, where actors do not exist (forwarded to "
+            "boomer-worker)."
+        ),
+    )
+    p.add_argument(
         "--cluster-facts",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -373,6 +382,8 @@ def run_test(args: argparse.Namespace, csv_prefix: Path, logs: TextIO, traces: T
             boomer_cmd += ["--spawn-concurrency", str(args.spawn_concurrency)]
         if args.actor_deadline is not None:
             boomer_cmd += ["--actor-deadline", str(args.actor_deadline)]
+        if args.skip_ping:
+            boomer_cmd += ["--skip-ping"]
         # Read the endpoint again at each spawn message. Thus a value that
         # changes while the run continues, such as the sample rate of a load
         # shape, reaches boomer at the change. boomer's --master-host default

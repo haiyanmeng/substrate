@@ -56,6 +56,7 @@ func main() {
 		totalActors             = flag.Int("total-actors", 100, "Total actors to create in the batch (spawn benchmark).")
 		spawnConcurrency        = flag.Int("spawn-concurrency", 1, "Number of actors created concurrently (spawn benchmark).")
 		actorDeadline           = flag.Float64("actor-deadline", 120, "Per-actor timeout in seconds covering CreateActor + ResumeActor + Ping (spawn benchmark).")
+		skipPing                = flag.Bool("skip-ping", false, "Send no request to the actors themselves, for a cluster on the fake data plane (benchmarking/workloads/deploy.sh --fake-data-plane), where actors do not exist. spawn counts an actor ready when ResumeActor returns; glutton cycles resume then suspend.")
 		httpMaxIdleConnsPerHost = flag.Int("http-max-idle-conns-per-host", 10000, "Idle HTTP connections the router client keeps per host. Set it to at least the number of users this worker runs, so each VU reuses its connection to the router across wakes instead of opening a new one per request.")
 	)
 	// boomer.Run will call flag.Parse() if we haven't yet; calling here so
@@ -193,6 +194,7 @@ func main() {
 		TotalActors:      *totalActors,
 		SpawnConcurrency: *spawnConcurrency,
 		ActorDeadline:    time.Duration(*actorDeadline * float64(time.Second)),
+		SkipPing:         *skipPing,
 	}
 
 	entry, ok := userclass.Lookup(class)

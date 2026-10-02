@@ -227,9 +227,12 @@ func (r *spawnRuntime) runOneActor(ctx context.Context, batchStart time.Time, ac
 		return
 	}
 
-	if err := r.pingUntilReady(actorCtx, actorName); err != nil {
-		r.recordFailure("summary", "ActorTimeToReady", time.Since(actorStart), err.Error())
-		return
+	// On the fake data plane no actor answers, so ready means resumed.
+	if !r.cfg.SkipPing {
+		if err := r.pingUntilReady(actorCtx, actorName); err != nil {
+			r.recordFailure("summary", "ActorTimeToReady", time.Since(actorStart), err.Error())
+			return
+		}
 	}
 
 	readyElapsed := time.Since(batchStart)
