@@ -115,6 +115,8 @@ var (
 	drainTimeout = pflag.Duration("drain-timeout", 5*time.Minute, "Deadline for the graceful gRPC drain on shutdown. In-flight RPCs still running past it are forcefully cancelled.")
 )
 
+var _ imagecache.CandidateKeychain = (*credentialprovider.Keychain)(nil)
+
 func main() {
 	pflag.Parse()
 	if *showVersion {
@@ -569,7 +571,7 @@ func initSnapshotSizeMetric() error {
 	snapshotSizeBytes, err = otel.Meter("atelet").Int64Histogram(
 		"atelet.snapshot.size",
 		metric.WithUnit("By"),
-		metric.WithDescription("Uncompressed size in bytes of each gVisor snapshot image written during checkpoint."),
+		metric.WithDescription("Uncompressed allocated size in bytes of each snapshot image written during checkpoint."),
 
 		metric.WithExplicitBucketBoundaries(
 			1e6, 5e6, 1e7, 2.5e7, 5e7, 1e8, 2.5e8, 5e8, 1e9, 2e9, 5e9, 1e10,
@@ -590,6 +592,16 @@ func recordSnapshotSize(ctx context.Context, file string, size int64, templateAt
 		ateattr.TemplateAtespaceKey.String(templateAtespace),
 		ateattr.TemplateNameKey.String(templateName),
 	))
+}
+
+// allocatedBytes returns the disk space allocated to info (st_blocks * 512)
+// rather than its apparent size, which for sparse snapshot images reflects the
+// guest RAM ceiling; ext4/XFS/btrfs include delalloc blocks before writeback.
+func allocatedBytes(info os.FileInfo) int64 {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return int64(st.Blocks) * 512
+	}
+	return info.Size()
 }
 
 func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest) (_ *ateletpb.CheckpointResponse, err error) {
@@ -801,7 +813,7 @@ func (s *AteomHerder) moveLocalCheckpoint(ctx context.Context, req *ateletpb.Che
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("checkpoint file %s is not a regular file", fileName)
 		}
-		recordSnapshotSize(ctx, fileName, info.Size(), req.GetActorTemplateAtespace(), req.GetActorTemplateName())
+		recordSnapshotSize(ctx, fileName, allocatedBytes(info), req.GetActorTemplateAtespace(), req.GetActorTemplateName())
 
 		if err := root.Rename(src, dst); err != nil {
 			return fmt.Errorf("failed to move %s to %s: %w", src, dst, err)
@@ -870,7 +882,7 @@ func (s *AteomHerder) uploadSnapshot(ctx context.Context, uri resources.Snapshot
 			if !info.Mode().IsRegular() {
 				return fmt.Errorf("snapshot file %s is not a regular file", fileName)
 			}
-			recordSnapshotSize(ctx, fileName, info.Size(), templateAtespace, templateName)
+			recordSnapshotSize(ctx, fileName, allocatedBytes(info), templateAtespace, templateName)
 
 			objectURI, err := uri.ObjectURI(fileName + ".zstd")
 			if err != nil {
@@ -1095,6 +1107,10 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	}
 
 	checkpointDir := ateletpath.RestoreStateDir(actorUID)
+	directLocal := req.GetType() == ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
+	if directLocal {
+		checkpointDir = ateletpath.LocalSnapshotDir(actorUID, req.GetLocalConfig().GetSnapshotName())
+	}
 
 	// Fetch the snapshot manifest stored beside the checkpoint images
 	// first: it lists the checkpoint files to download and records the actor
@@ -1155,8 +1171,6 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	// needs both — so overlapping the GCS download (~0.5s warm) with the asset
 	// fetch + image unpack hides whichever leg is shorter, and on a cold node
 	// (uncached assets + image, ~2.5s unpack) that overlap is large.
-	// TODO(dberkov): the old pause checkpoint files are not deleted after they are
-	// copied to checkpointDir for the LOCAL case.
 	var assetPaths map[string]string
 	// One per leg: a single field written from both goroutines would race.
 	var downloadErr, prepErr error
@@ -1165,7 +1179,9 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	g.Go(func() (err error) {
 		t := time.Now()
 		defer func() {
-			dDownload = time.Since(t)
+			if !directLocal {
+				dDownload = time.Since(t)
+			}
 			downloadErr = err
 		}()
 		switch req.GetType() {
@@ -1174,7 +1190,8 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 				return err
 			}
 		case ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL:
-			if err := s.copyLocalCheckpoint(gctx, ateletpath.ActorPath(actorUID), req.GetLocalConfig().GetSnapshotName(), ateletpath.LocalCheckpointsDir(actorUID), checkpointDir, sandboxRec.SnapshotFiles); err != nil {
+			// Restore in place from LocalSnapshotDir; no staging.
+			if err := checkLocalSnapshotFiles(checkpointDir, sandboxRec.SnapshotFiles); err != nil {
 				return err
 			}
 		}
@@ -1224,6 +1241,9 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		return nil, apierror.InvalidArgument("invalid workload spec: %v", err)
 	}
 
+	actorDirs := ateletpath.ActorDirs(actorUID)
+	actorDirs.RestoreDir = checkpointDir
+
 	// The ateom_restore phase is opaque from here; ateom logs its own breakdown of
 	// this call as "Actor restore phases".
 	tAteom := time.Now()
@@ -1237,7 +1257,8 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		Spec:                  spec,
 		Scope:                 toAteomSnapshotScope(req.GetScope()),
 		ActorUid:              req.GetActorUid(),
-		ActorDirs:             ateletpath.ActorDirs(actorUID),
+		ActorDirs:             actorDirs,
+		PreserveRestoreDir:    directLocal,
 		EgressGateway:         toAteomEgressGateway(req.GetEgressGateway()),
 		CpuMilli:              req.GetCpuMilli(),
 		MemoryBytes:           req.GetMemoryBytes(),
@@ -1329,6 +1350,21 @@ func (s *AteomHerder) Terminate(ctx context.Context, req *ateletpb.TerminateRequ
 	}
 
 	return &ateletpb.TerminateResponse{}, nil
+}
+
+// checkLocalSnapshotFiles verifies each snapshot file exists in dir as a
+// regular file. Lstat, so a symlink cannot point ateom outside the snapshot.
+func checkLocalSnapshotFiles(dir string, files []string) error {
+	for _, name := range files {
+		info, err := os.Lstat(filepath.Join(dir, name))
+		if err != nil {
+			return wrapFileSystemErr("while checking local checkpoint file", err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("local checkpoint file %s is not a regular file", name)
+		}
+	}
+	return nil
 }
 
 // copyLocalCheckpoint stages files from the local checkpoint snapshotName under
