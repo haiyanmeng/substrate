@@ -16,15 +16,45 @@
 
 The runner Job wraps benchmarking/locust/runner.py, which drives locust
 (and boomer for glutton tests) and uploads its own results.
+
+An optional `ateapi:` block shapes the control plane for a capacity run of
+ate-api-server and Postgres (see ATEAPI_DEFAULTS); without it pre_test
+leaves the cluster as installed.
 """
 
+import base64
+import json
 import os
 import re
+import subprocess
 from typing import Any
 
-from util import build_and_push
+from util import build_and_push, run, run_no_check
 
 TEST_TYPE = "locust"
+
+NAMESPACE = "ate-system"
+
+# Knobs of the `ateapi:` block. `cpu` has no default: it is the independent
+# variable of the run.
+ATEAPI_DEFAULTS = {
+    # ate-api-server replicas, each with requests = limits of cpu and
+    # memory. Go sizes GOMAXPROCS from the CPU limit.
+    "replicas": 1,
+    "memory": "4Gi",
+    # pgxpool max connections per replica, spliced into the DSN. None keeps
+    # the installed value (64 on size10).
+    "poolMaxConns": None,
+    # Label one node for ateapi and another for the runner, away from the
+    # Postgres node, and pin each there.
+    "pinNodes": True,
+}
+
+def ateapi_config(test: dict[str, Any]) -> dict[str, Any] | None:
+    """The test's `ateapi:` block merged over ATEAPI_DEFAULTS, or None."""
+    if "ateapi" not in test:
+        return None
+    return {**ATEAPI_DEFAULTS, **test["ateapi"]}
 
 
 def validate(test: dict[str, Any]) -> None:
@@ -37,6 +67,35 @@ def validate(test: dict[str, Any]) -> None:
             raise ValueError(
                 f"locust test {name!r} has invalid {field} {test[field]!r}"
             )
+    if "ateapi" not in test:
+        return
+    block = test["ateapi"]
+    if not isinstance(block, dict):
+        raise ValueError(f"locust test {name!r} ateapi must be a mapping")
+    allowed = set(ATEAPI_DEFAULTS) | {"cpu"}
+    unknown = set(block) - allowed
+    if unknown:
+        raise ValueError(
+            f"locust test {name!r} has unknown ateapi knob(s) "
+            f"{sorted(unknown)}; allowed: {sorted(allowed)}"
+        )
+    cfg = ateapi_config(test)
+    if "cpu" not in block or not _is_quantity(cfg["cpu"]):
+        raise ValueError(f"locust test {name!r} needs ateapi.cpu, as in 2 or 1500m")
+    if not _is_quantity(cfg["memory"]):
+        raise ValueError(f"locust test {name!r} has invalid ateapi.memory")
+    if not _is_positive_int(cfg["replicas"]):
+        raise ValueError(f"locust test {name!r} ateapi.replicas must be an int >= 1")
+    if cfg["poolMaxConns"] is not None and not _is_positive_int(cfg["poolMaxConns"]):
+        raise ValueError(
+            f"locust test {name!r} ateapi.poolMaxConns must be an int >= 1"
+        )
+    if not isinstance(cfg["pinNodes"], bool):
+        raise ValueError(f"locust test {name!r} ateapi.pinNodes must be a bool")
+
+
+def _is_positive_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 1
 
 
 def _is_quantity(v: Any) -> bool:
@@ -58,7 +117,156 @@ def build_image(commit: str) -> str:
 
 
 def pre_test(test: dict[str, Any]) -> None:
-    """Nothing to shape on the cluster before a locust run."""
+    """With an `ateapi:` block, shape the control plane for the run: node
+    roles, the pool size, then the ateapi pin. No unpatch: every test
+    redeploys substrate."""
+    cfg = ateapi_config(test)
+    if cfg is None:
+        return
+    if cfg["pinNodes"]:
+        label_nodes()
+    if cfg["poolMaxConns"] is not None:
+        set_pool_max_conns(cfg["poolMaxConns"])
+    pin_ateapi(cfg)
+    # The placement of the run, for comparing runs: a step compares across
+    # runs only when ateapi, Postgres, and the runner sat on the same nodes.
+    run_no_check(
+        ["kubectl", "-n", NAMESPACE, "get", "pods", "-o", "wide",
+         "-l", "app in (ate-api-server,postgres)"]
+    )
+    run_no_check(["kubectl", "get", "nodes", "-L", ROLE_LABEL])
+
+
+# Node label that gives ate-api-server and the runner a node each, so the
+# load generator is never ateapi's neighbor. Both pods require it through a
+# node affinity.
+ROLE_LABEL = "ate.dev/benchmark-role"
+
+
+def pick_role_nodes(nodes: list[dict[str, Any]], postgres_node: str) -> tuple[str, str]:
+    """Return (ateapi node, runner node): the first two schedulable nodes by
+    name, leaving out the Postgres node. Postgres on size10 requests nearly
+    a whole node, so its node is not a candidate for either role."""
+    candidates = sorted(
+        n["metadata"]["name"]
+        for n in nodes
+        if n["metadata"]["name"] != postgres_node
+        and not n.get("spec", {}).get("unschedulable")
+        and not any(
+            t.get("effect") in ("NoSchedule", "NoExecute")
+            for t in n.get("spec", {}).get("taints", [])
+        )
+    )
+    if len(candidates) < 2:
+        raise RuntimeError(
+            f"pinNodes needs two schedulable nodes besides the Postgres node "
+            f"{postgres_node!r}; found {candidates}"
+        )
+    return candidates[0], candidates[1]
+
+
+def label_nodes() -> None:
+    postgres_node = _kubectl_out(
+        ["-n", NAMESPACE, "get", "pod", "postgres-0", "-o", "jsonpath={.spec.nodeName}"]
+    )
+    nodes = json.loads(_kubectl_out(["get", "nodes", "-o", "json"]))["items"]
+    ateapi_node, runner_node = pick_role_nodes(nodes, postgres_node)
+    # A label left by an earlier run on another node would give a role two
+    # nodes.
+    run_no_check(["kubectl", "label", "nodes", "--all", f"{ROLE_LABEL}-"])
+    run(["kubectl", "label", "node", ateapi_node, f"{ROLE_LABEL}=ateapi", "--overwrite"])
+    run(["kubectl", "label", "node", runner_node, f"{ROLE_LABEL}=runner", "--overwrite"])
+
+
+def role_affinity(role: str) -> dict[str, Any]:
+    return {
+        "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [
+                    {
+                        "matchExpressions": [
+                            {"key": ROLE_LABEL, "operator": "In", "values": [role]}
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+
+
+DSN_SECRET = "ate-api-server-secret-envvars"
+DSN_KEY = "ATE_API_POSTGRES_CONNECTION_STRING"
+
+
+def with_pool_max_conns(dsn: str, n: int) -> str:
+    """Set pool_max_conns in a URI or keyword DSN, as cmd/ate-setup's
+    withPoolMaxConns does at install."""
+    setting = f"pool_max_conns={n}"
+    if re.search(r"pool_max_conns=[^ &]*", dsn):
+        return re.sub(r"pool_max_conns=[^ &]*", setting, dsn, count=1)
+    if "://" in dsn:
+        return dsn + ("&" if "?" in dsn else "?") + setting
+    return dsn + " " + setting
+
+
+def set_pool_max_conns(n: int) -> None:
+    """Rewrite the pool size in the DSN Secret ateapi reads at start; the
+    pin_ateapi rollout that follows picks it up. The DSN can carry a
+    password, thus it passes through stdin and never reaches a logged
+    command line."""
+    secret = json.loads(
+        _kubectl_out(["-n", NAMESPACE, "get", "secret", DSN_SECRET, "-o", "json"])
+    )
+    dsn = base64.b64decode(secret["data"][DSN_KEY]).decode()
+    secret["data"][DSN_KEY] = base64.b64encode(
+        with_pool_max_conns(dsn, n).encode()
+    ).decode()
+    print(f"$ kubectl replace secret {DSN_SECRET} (pool_max_conns={n})", flush=True)
+    subprocess.run(
+        ["kubectl", "replace", "-f", "-"],
+        input=json.dumps(secret),
+        text=True,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+
+
+def ateapi_patch(cfg: dict[str, Any]) -> dict[str, Any]:
+    pod_spec: dict[str, Any] = {
+        "containers": [
+            {
+                "name": "ate-api-server",
+                "resources": {
+                    "requests": {"cpu": str(cfg["cpu"]), "memory": cfg["memory"]},
+                    "limits": {"cpu": str(cfg["cpu"]), "memory": cfg["memory"]},
+                },
+            }
+        ]
+    }
+    if cfg["pinNodes"]:
+        pod_spec["affinity"] = role_affinity("ateapi")
+    return {"spec": {"replicas": cfg["replicas"], "template": {"spec": pod_spec}}}
+
+
+def pin_ateapi(cfg: dict[str, Any]) -> None:
+    _patch_and_wait("deployment", "ate-api-server", ateapi_patch(cfg))
+
+
+def _patch_and_wait(kind: str, name: str, patch: dict[str, Any]) -> None:
+    run(
+        ["kubectl", "-n", NAMESPACE, "patch", kind, name,
+         "--type=strategic", "-p", json.dumps(patch)]
+    )
+    run(
+        ["kubectl", "-n", NAMESPACE, "rollout", "status", f"{kind}/{name}",
+         "--timeout=600s"]
+    )
+
+
+def _kubectl_out(args: list[str]) -> str:
+    return subprocess.run(
+        ["kubectl", *args], capture_output=True, text=True, check=True
+    ).stdout
 
 
 def job_tmpl(manifests_dir: str) -> str:
@@ -74,10 +282,14 @@ DEFAULT_RUNNER_MEMORY = "512Mi"
 
 
 def job_subs(test: dict[str, Any]) -> dict[str, Any]:
+    cfg = ateapi_config(test)
+    pinned = cfg is not None and cfg["pinNodes"]
     return {
         "TEST_FILE": test["file"],
         "DURATION": test["duration"],
         "USERS": test["users"],
         "RUNNER_CPU": test.get("runnerCpu", DEFAULT_RUNNER_CPU),
         "RUNNER_MEMORY": test.get("runnerMemory", DEFAULT_RUNNER_MEMORY),
+        # JSON is YAML flow syntax, thus it drops into `affinity:` as is.
+        "RUNNER_AFFINITY": json.dumps(role_affinity("runner") if pinned else {}),
     }

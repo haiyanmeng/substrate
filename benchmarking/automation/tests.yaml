@@ -102,6 +102,18 @@
 # Keep `users` at or above the rate times the p99 latency in seconds, or the
 # step falls short of its rate.
 #
+# An optional `ateapi:` block shapes the control plane for a capacity run of
+# ate-api-server and Postgres; pre_test applies it after the deploy:
+#   cpu            Required. CPU of each ate-api-server replica, set as both
+#                  request and limit (e.g. 2 or "1500m").
+#   memory         Optional (default "4Gi"). Memory request and limit.
+#   replicas       Optional (default 1).
+#   poolMaxConns   Optional. pgxpool max connections per replica, written
+#                  into the DSN Secret. Unset keeps the installed value.
+#   pinNodes       Optional (default true). Label one node for ateapi and
+#                  another for the runner, away from the Postgres node, and
+#                  pin each there.
+#
 # ---- type: nighthawk-ingress --------------------------------------------------------
 #
 # Runs the Nighthawk adaptive router-capacity benchmark. `duration` is the

@@ -15,6 +15,7 @@
 """Unit tests for testtypes/locust.py:
 python3 benchmarking/automation/test_locust.py"""
 
+import json
 import os
 import unittest
 
@@ -34,16 +35,50 @@ def entry(**fields):
     }
 
 
+def node(name, unschedulable=False, taints=()):
+    return {
+        "metadata": {"name": name},
+        "spec": {"unschedulable": unschedulable, "taints": list(taints)},
+    }
+
+
 class ValidateTest(unittest.TestCase):
-    def test_valid_runner_size(self):
+    def test_without_ateapi(self):
         locust.validate(entry())
-        locust.validate(entry(runnerCpu="8", runnerMemory="2Gi"))
-        locust.validate(entry(runnerCpu=0.5, runnerMemory="512Mi"))
+        self.assertIsNone(locust.ateapi_config(entry()))
+
+    def test_defaults(self):
+        test = entry(ateapi={"cpu": 2})
+        locust.validate(test)
+        cfg = locust.ateapi_config(test)
+        self.assertEqual(cfg["cpu"], 2)
+        self.assertEqual(cfg["replicas"], 1)
+        self.assertEqual(cfg["memory"], "4Gi")
+        self.assertIsNone(cfg["poolMaxConns"])
+        self.assertTrue(cfg["pinNodes"])
+
+    def test_valid_knobs(self):
+        locust.validate(entry(
+            runnerCpu="8",
+            runnerMemory="2Gi",
+            ateapi={"cpu": "1500m", "memory": "8Gi", "replicas": 2,
+                    "poolMaxConns": 16, "pinNodes": False},
+        ))
 
     def test_invalid(self):
         bad = [
+            {"ateapi": {}},
+            {"ateapi": "2"},
+            {"ateapi": {"cpu": 0}},
+            {"ateapi": {"cpu": "two"}},
+            {"ateapi": {"cpu": True}},
+            {"ateapi": {"cpu": 2, "cpus": 2}},
+            {"ateapi": {"cpu": 2, "replicas": 0}},
+            {"ateapi": {"cpu": 2, "replicas": True}},
+            {"ateapi": {"cpu": 2, "poolMaxConns": "64"}},
+            {"ateapi": {"cpu": 2, "pinNodes": "yes"}},
+            {"ateapi": {"cpu": 2, "memory": "4 GiB"}},
             {"runnerCpu": "8 cores"},
-            {"runnerCpu": True},
             {"runnerMemory": 0},
         ]
         for fields in bad:
@@ -55,6 +90,60 @@ class ValidateTest(unittest.TestCase):
         del test["users"]
         with self.assertRaises(ValueError):
             locust.validate(test)
+
+
+class AteapiPatchTest(unittest.TestCase):
+    def test_guaranteed_and_pinned(self):
+        patch = locust.ateapi_patch(locust.ateapi_config(entry(ateapi={"cpu": 2})))
+        self.assertEqual(patch["spec"]["replicas"], 1)
+        pod = patch["spec"]["template"]["spec"]
+        resources = pod["containers"][0]["resources"]
+        self.assertEqual(resources["requests"], {"cpu": "2", "memory": "4Gi"})
+        self.assertEqual(resources["limits"], resources["requests"])
+        self.assertEqual(pod["affinity"], locust.role_affinity("ateapi"))
+
+    def test_unpinned(self):
+        cfg = locust.ateapi_config(entry(ateapi={"cpu": 2, "pinNodes": False}))
+        self.assertNotIn("affinity", locust.ateapi_patch(cfg)["spec"]["template"]["spec"])
+
+
+class PickRoleNodesTest(unittest.TestCase):
+    def test_skips_postgres_and_unschedulable_nodes(self):
+        nodes = [
+            node("n-d"),
+            node("n-a"),
+            node("n-b", unschedulable=True),
+            node("n-c", taints=[{"key": "k", "effect": "NoSchedule"}]),
+            node("n-e", taints=[{"key": "k", "effect": "PreferNoSchedule"}]),
+        ]
+        self.assertEqual(locust.pick_role_nodes(nodes, "n-a"), ("n-d", "n-e"))
+
+    def test_too_few_nodes(self):
+        with self.assertRaises(RuntimeError):
+            locust.pick_role_nodes([node("pg"), node("n-a")], "pg")
+
+
+class PoolMaxConnsTest(unittest.TestCase):
+    def test_uri(self):
+        cases = {
+            "postgres://u:p@h/db": "postgres://u:p@h/db?pool_max_conns=16",
+            "postgres://h/db?sslmode=disable":
+                "postgres://h/db?sslmode=disable&pool_max_conns=16",
+            "postgres://h/db?pool_max_conns=64&pool_min_conns=4":
+                "postgres://h/db?pool_max_conns=16&pool_min_conns=4",
+        }
+        for dsn, want in cases.items():
+            self.assertEqual(locust.with_pool_max_conns(dsn, 16), want)
+
+    def test_keyword(self):
+        self.assertEqual(
+            locust.with_pool_max_conns("host=h dbname=db", 16),
+            "host=h dbname=db pool_max_conns=16",
+        )
+        self.assertEqual(
+            locust.with_pool_max_conns("host=h pool_max_conns=64 dbname=db", 16),
+            "host=h pool_max_conns=16 dbname=db",
+        )
 
 
 class JobTest(unittest.TestCase):
@@ -71,20 +160,33 @@ class JobTest(unittest.TestCase):
         return jobs[0]["spec"]["template"]["spec"]
 
     def test_defaults_render(self):
-        pod = self.render(entry())
-        runner = pod["containers"][0]
+        test = entry()
+        pod = self.render(test)
+        self.assertEqual(pod["affinity"], {})
         self.assertEqual(
-            runner["resources"], {"requests": {"cpu": "500m", "memory": "512Mi"}}
+            pod["containers"][0]["resources"],
+            {"requests": {"cpu": "500m", "memory": "512Mi"}},
         )
         # monitoring.yaml's boomer-worker job scrapes this port.
-        self.assertIn({"name": "boomer-metrics", "containerPort": 8001}, runner["ports"])
+        self.assertIn(
+            {"name": "boomer-metrics", "containerPort": 8001},
+            pod["containers"][0]["ports"],
+        )
 
-    def test_sized_runner_renders(self):
-        pod = self.render(entry(runnerCpu="8", runnerMemory="2Gi",
-                                flags=["--actors", "200"]))
-        runner = pod["containers"][0]
-        self.assertEqual(runner["resources"]["requests"], {"cpu": "8", "memory": "2Gi"})
-        self.assertEqual(runner["args"][-2:], ["--actors", "200"])
+    def test_pinned_runner_renders(self):
+        test = entry(runnerCpu="8", runnerMemory="2Gi", ateapi={"cpu": 2},
+                     flags=["--actors", "200"])
+        pod = self.render(test)
+        self.assertEqual(pod["affinity"], locust.role_affinity("runner"))
+        self.assertEqual(
+            pod["containers"][0]["resources"]["requests"],
+            {"cpu": "8", "memory": "2Gi"},
+        )
+        self.assertEqual(pod["containers"][0]["args"][-2:], ["--actors", "200"])
+
+    def test_unpinned_runner_has_no_affinity(self):
+        subs = locust.job_subs(entry(ateapi={"cpu": 2, "pinNodes": False}))
+        self.assertEqual(json.loads(subs["RUNNER_AFFINITY"]), {})
 
 
 class TestsYamlTest(unittest.TestCase):
