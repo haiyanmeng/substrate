@@ -19,6 +19,7 @@ The runner Job wraps benchmarking/locust/runner.py, which drives locust
 """
 
 import os
+import re
 from typing import Any
 
 from util import build_and_push
@@ -31,6 +32,20 @@ def validate(test: dict[str, Any]) -> None:
     for field in ("file", "duration", "users"):
         if field not in test:
             raise ValueError(f"locust test {name!r} missing {field!r}")
+    for field in ("runnerCpu", "runnerMemory"):
+        if field in test and not _is_quantity(test[field]):
+            raise ValueError(
+                f"locust test {name!r} has invalid {field} {test[field]!r}"
+            )
+
+
+def _is_quantity(v: Any) -> bool:
+    """A Kubernetes quantity as tests.yaml spells it: 2, 0.5, "1500m", "4Gi"."""
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float)):
+        return v > 0
+    return isinstance(v, str) and bool(re.fullmatch(r"[0-9]+(\.[0-9]+)?([mkMGT]i?)?", v))
 
 
 def build_image(commit: str) -> str:
