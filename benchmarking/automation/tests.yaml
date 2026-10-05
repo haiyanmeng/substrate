@@ -110,6 +110,8 @@
 #   replicas       Optional (default 1).
 #   poolMaxConns   Optional. pgxpool max connections per replica, written
 #                  into the DSN Secret. Unset keeps the installed value.
+#   pgStats        Optional (default true). Load pg_stat_statements and add
+#                  a postgres_exporter sidecar, scraped by monitoring.yaml.
 #   pinNodes       Optional (default true). Label one node for ateapi and
 #                  another for the runner, away from the Postgres node, and
 #                  pin each there.

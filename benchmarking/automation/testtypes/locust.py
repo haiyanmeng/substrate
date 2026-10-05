@@ -45,6 +45,9 @@ ATEAPI_DEFAULTS = {
     # pgxpool max connections per replica, spliced into the DSN. None keeps
     # the installed value (64 on size10).
     "poolMaxConns": None,
+    # Load pg_stat_statements and run postgres_exporter next to Postgres,
+    # for Prometheus (benchmarking/monitoring.yaml) to scrape.
+    "pgStats": True,
     # Label one node for ateapi and another for the runner, away from the
     # Postgres node, and pin each there.
     "pinNodes": True,
@@ -90,8 +93,9 @@ def validate(test: dict[str, Any]) -> None:
         raise ValueError(
             f"locust test {name!r} ateapi.poolMaxConns must be an int >= 1"
         )
-    if not isinstance(cfg["pinNodes"], bool):
-        raise ValueError(f"locust test {name!r} ateapi.pinNodes must be a bool")
+    for knob in ("pgStats", "pinNodes"):
+        if not isinstance(cfg[knob], bool):
+            raise ValueError(f"locust test {name!r} ateapi.{knob} must be a bool")
 
 
 def _is_positive_int(v: Any) -> bool:
@@ -118,13 +122,15 @@ def build_image(commit: str) -> str:
 
 def pre_test(test: dict[str, Any]) -> None:
     """With an `ateapi:` block, shape the control plane for the run: node
-    roles, the pool size, then the ateapi pin. No unpatch: every test
-    redeploys substrate."""
+    roles, Postgres statistics, the pool size, then the ateapi pin. No
+    unpatch: every test redeploys substrate."""
     cfg = ateapi_config(test)
     if cfg is None:
         return
     if cfg["pinNodes"]:
         label_nodes()
+    if cfg["pgStats"]:
+        enable_postgres_stats()
     if cfg["poolMaxConns"] is not None:
         set_pool_max_conns(cfg["poolMaxConns"])
     pin_ateapi(cfg)
@@ -192,6 +198,56 @@ def role_affinity(role: str) -> dict[str, Any]:
             }
         }
     }
+
+
+POSTGRES_EXPORTER_IMAGE = "quay.io/prometheuscommunity/postgres-exporter:v0.17.1"
+
+
+def enable_postgres_stats() -> None:
+    """Load pg_stat_statements and add a postgres_exporter sidecar, which
+    reaches the server over the pod's unix socket (trusted by pg_hba). One
+    patch, thus one Postgres restart, before ateapi rolls."""
+    patch = {
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "postgres",
+                            # Strategic merge replaces args whole; repeat the
+                            # base manifest's config_file.
+                            "args": [
+                                "-c", "config_file=/etc/postgresql/postgresql.conf",
+                                "-c", "shared_preload_libraries=pg_stat_statements",
+                            ],
+                        },
+                        {
+                            "name": "postgres-exporter",
+                            "image": POSTGRES_EXPORTER_IMAGE,
+                            "args": ["--collector.stat_statements"],
+                            "env": [
+                                {
+                                    "name": "DATA_SOURCE_NAME",
+                                    "value": "host=/var/run/postgresql user=postgres dbname=atepg sslmode=disable",
+                                }
+                            ],
+                            "ports": [{"name": "pg-metrics", "containerPort": 9187}],
+                            "volumeMounts": [
+                                {"name": "socket", "mountPath": "/var/run/postgresql"}
+                            ],
+                            "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}},
+                        },
+                    ]
+                }
+            }
+        }
+    }
+    _patch_and_wait("statefulset", "postgres", patch)
+    run(
+        ["kubectl", "-n", NAMESPACE, "exec", "postgres-0", "-c", "postgres", "--",
+         "psql", "-U", "postgres", "-d", "atepg", "-v", "ON_ERROR_STOP=1",
+         "-c", "CREATE EXTENSION IF NOT EXISTS pg_stat_statements"]
+    )
 
 
 DSN_SECRET = "ate-api-server-secret-envvars"

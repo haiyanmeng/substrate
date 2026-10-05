@@ -55,6 +55,7 @@ class ValidateTest(unittest.TestCase):
         self.assertEqual(cfg["replicas"], 1)
         self.assertEqual(cfg["memory"], "4Gi")
         self.assertIsNone(cfg["poolMaxConns"])
+        self.assertTrue(cfg["pgStats"])
         self.assertTrue(cfg["pinNodes"])
 
     def test_valid_knobs(self):
@@ -62,7 +63,7 @@ class ValidateTest(unittest.TestCase):
             runnerCpu="8",
             runnerMemory="2Gi",
             ateapi={"cpu": "1500m", "memory": "8Gi", "replicas": 2,
-                    "poolMaxConns": 16, "pinNodes": False},
+                    "poolMaxConns": 16, "pgStats": False, "pinNodes": False},
         ))
 
     def test_invalid(self):
@@ -76,6 +77,7 @@ class ValidateTest(unittest.TestCase):
             {"ateapi": {"cpu": 2, "replicas": 0}},
             {"ateapi": {"cpu": 2, "replicas": True}},
             {"ateapi": {"cpu": 2, "poolMaxConns": "64"}},
+            {"ateapi": {"cpu": 2, "pgStats": "yes"}},
             {"ateapi": {"cpu": 2, "pinNodes": "yes"}},
             {"ateapi": {"cpu": 2, "memory": "4 GiB"}},
             {"runnerCpu": "8 cores"},
