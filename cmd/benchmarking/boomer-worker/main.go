@@ -38,6 +38,7 @@ import (
 	// Register user classes via init():
 	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/agentsession"
 	_ "github.com/agent-substrate/substrate/internal/benchmarking/boomer/glutton"
+	_ "github.com/agent-substrate/substrate/internal/benchmarking/boomer/resumecold"
 	_ "github.com/agent-substrate/substrate/internal/benchmarking/boomer/sweperf"
 )
 
@@ -56,6 +57,7 @@ func main() {
 		totalActors             = flag.Int("total-actors", 100, "Total actors to create in the batch (spawn benchmark).")
 		spawnConcurrency        = flag.Int("spawn-concurrency", 1, "Number of actors created concurrently (spawn benchmark).")
 		actorDeadline           = flag.Float64("actor-deadline", 120, "Per-actor timeout in seconds covering CreateActor + ResumeActor + Ping (spawn benchmark).")
+		actors                  = flag.Int("actors", 200, "Size of the actor fleet shared by every user, for user classes whose actor count is independent of the user count (resumecold). Startup creates and warms all of them; shutdown deletes them.")
 		httpMaxIdleConnsPerHost = flag.Int("http-max-idle-conns-per-host", 10000, "Idle HTTP connections the router client keeps per host. Set it to at least the number of users this worker runs, so each VU reuses its connection to the router across wakes instead of opening a new one per request.")
 	)
 	// boomer.Run will call flag.Parse() if we haven't yet; calling here so
@@ -64,6 +66,10 @@ func main() {
 
 	class := strings.ToLower(*userClass)
 
+	if *actors < 1 {
+		slog.Error("fatal: --actors must be >= 1", slog.Int("actors", *actors))
+		os.Exit(1)
+	}
 	if *actorsPerUser < 1 {
 		slog.Error("fatal: --actors-per-user must be >= 1",
 			slog.Int("actors_per_user", *actorsPerUser))
@@ -193,6 +199,7 @@ func main() {
 		TotalActors:      *totalActors,
 		SpawnConcurrency: *spawnConcurrency,
 		ActorDeadline:    time.Duration(*actorDeadline * float64(time.Second)),
+		Actors:           *actors,
 	}
 
 	entry, ok := userclass.Lookup(class)
