@@ -92,7 +92,7 @@ usage() {
   echo ""
   echo "Fake data plane (benchmarks ate-api-server and Postgres; never on a cluster with real actors):"
   echo "  --fake-data-plane           Serve the WorkerPool with fake-atelet and fake-workersync: --worker-count"
-  echo "                              fake Workers that no pod backs."
+  echo "                              fake Workers that no pod backs, each reporting what a real worker would."
   echo "                              Moves atelet off the chosen nodes and scales ate-controller to"
   echo "                              zero; --delete undoes both."
   echo "  --fake-nodes N              Nodes to run fake-atelet on (default: 1)"
@@ -243,8 +243,8 @@ wait_no_pods() {
 
 # deploy_fake_data_plane takes atelet's place on --fake-nodes nodes, then
 # applies the WorkerPool, which fake-workersync serves with fake Workers on
-# them. Runs before the templates are deployed, so the fake Workers exist
-# when each golden actor is placed.
+# them. Runs before the templates are deployed, so the fake Workers have
+# capacity when each golden actor is placed.
 deploy_fake_data_plane() {
   FAKE_STORAGE_BACKEND="$(kubectl get daemonset --namespace=ate-system -l "${REAL_ATELET_SELECTOR}" \
     -o jsonpath='{.items[0].spec.template.spec.containers[0].env[?(@.name=="ATE_STORAGE_BACKEND")].value}')"
@@ -287,11 +287,11 @@ deploy_fake_data_plane() {
     --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
 
   # The same WorkerPool a real run deploys. With ate-controller down no
-  # Deployment is made for it; fake-workersync writes its fake Workers to
-  # the pool's status.
+  # Deployment is made for it; fake-workersync counts a fake Worker ready
+  # once its capacity is reported, and writes that to the pool's status.
   substitute "${POOL_MANIFEST}" | hack/run-tool.sh ko apply -f -
   if ((WORKER_COUNT > 0)); then
-    echo "Waiting for ${WORKER_COUNT} fake Workers (timeout: ${WAIT_TIMEOUT_SECS}s)..."
+    echo "Waiting for ${WORKER_COUNT} fake Workers to report capacity (timeout: ${WAIT_TIMEOUT_SECS}s)..."
     kubectl wait --for=jsonpath='{.status.readyReplicas}'="${WORKER_COUNT}" workerpool/benchmark-ateom \
       --namespace=benchmark-workloads --timeout="${WAIT_TIMEOUT_SECS}s"
   fi
