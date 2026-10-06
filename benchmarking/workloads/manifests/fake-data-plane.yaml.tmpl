@@ -72,6 +72,11 @@ spec:
         image: ko://github.com/agent-substrate/substrate/cmd/benchmarking/isolate/fake-atelet
         args:
         - --delay=${FAKE_DELAY}
+        env:
+        # Placeholders go to the backend atelet uses; deploy.sh copies it from
+        # the real atelet DaemonSet.
+        - name: ATE_STORAGE_BACKEND
+          value: "${FAKE_STORAGE_BACKEND}"
         ports:
         - name: grpc
           containerPort: 8085

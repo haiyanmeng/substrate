@@ -69,6 +69,7 @@ FAKE_DATA_PLANE=false
 FAKE_NODES=1
 FAKE_RUN="bench"
 FAKE_DELAY="0s"
+FAKE_STORAGE_BACKEND=""
 FAKE_NODE_LABEL="ate.dev/fake-data-plane"
 
 usage() {
@@ -167,6 +168,7 @@ substitute() {
       -e "s|\${SWEPERF_IMAGE}|${SWEPERF_IMAGE:-}|g" \
       -e "s|\${FAKE_RUN}|${FAKE_RUN}|g" \
       -e "s|\${FAKE_DELAY}|${FAKE_DELAY}|g" \
+      -e "s|\${FAKE_STORAGE_BACKEND}|${FAKE_STORAGE_BACKEND}|g" \
       "${manifest}"
 }
 
@@ -244,6 +246,10 @@ wait_no_pods() {
 # them. Runs before the templates are deployed, so the fake Workers exist
 # when each golden actor is placed.
 deploy_fake_data_plane() {
+  FAKE_STORAGE_BACKEND="$(kubectl get daemonset --namespace=ate-system -l "${REAL_ATELET_SELECTOR}" \
+    -o jsonpath='{.items[0].spec.template.spec.containers[0].env[?(@.name=="ATE_STORAGE_BACKEND")].value}')"
+  FAKE_STORAGE_BACKEND="${FAKE_STORAGE_BACKEND:-gcs}"
+
   # The chosen nodes are ones that run an atelet today, so they are nodes
   # substrate already schedules to.
   local nodes=()
