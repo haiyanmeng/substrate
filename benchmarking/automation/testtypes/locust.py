@@ -120,16 +120,18 @@ def build_image(commit: str) -> str:
 
 
 def pre_test(test: dict[str, Any]) -> None:
-    """With an `ateapi:` block, shape the control plane for the run: node
-    roles, Postgres statistics, the pool size, then the ateapi pin. No
+    """With an `ateapi:` block, shape the control plane for the run:
+    Postgres statistics, node roles, the pool size, then the ateapi pin. No
     unpatch: every test redeploys substrate."""
     cfg = ateapi_config(test)
     if cfg is None:
         return
-    if cfg["pinNodes"]:
-        label_nodes()
+    # Postgres first: enabling statistics restarts it, and the restarted pod
+    # may land on another node, which the roles must then avoid.
     if cfg["pgStats"]:
         enable_postgres_stats()
+    if cfg["pinNodes"]:
+        label_nodes()
     if cfg["poolMaxConns"] is not None:
         set_pool_max_conns(cfg["poolMaxConns"])
     pin_ateapi(cfg)

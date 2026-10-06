@@ -18,6 +18,7 @@ python3 benchmarking/automation/test_locust.py"""
 import json
 import os
 import unittest
+from unittest import mock
 
 import yaml
 
@@ -123,6 +124,25 @@ class PickRoleNodesTest(unittest.TestCase):
     def test_too_few_nodes(self):
         with self.assertRaises(RuntimeError):
             locust.pick_role_nodes([node("pg"), node("n-a")], "pg")
+
+
+class PreTestTest(unittest.TestCase):
+    # Enabling statistics restarts Postgres onto any node, so the roles that
+    # must avoid its node are assigned only afterwards.
+    def test_labels_nodes_after_postgres_restarts(self):
+        calls = []
+        stubs = {
+            name: mock.patch.object(locust, name, lambda *_, name=name: calls.append(name))
+            for name in ("enable_postgres_stats", "label_nodes", "set_pool_max_conns", "pin_ateapi", "run_no_check")
+        }
+        for stub in stubs.values():
+            stub.start()
+            self.addCleanup(stub.stop)
+        locust.pre_test(entry(ateapi={"cpu": 2, "poolMaxConns": 40}))
+        self.assertEqual(
+            [c for c in calls if c != "run_no_check"],
+            ["enable_postgres_stats", "label_nodes", "set_pool_max_conns", "pin_ateapi"],
+        )
 
 
 class PoolMaxConnsTest(unittest.TestCase):
