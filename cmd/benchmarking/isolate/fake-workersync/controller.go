@@ -42,7 +42,9 @@ import (
 type workerClient interface {
 	CreateWorker(ctx context.Context, in *ateapipb.CreateWorkerRequest, opts ...grpc.CallOption) (*ateapipb.Worker, error)
 	DeleteWorker(ctx context.Context, in *ateapipb.DeleteWorkerRequest, opts ...grpc.CallOption) (*ateapipb.Worker, error)
+	DrainWorker(ctx context.Context, in *ateapipb.DrainWorkerRequest, opts ...grpc.CallOption) (*ateapipb.Worker, error)
 	ListWorkers(ctx context.Context, in *ateapipb.ListWorkersRequest, opts ...grpc.CallOption) (*ateapipb.ListWorkersResponse, error)
+	ListWorkerActorAssignments(ctx context.Context, in *ateapipb.ListWorkerActorAssignmentsRequest, opts ...grpc.CallOption) (*ateapipb.ListWorkerActorAssignmentsResponse, error)
 }
 
 // capacityRelay sends a capacity report to the fake-atelet relay at addr.
@@ -80,6 +82,7 @@ type fakeWorker struct {
 	// reported is the capacity ate-api-server last accepted for it; nil
 	// until one is.
 	reported *ateapipb.WorkerResources
+	draining bool
 }
 
 // controller stands in for atecontroller's WorkerPool controller and worker
@@ -88,9 +91,9 @@ type fakeWorker struct {
 // fake-atelet on its node, and writes the pool's status from them.
 //
 // It keeps the registered Workers in memory and lists them from ate-api-server
-// only at startup (adopt). A pass with nothing changed makes no
-// ate-api-server calls, so a steady fleet adds no load to the system under
-// test.
+// only at startup (adopt). A pass with nothing changed and nothing draining
+// makes no ate-api-server calls, so a steady fleet adds no load to the system
+// under test.
 type controller struct {
 	client      workerClient
 	relay       capacityRelay
@@ -131,6 +134,7 @@ func (c *controller) adopt(ctx context.Context) error {
 				index:     index,
 				node:      w.GetNodeName(),
 				created:   true,
+				draining:  w.GetStatus().GetState() == ateapipb.WorkerState_WORKER_STATE_DRAINING,
 			}
 		}
 		if token = page.GetNextPageToken(); token == "" {
@@ -189,10 +193,14 @@ func (c *controller) reconcile(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 
+	// Retire first, so a Worker that is replaced is recreated in the same pass
+	// once no Actor holds it. A draining Worker is retired until it is gone,
+	// even if its pool wants it again: it takes no new actors and cannot be
+	// undrained.
 	c.mu.Lock()
 	var unwanted []string
-	for name := range c.workers {
-		if _, ok := desired[name]; !ok {
+	for name, w := range c.workers {
+		if _, ok := desired[name]; !ok || w.draining {
 			unwanted = append(unwanted, name)
 		}
 	}
@@ -263,6 +271,10 @@ func (c *controller) ensure(ctx context.Context, name string, d desiredWorker, n
 		w.created = true
 		c.mu.Unlock()
 	}
+	if w.draining {
+		// Still held by an Actor; recreated once retire has deleted it.
+		return nil
+	}
 	want, err := capacity(d.pool, allocatable[w.node])
 	if err != nil {
 		return err
@@ -307,9 +319,38 @@ func (c *controller) create(ctx context.Context, name string, w *fakeWorker, wp 
 	return nil
 }
 
-// retire removes a Worker no pool wants.
+// retire removes a Worker no pool wants, the way a real one goes when its pod
+// does: drained first so nothing new lands on it, deleted once no Actor is
+// assigned to it.
 func (c *controller) retire(ctx context.Context, name string) error {
-	if _, err := c.client.DeleteWorker(ctx, &ateapipb.DeleteWorkerRequest{Worker: &ateapipb.ObjectRef{Name: name}}); err != nil && status.Code(err) != codes.NotFound {
+	c.mu.Lock()
+	w := c.workers[name]
+	c.mu.Unlock()
+	ref := &ateapipb.ObjectRef{Name: name}
+	if !w.draining {
+		if _, err := c.client.DrainWorker(ctx, &ateapipb.DrainWorkerRequest{Worker: ref}); err != nil {
+			if status.Code(err) == codes.NotFound {
+				c.forget(name)
+				return nil
+			}
+			return fmt.Errorf("while draining Worker %s: %w", name, err)
+		}
+		c.mu.Lock()
+		w.draining = true
+		c.mu.Unlock()
+	}
+	assigned, err := c.client.ListWorkerActorAssignments(ctx, &ateapipb.ListWorkerActorAssignmentsRequest{Worker: ref, PageSize: 1})
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			c.forget(name)
+			return nil
+		}
+		return fmt.Errorf("while listing Actors on Worker %s: %w", name, err)
+	}
+	if len(assigned.GetActorAssignments()) > 0 {
+		return nil
+	}
+	if _, err := c.client.DeleteWorker(ctx, &ateapipb.DeleteWorkerRequest{Worker: ref}); err != nil && status.Code(err) != codes.NotFound {
 		return fmt.Errorf("while deleting Worker %s: %w", name, err)
 	}
 	c.forget(name)
@@ -331,7 +372,7 @@ func (c *controller) syncStatus(ctx context.Context, wp *atev1alpha1.WorkerPool)
 	}
 	c.mu.Lock()
 	for _, w := range c.workers {
-		if w.namespace != wp.Namespace || w.pool != wp.Name || !w.created {
+		if w.namespace != wp.Namespace || w.pool != wp.Name || !w.created || w.draining {
 			continue
 		}
 		want.Replicas++

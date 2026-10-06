@@ -37,16 +37,17 @@ const testRun = "r1"
 
 // fakeControl is an in-memory Worker registry.
 type fakeControl struct {
-	mu      sync.Mutex
-	workers map[string]*ateapipb.Worker
-	creates int
+	mu          sync.Mutex
+	workers     map[string]*ateapipb.Worker
+	assignments map[string]int // actors assigned, by Worker name
+	creates     int
 	// lostReply, when set, is returned by CreateWorker after the Worker is
 	// stored, as when the server commits a create whose reply never arrives.
 	lostReply error
 }
 
 func newFakeControl() *fakeControl {
-	return &fakeControl{workers: map[string]*ateapipb.Worker{}}
+	return &fakeControl{workers: map[string]*ateapipb.Worker{}, assignments: map[string]int{}}
 }
 
 func (f *fakeControl) CreateWorker(_ context.Context, in *ateapipb.CreateWorkerRequest, _ ...grpc.CallOption) (*ateapipb.Worker, error) {
@@ -78,10 +79,35 @@ func (f *fakeControl) DeleteWorker(_ context.Context, in *ateapipb.DeleteWorkerR
 	return w, nil
 }
 
+func (f *fakeControl) DrainWorker(_ context.Context, in *ateapipb.DrainWorkerRequest, _ ...grpc.CallOption) (*ateapipb.Worker, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	w, ok := f.workers[in.GetWorker().GetName()]
+	if !ok {
+		return nil, status.Error(codes.NotFound, "no such Worker")
+	}
+	w.Status.State = ateapipb.WorkerState_WORKER_STATE_DRAINING
+	return w, nil
+}
+
 func (f *fakeControl) ListWorkers(_ context.Context, _ *ateapipb.ListWorkersRequest, _ ...grpc.CallOption) (*ateapipb.ListWorkersResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return &ateapipb.ListWorkersResponse{Workers: slices.Collect(maps.Values(f.workers))}, nil
+}
+
+func (f *fakeControl) ListWorkerActorAssignments(_ context.Context, in *ateapipb.ListWorkerActorAssignmentsRequest, _ ...grpc.CallOption) (*ateapipb.ListWorkerActorAssignmentsResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	name := in.GetWorker().GetName()
+	if _, ok := f.workers[name]; !ok {
+		return nil, status.Error(codes.NotFound, "no such Worker")
+	}
+	resp := &ateapipb.ListWorkerActorAssignmentsResponse{}
+	for range f.assignments[name] {
+		resp.ActorAssignments = append(resp.ActorAssignments, &ateapipb.ActorAssignment{})
+	}
+	return resp, nil
 }
 
 func (f *fakeControl) names() []string {
@@ -362,20 +388,70 @@ func TestReconcileReportsAgainWhenCapacityChanges(t *testing.T) {
 	}
 }
 
-func TestScaleDownDeletes(t *testing.T) {
+// Scaling down mirrors a real worker pod going away: drained first so nothing
+// new lands on it, deleted only once no Actor is assigned to it.
+func TestScaleDownDrainsThenDeletes(t *testing.T) {
 	c, ctl, _, cl := newTestController(pool("bench", 4, nil))
 	if err := reconcile(t, c); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
+	busy := fakeworker.Name(testRun, "benchmark-workloads", "bench", 3)
+	idle := fakeworker.Name(testRun, "benchmark-workloads", "bench", 2)
+	ctl.assignments[busy] = 1
+
 	cl.setReplicas("bench", 2)
 	if err := reconcile(t, c); err != nil {
 		t.Fatalf("scale-down reconcile: %v", err)
 	}
+	if slices.Contains(ctl.names(), idle) {
+		t.Errorf("idle Worker %s not deleted", idle)
+	}
+	if w := ctl.worker(busy); w == nil || w.GetStatus().GetState() != ateapipb.WorkerState_WORKER_STATE_DRAINING {
+		t.Fatalf("busy Worker %s = %v, want kept and draining", busy, w)
+	}
+	if got := cl.statuses["bench"]; got.Replicas != 2 || got.ReadyReplicas != 2 {
+		t.Errorf("status = %+v, want 2 replicas: a draining Worker is no replica", got)
+	}
+
+	ctl.assignments[busy] = 0
+	if err := reconcile(t, c); err != nil {
+		t.Fatalf("reconcile after the Actor left: %v", err)
+	}
 	if got, want := ctl.names(), poolNames("bench", 2); !slices.Equal(got, want) {
 		t.Errorf("registered %v, want %v", got, want)
 	}
+}
+
+// A Worker scaled down while an Actor holds it, then wanted again, is deleted
+// once the Actor leaves and registered afresh, rather than left draining.
+func TestScaleDownThenUpReplacesTheDrainingWorker(t *testing.T) {
+	c, ctl, _, cl := newTestController(pool("bench", 2, nil))
+	if err := reconcile(t, c); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	busy := fakeworker.Name(testRun, "benchmark-workloads", "bench", 1)
+	ctl.assignments[busy] = 1
+	cl.setReplicas("bench", 1)
+	if err := reconcile(t, c); err != nil {
+		t.Fatalf("scale-down reconcile: %v", err)
+	}
+	cl.setReplicas("bench", 2)
+	if err := reconcile(t, c); err != nil {
+		t.Fatalf("scale-up reconcile: %v", err)
+	}
+	if got := cl.statuses["bench"]; got.Replicas != 1 {
+		t.Errorf("status = %+v while the Worker drains, want 1 replica", got)
+	}
+
+	ctl.assignments[busy] = 0
+	if err := reconcile(t, c); err != nil {
+		t.Fatalf("reconcile after the Actor left: %v", err)
+	}
+	if w := ctl.worker(busy); w.GetStatus().GetState() != ateapipb.WorkerState_WORKER_STATE_ACTIVE {
+		t.Errorf("Worker %s state = %v, want registered afresh and active", busy, w.GetStatus().GetState())
+	}
 	if got := cl.statuses["bench"]; got.Replicas != 2 || got.ReadyReplicas != 2 {
-		t.Errorf("status = %+v, want 2 replicas", got)
+		t.Errorf("status = %+v, want 2 replicas, 2 ready", got)
 	}
 }
 
