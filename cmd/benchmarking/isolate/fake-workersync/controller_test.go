@@ -41,6 +41,7 @@ type fakeControl struct {
 	workers     map[string]*ateapipb.Worker
 	assignments map[string]int // actors assigned, by Worker name
 	creates     int
+	updates     int
 	// lostReply, when set, is returned by CreateWorker after the Worker is
 	// stored, as when the server commits a create whose reply never arrives.
 	lostReply error
@@ -87,6 +88,37 @@ func (f *fakeControl) DrainWorker(_ context.Context, in *ateapipb.DrainWorkerReq
 		return nil, status.Error(codes.NotFound, "no such Worker")
 	}
 	w.Status.State = ateapipb.WorkerState_WORKER_STATE_DRAINING
+	return w, nil
+}
+
+func (f *fakeControl) GetWorker(_ context.Context, in *ateapipb.GetWorkerRequest, _ ...grpc.CallOption) (*ateapipb.Worker, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	w, ok := f.workers[in.GetWorker().GetName()]
+	if !ok {
+		return nil, status.Error(codes.NotFound, "no such Worker")
+	}
+	return proto.CloneOf(w), nil
+}
+
+// UpdateWorker allows only the labels to change, as ate-api-server's
+// immutable-field validation does for the fields the controller sets.
+func (f *fakeControl) UpdateWorker(_ context.Context, in *ateapipb.UpdateWorkerRequest, _ ...grpc.CallOption) (*ateapipb.Worker, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.updates++
+	name := in.GetWorker().GetMetadata().GetName()
+	old, ok := f.workers[name]
+	if !ok {
+		return nil, status.Error(codes.NotFound, "no such Worker")
+	}
+	w := proto.CloneOf(in.GetWorker())
+	cmpOld, cmpNew := proto.CloneOf(old), proto.CloneOf(w)
+	cmpOld.Labels, cmpNew.Labels = nil, nil
+	if !proto.Equal(cmpOld, cmpNew) {
+		return nil, status.Errorf(codes.InvalidArgument, "Worker %s: only labels may change", name)
+	}
+	f.workers[name] = w
 	return w, nil
 }
 
@@ -188,6 +220,19 @@ func (f *fakeCluster) UpdateStatus(_ context.Context, wp *atev1alpha1.WorkerPool
 		}
 	}
 	return nil
+}
+
+// editPool replaces the named pool with a copy edit has changed.
+func (f *fakeCluster) editPool(name string, edit func(*atev1alpha1.WorkerPool)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, p := range f.pools {
+		if p.Name == name {
+			c := p.DeepCopy()
+			edit(c)
+			f.pools[i] = c
+		}
+	}
 }
 
 func (f *fakeCluster) setReplicas(pool string, n int32) {
@@ -492,6 +537,84 @@ func TestLostCreateReplyIsRetiredOrConfirmed(t *testing.T) {
 	}
 	if got := cl.statuses["bench"]; got.Replicas != 1 || got.ReadyReplicas != 1 {
 		t.Errorf("status = %+v, want 1 replica, confirmed by the retried create", got)
+	}
+}
+
+// A label edit on the pool reaches its Workers in place, as the worker syncer
+// applies it, including Workers adopted after a restart.
+func TestPoolLabelChangeUpdatesWorkers(t *testing.T) {
+	c, ctl, rel, cl := newTestController(pool("bench", 2, nil))
+	if err := reconcile(t, c); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	relabel := func(v string) {
+		cl.editPool("bench", func(wp *atev1alpha1.WorkerPool) { wp.Labels = map[string]string{"workload": v} })
+	}
+
+	relabel("v2")
+	creates := ctl.creates
+	if err := reconcile(t, c); err != nil {
+		t.Fatalf("reconcile after relabel: %v", err)
+	}
+	for _, name := range poolNames("bench", 2) {
+		if got := ctl.worker(name).GetLabels()["workload"]; got != "v2" {
+			t.Errorf("Worker %s workload label = %q, want v2", name, got)
+		}
+	}
+	if ctl.creates != creates || ctl.updates != 2 {
+		t.Errorf("relabel cost %d creates and %d updates, want 0 and 2", ctl.creates-creates, ctl.updates)
+	}
+
+	restarted := newController(ctl, rel, cl, testRun, 4)
+	if err := restarted.adopt(context.Background()); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	relabel("v3")
+	if err := reconcile(t, restarted); err != nil {
+		t.Fatalf("reconcile after restart and relabel: %v", err)
+	}
+	for _, name := range poolNames("bench", 2) {
+		if got := ctl.worker(name).GetLabels()["workload"]; got != "v3" {
+			t.Errorf("after restart, Worker %s workload label = %q, want v3", name, got)
+		}
+	}
+}
+
+// sandbox_class is immutable on a Worker, so a sandboxClass edit replaces the
+// pool's Workers the way it replaces real worker pods: an idle Worker at once,
+// a held one once its Actors leave.
+func TestPoolSandboxClassChangeReplacesWorkers(t *testing.T) {
+	c, ctl, _, cl := newTestController(pool("bench", 2, nil))
+	if err := reconcile(t, c); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	idle := fakeworker.Name(testRun, "benchmark-workloads", "bench", 0)
+	busy := fakeworker.Name(testRun, "benchmark-workloads", "bench", 1)
+	ctl.assignments[busy] = 1
+
+	cl.editPool("bench", func(wp *atev1alpha1.WorkerPool) { wp.Spec.SandboxClass = "microvm" })
+	if err := reconcile(t, c); err != nil {
+		t.Fatalf("reconcile after the class change: %v", err)
+	}
+	if got := ctl.worker(idle).GetSandboxClass(); got != "microvm" {
+		t.Errorf("idle Worker sandbox class = %q, want microvm", got)
+	}
+	if w := ctl.worker(busy); w.GetSandboxClass() != "gvisor" || w.GetStatus().GetState() != ateapipb.WorkerState_WORKER_STATE_DRAINING {
+		t.Errorf("busy Worker = %q/%v, want gvisor and draining", w.GetSandboxClass(), w.GetStatus().GetState())
+	}
+	if got := cl.statuses["bench"]; got.Replicas != 1 {
+		t.Errorf("status = %+v, want 1 replica while the old Worker drains", got)
+	}
+
+	ctl.assignments[busy] = 0
+	if err := reconcile(t, c); err != nil {
+		t.Fatalf("reconcile after the Actor left: %v", err)
+	}
+	if w := ctl.worker(busy); w.GetSandboxClass() != "microvm" || w.GetStatus().GetState() != ateapipb.WorkerState_WORKER_STATE_ACTIVE {
+		t.Errorf("replaced Worker = %q/%v, want microvm and active", w.GetSandboxClass(), w.GetStatus().GetState())
+	}
+	if got := cl.statuses["bench"]; got.Replicas != 2 || got.ReadyReplicas != 2 {
+		t.Errorf("status = %+v, want 2 replicas, 2 ready", got)
 	}
 }
 

@@ -43,6 +43,8 @@ type workerClient interface {
 	CreateWorker(ctx context.Context, in *ateapipb.CreateWorkerRequest, opts ...grpc.CallOption) (*ateapipb.Worker, error)
 	DeleteWorker(ctx context.Context, in *ateapipb.DeleteWorkerRequest, opts ...grpc.CallOption) (*ateapipb.Worker, error)
 	DrainWorker(ctx context.Context, in *ateapipb.DrainWorkerRequest, opts ...grpc.CallOption) (*ateapipb.Worker, error)
+	GetWorker(ctx context.Context, in *ateapipb.GetWorkerRequest, opts ...grpc.CallOption) (*ateapipb.Worker, error)
+	UpdateWorker(ctx context.Context, in *ateapipb.UpdateWorkerRequest, opts ...grpc.CallOption) (*ateapipb.Worker, error)
 	ListWorkers(ctx context.Context, in *ateapipb.ListWorkersRequest, opts ...grpc.CallOption) (*ateapipb.ListWorkersResponse, error)
 	ListWorkerActorAssignments(ctx context.Context, in *ateapipb.ListWorkerActorAssignmentsRequest, opts ...grpc.CallOption) (*ateapipb.ListWorkerActorAssignmentsResponse, error)
 }
@@ -79,6 +81,9 @@ type fakeWorker struct {
 	// from before its create, so a create the server commits but the caller
 	// sees fail is still retired, or deleted at shutdown.
 	created bool
+	// labels and sandboxClass are what the Worker is registered with.
+	labels       map[string]string
+	sandboxClass string
 	// reported is the capacity ate-api-server last accepted for it; nil
 	// until one is.
 	reported *ateapipb.WorkerResources
@@ -129,12 +134,14 @@ func (c *controller) adopt(ctx context.Context) error {
 				continue
 			}
 			c.workers[name] = &fakeWorker{
-				namespace: w.GetWorkerNamespace(),
-				pool:      w.GetWorkerPool(),
-				index:     index,
-				node:      w.GetNodeName(),
-				created:   true,
-				draining:  w.GetStatus().GetState() == ateapipb.WorkerState_WORKER_STATE_DRAINING,
+				namespace:    w.GetWorkerNamespace(),
+				pool:         w.GetWorkerPool(),
+				index:        index,
+				node:         w.GetNodeName(),
+				labels:       w.GetLabels(),
+				sandboxClass: w.GetSandboxClass(),
+				created:      true,
+				draining:     w.GetStatus().GetState() == ateapipb.WorkerState_WORKER_STATE_DRAINING,
 			}
 		}
 		if token = page.GetNextPageToken(); token == "" {
@@ -196,11 +203,13 @@ func (c *controller) reconcile(ctx context.Context) error {
 	// Retire first, so a Worker that is replaced is recreated in the same pass
 	// once no Actor holds it. A draining Worker is retired until it is gone,
 	// even if its pool wants it again: it takes no new actors and cannot be
-	// undrained.
+	// undrained. sandbox_class is immutable on a Worker, and editing it on a
+	// real pool replaces every worker pod, so its fake Workers are replaced.
 	c.mu.Lock()
 	var unwanted []string
 	for name, w := range c.workers {
-		if _, ok := desired[name]; !ok || w.draining {
+		d, ok := desired[name]
+		if !ok || w.draining || w.sandboxClass != string(d.pool.Spec.SandboxClass) {
 			unwanted = append(unwanted, name)
 		}
 	}
@@ -238,12 +247,12 @@ func (c *controller) reconcile(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// ensure registers the desired Worker if it is not yet, then has its
-// capacity reported if ate-api-server has not accepted the current value.
-// The Worker is tracked before CreateWorker is called and marked created
-// after, so a failed create is retried by the next pass, and one the server
-// committed anyway is never lost: retire and deleteAll take a NotFound as
-// done.
+// ensure registers the desired Worker if it is not yet, brings its labels in
+// line with the pool's, then has its capacity reported if ate-api-server has
+// not accepted the current value. The Worker is tracked before CreateWorker
+// is called and marked created after, so a failed create is retried by the
+// next pass, and one the server committed anyway is never lost: retire and
+// deleteAll take a NotFound as done.
 func (c *controller) ensure(ctx context.Context, name string, d desiredWorker, nodes []string, allocatable map[string]corev1.ResourceList, relays map[string]string) error {
 	c.mu.Lock()
 	w := c.workers[name]
@@ -254,10 +263,12 @@ func (c *controller) ensure(ctx context.Context, name string, d desiredWorker, n
 			return errors.New("no benchmark node to place fake Workers on")
 		}
 		w = &fakeWorker{
-			namespace: d.pool.Namespace,
-			pool:      d.pool.Name,
-			index:     d.index,
-			node:      fakeworker.Node(d.index, nodes),
+			namespace:    d.pool.Namespace,
+			pool:         d.pool.Name,
+			index:        d.index,
+			node:         fakeworker.Node(d.index, nodes),
+			labels:       maps.Clone(d.pool.GetLabels()),
+			sandboxClass: string(d.pool.Spec.SandboxClass),
 		}
 		c.mu.Lock()
 		c.workers[name] = w
@@ -274,6 +285,11 @@ func (c *controller) ensure(ctx context.Context, name string, d desiredWorker, n
 	if w.draining {
 		// Still held by an Actor; recreated once retire has deleted it.
 		return nil
+	}
+	if !maps.Equal(w.labels, d.pool.GetLabels()) {
+		if err := c.updateLabels(ctx, name, w, d.pool.GetLabels()); err != nil {
+			return err
+		}
 	}
 	want, err := capacity(d.pool, allocatable[w.node])
 	if err != nil {
@@ -316,6 +332,28 @@ func (c *controller) create(ctx context.Context, name string, w *fakeWorker, wp 
 	if err != nil && status.Code(err) != codes.AlreadyExists {
 		return fmt.Errorf("while creating Worker %s: %w", name, err)
 	}
+	return nil
+}
+
+// updateLabels writes the pool's labels onto a registered Worker, as the
+// worker syncer does when a pool's labels change. UpdateWorker replaces the
+// whole resource and takes the version it was read at as its precondition, so
+// the Worker is read first; a conflicting write fails the call and the next
+// pass retries it.
+func (c *controller) updateLabels(ctx context.Context, name string, w *fakeWorker, want map[string]string) error {
+	got, err := c.client.GetWorker(ctx, &ateapipb.GetWorkerRequest{Worker: &ateapipb.ObjectRef{Name: name}})
+	if err != nil {
+		return fmt.Errorf("while reading Worker %s: %w", name, err)
+	}
+	if !maps.Equal(got.GetLabels(), want) {
+		got.Labels = maps.Clone(want)
+		if _, err := c.client.UpdateWorker(ctx, &ateapipb.UpdateWorkerRequest{Worker: got}); err != nil {
+			return fmt.Errorf("while updating Worker %s labels: %w", name, err)
+		}
+	}
+	c.mu.Lock()
+	w.labels = maps.Clone(want)
+	c.mu.Unlock()
 	return nil
 }
 
