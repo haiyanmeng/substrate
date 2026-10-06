@@ -22,7 +22,6 @@ ate-api-server and Postgres (see ATEAPI_DEFAULTS); without it pre_test
 leaves the cluster as installed.
 """
 
-import base64
 import json
 import os
 import re
@@ -250,40 +249,24 @@ def enable_postgres_stats() -> None:
     )
 
 
-DSN_SECRET = "ate-api-server-secret-envvars"
-DSN_KEY = "ATE_API_POSTGRES_CONNECTION_STRING"
+# ate-setup's ConfigMap of ateapi environment variables. ateapi reads
+# ATE_API_POSTGRES_POOL_MAX_CONNS from it at start, over any pool_max_conns in
+# the DSN.
+ENV_CONFIGMAP = "ate-api-server-envvars"
+POOL_MAX_CONNS_KEY = "ATE_API_POSTGRES_POOL_MAX_CONNS"
 
 
-def with_pool_max_conns(dsn: str, n: int) -> str:
-    """Set pool_max_conns in a URI or keyword DSN, as cmd/ate-setup's
-    withPoolMaxConns does at install."""
-    setting = f"pool_max_conns={n}"
-    if re.search(r"pool_max_conns=[^ &]*", dsn):
-        return re.sub(r"pool_max_conns=[^ &]*", setting, dsn, count=1)
-    if "://" in dsn:
-        return dsn + ("&" if "?" in dsn else "?") + setting
-    return dsn + " " + setting
+def pool_max_conns_patch(n: int) -> dict[str, Any]:
+    return {"data": {POOL_MAX_CONNS_KEY: str(n)}}
 
 
 def set_pool_max_conns(n: int) -> None:
-    """Rewrite the pool size in the DSN Secret ateapi reads at start; the
-    pin_ateapi rollout that follows picks it up. The DSN can carry a
-    password, thus it passes through stdin and never reaches a logged
-    command line."""
-    secret = json.loads(
-        _kubectl_out(["-n", NAMESPACE, "get", "secret", DSN_SECRET, "-o", "json"])
-    )
-    dsn = base64.b64decode(secret["data"][DSN_KEY]).decode()
-    secret["data"][DSN_KEY] = base64.b64encode(
-        with_pool_max_conns(dsn, n).encode()
-    ).decode()
-    print(f"$ kubectl replace secret {DSN_SECRET} (pool_max_conns={n})", flush=True)
-    subprocess.run(
-        ["kubectl", "replace", "-f", "-"],
-        input=json.dumps(secret),
-        text=True,
-        check=True,
-        stdout=subprocess.DEVNULL,
+    """Set the read/write pool size ateapi reads at start; the pin_ateapi
+    rollout that follows picks it up. The owner and watch pools stay at 2
+    and 3 connections per replica."""
+    run(
+        ["kubectl", "-n", NAMESPACE, "patch", "configmap", ENV_CONFIGMAP,
+         "--type", "merge", "-p", json.dumps(pool_max_conns_patch(n))]
     )
 
 

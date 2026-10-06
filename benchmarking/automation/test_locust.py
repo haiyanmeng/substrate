@@ -126,25 +126,10 @@ class PickRoleNodesTest(unittest.TestCase):
 
 
 class PoolMaxConnsTest(unittest.TestCase):
-    def test_uri(self):
-        cases = {
-            "postgres://u:p@h/db": "postgres://u:p@h/db?pool_max_conns=16",
-            "postgres://h/db?sslmode=disable":
-                "postgres://h/db?sslmode=disable&pool_max_conns=16",
-            "postgres://h/db?pool_max_conns=64&pool_min_conns=4":
-                "postgres://h/db?pool_max_conns=16&pool_min_conns=4",
-        }
-        for dsn, want in cases.items():
-            self.assertEqual(locust.with_pool_max_conns(dsn, 16), want)
-
-    def test_keyword(self):
+    def test_patch(self):
         self.assertEqual(
-            locust.with_pool_max_conns("host=h dbname=db", 16),
-            "host=h dbname=db pool_max_conns=16",
-        )
-        self.assertEqual(
-            locust.with_pool_max_conns("host=h pool_max_conns=64 dbname=db", 16),
-            "host=h pool_max_conns=16 dbname=db",
+            locust.pool_max_conns_patch(40),
+            {"data": {"ATE_API_POSTGRES_POOL_MAX_CONNS": "40"}},
         )
 
 
