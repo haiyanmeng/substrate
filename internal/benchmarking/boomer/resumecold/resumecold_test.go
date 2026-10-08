@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/internal/ateinterceptors"
 	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/dynconfig"
 	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/userclass"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
@@ -32,6 +33,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -52,6 +54,9 @@ type fakeControlClient struct {
 	// deleteAborts is how many DeleteActor calls fail with Aborted, as when
 	// another operation holds the actor lease, before deletes succeed.
 	deleteAborts int
+	// serverElapsedUS, when set, is returned in the ServerElapsedTrailer of
+	// every ResumeActor and PauseActor.
+	serverElapsedUS string
 	// resumeEntered and resumeGate, when set, hold every ResumeActor: it
 	// signals resumeEntered and then waits for resumeGate to close or its
 	// context to end.
@@ -61,6 +66,19 @@ type fakeControlClient struct {
 
 func newFake() *fakeControlClient {
 	return &fakeControlClient{states: map[string]ateapipb.ActorState{}}
+}
+
+// setTrailer fills the trailer a call asked for, as ate-api-server's
+// ateinterceptors.ServerUnaryInterceptor does.
+func (f *fakeControlClient) setTrailer(opts []grpc.CallOption) {
+	if f.serverElapsedUS == "" {
+		return
+	}
+	for _, o := range opts {
+		if t, ok := o.(grpc.TrailerCallOption); ok {
+			*t.TrailerAddr = metadata.Pairs(ateinterceptors.ServerElapsedTrailer, f.serverElapsedUS)
+		}
+	}
 }
 
 func (f *fakeControlClient) record(rpc, actor string) {
@@ -121,6 +139,7 @@ func (f *fakeControlClient) ResumeActor(ctx context.Context, in *ateapipb.Resume
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.setTrailer(opts)
 	name := in.GetActor().GetName()
 	f.record("ResumeActor", name)
 	if f.resumeErr != nil {
@@ -143,6 +162,7 @@ func (f *fakeControlClient) ResumeActor(ctx context.Context, in *ateapipb.Resume
 func (f *fakeControlClient) PauseActor(ctx context.Context, in *ateapipb.PauseActorRequest, opts ...grpc.CallOption) (*ateapipb.PauseActorResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.setTrailer(opts)
 	name := in.GetActor().GetName()
 	f.record("PauseActor", name)
 	if f.states[name] != ateapipb.ActorState_ACTOR_STATE_RUNNING {
@@ -306,6 +326,39 @@ func TestStartFleetFailsWhenTheAtespaceCannotBeEnsured(t *testing.T) {
 	}
 	if got := fake.callsTo("CreateActor"); len(got) != 0 {
 		t.Errorf("created %v without an atespace", got)
+	}
+}
+
+// Each cycle records ate-api-server's own elapsed time beside the client
+// latency, so the gap between them is network and client time.
+func TestIterateRecordsServerLatency(t *testing.T) {
+	fake := newFake()
+	r := newTestRuntime(fake, 1)
+	r.startFleet(context.Background())
+	fake.serverElapsedUS = "1500"
+	resumes, pauses := serverLatencySum(t, "ResumeActorCold"), serverLatencySum(t, "PauseActor")
+	r.iterate()
+	if got := serverLatencySum(t, "ResumeActorCold") - resumes; got != 1.5 {
+		t.Errorf("ResumeActorCold server latency sum grew by %v ms, want 1.5", got)
+	}
+	if got := serverLatencySum(t, "PauseActor") - pauses; got != 1.5 {
+		t.Errorf("PauseActor server latency sum grew by %v ms, want 1.5", got)
+	}
+}
+
+// A failed call stays out of the server histogram, which has no status: its
+// client sample counts as a failure, so the two would describe different
+// requests.
+func TestIterateLeavesFailuresOutOfServerLatency(t *testing.T) {
+	fake := newFake()
+	r := newTestRuntime(fake, 1)
+	r.startFleet(context.Background())
+	fake.serverElapsedUS = "1500"
+	fake.resumeErr = status.Error(codes.Aborted, "lease held")
+	before := serverLatencySum(t, "ResumeActorCold")
+	r.iterate()
+	if got := serverLatencySum(t, "ResumeActorCold") - before; got != 0 {
+		t.Errorf("ResumeActorCold server latency sum grew by %v ms after a failed resume, want 0", got)
 	}
 }
 
@@ -541,6 +594,11 @@ func TestShutdownCancelsACycleThatOutlastsItsShare(t *testing.T) {
 func requestCount(t *testing.T, name, result string) float64 {
 	t.Helper()
 	return scrape(t, `locust_requests_total{method="grpc",name="`+name+`",status="`+result+`",user_class="ResumeColdUser"} `)
+}
+
+func serverLatencySum(t *testing.T, name string) float64 {
+	t.Helper()
+	return scrape(t, `locust_server_duration_milliseconds_sum{method="grpc",name="`+name+`",user_class="ResumeColdUser"} `)
 }
 
 func scrape(t *testing.T, prefix string) float64 {
