@@ -672,3 +672,165 @@ tests:
     nighthawk-ingress:
       envoyCpu: 16
       tailLatencySloMs: 25
+  # ate-api-server and Postgres cold resume ceiling on the fake data plane.
+  # Every user takes a paused actor from the shared fleet, resumes it and
+  # pauses it again; FleetExhausted failures mark a step the fleet could not
+  # cover. fake-atelet answers each call, restore and checkpoint alike,
+  # after 150 ms on all three nodes, so a cycle spends 300 ms in the data
+  # plane, after minting the actor's certificate on each restore as ateom
+  # does. The 200 fake Workers hold
+  # 1000 actors each, so placement never binds. resumecold sends the actors
+  # no requests, which the fake data plane needs.
+  - name: ateapi_cold_resume_pause_fake_2cpu
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, ate-api-server at 2 CPUs: rate ladder 100-1500 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 23m
+    users: 1000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    fakeDataPlane:
+      nodes: 3
+      delay: 150ms
+    ateapi:
+      cpu: 2
+      memory: 4Gi
+      poolMaxConns: 64
+    flags:
+      - "--total-actors"
+      - "1000"
+      - "--ladder-spawn-rate"
+      - "1000"
+      - "--ladder"
+      - "1000:3m@100,1000:3m@200,1000:3m@400,1000:3m@600,1000:3m@800,1000:3m@1000,1000:3m@1500"
+  # A quick check that the cold resume setup still works end to end: the
+  # 2cpu test cut to two 1-minute steps either side of its ~800/s ceiling.
+  - name: ateapi_cold_resume_pause_fake_2cpu_tiny
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, ate-api-server at 2 CPUs: smoke ladder 800-1000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 4m
+    users: 1000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    fakeDataPlane:
+      nodes: 3
+      delay: 150ms
+    ateapi:
+      cpu: 2
+      memory: 4Gi
+      poolMaxConns: 64
+    flags:
+      - "--total-actors"
+      - "1000"
+      - "--ladder-spawn-rate"
+      - "1000"
+      - "--ladder"
+      - "1000:1m@800,1000:1m@1000"
+      # No wait for the atelet's last export after the run: fake-atelet
+      # exports none, so the 70s default only delays the Job.
+      - "--atelet-lag-s"
+      - "0"
+  - name: ateapi_cold_resume_pause_fake_4cpu
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, ate-api-server at 4 CPUs: rate ladder 250-2500 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 23m
+    users: 2000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    fakeDataPlane:
+      nodes: 3
+      delay: 150ms
+    ateapi:
+      cpu: 4
+      memory: 4Gi
+      poolMaxConns: 64
+    flags:
+      - "--total-actors"
+      - "2000"
+      - "--ladder-spawn-rate"
+      - "2000"
+      - "--ladder"
+      - "2000:3m@250,2000:3m@500,2000:3m@1000,2000:3m@1500,2000:3m@1750,2000:3m@2000,2000:3m@2500"
+  - name: ateapi_cold_resume_pause_fake_8cpu
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, ate-api-server at 8 CPUs: rate ladder 250-3000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 23m
+    users: 2000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    fakeDataPlane:
+      nodes: 3
+      delay: 150ms
+    ateapi:
+      cpu: 8
+      memory: 4Gi
+      poolMaxConns: 64
+    flags:
+      - "--total-actors"
+      - "2000"
+      - "--ladder-spawn-rate"
+      - "2000"
+      - "--ladder"
+      - "2000:3m@250,2000:3m@500,2000:3m@1000,2000:3m@1500,2000:3m@2000,2000:3m@2500,2000:3m@3000"
+  # Two replicas share size0's max_connections of 100, so each pool is 40.
+  - name: ateapi_cold_resume_pause_fake_2x2cpu
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 2 ate-api-server replicas at 2 CPUs: rate ladder 250-2500 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 23m
+    users: 2000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    fakeDataPlane:
+      nodes: 3
+      delay: 150ms
+    ateapi:
+      cpu: 2
+      replicas: 2
+      memory: 4Gi
+      poolMaxConns: 40
+    flags:
+      - "--total-actors"
+      - "2000"
+      - "--ladder-spawn-rate"
+      - "2000"
+      - "--ladder"
+      - "2000:3m@250,2000:3m@500,2000:3m@1000,2000:3m@1500,2000:3m@1750,2000:3m@2000,2000:3m@2500"
+  - name: ateapi_cold_resume_pause_fake_2x4cpu
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 2 ate-api-server replicas at 4 CPUs: rate ladder 500-4000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 23m
+    users: 4000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    fakeDataPlane:
+      nodes: 3
+      delay: 150ms
+    ateapi:
+      cpu: 4
+      replicas: 2
+      memory: 4Gi
+      poolMaxConns: 40
+    flags:
+      - "--total-actors"
+      - "4000"
+      - "--ladder-spawn-rate"
+      - "4000"
+      - "--ladder"
+      - "4000:3m@500,4000:3m@1000,4000:3m@2000,4000:3m@2500,4000:3m@3000,4000:3m@3500,4000:3m@4000"
