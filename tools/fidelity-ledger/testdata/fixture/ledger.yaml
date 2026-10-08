@@ -1,0 +1,33 @@
+scans:
+  - name: caller
+    roots:
+      - ./caller
+    services:
+      - fix.*
+calls:
+  - rpc: fix.Alpha/Ping
+    callers:
+      - caller
+    status: emulated
+    emulation: the fake pings
+  - rpc: fix.Alpha/List
+    callers:
+      - helper
+    status: emulated
+    emulation: the fake lists
+  - rpc: fix.Beta/Ping
+    callers:
+      - caller
+    status: not_emulated
+    gaps:
+      - no-beta
+  - rpc: fix.Beta/Echo
+    callers:
+      - caller
+    status: not_applicable
+    reason: nothing measures echoes
+gaps:
+  - id: no-beta
+    brief: The fakes have no Beta client.
+    impact: Beta pings cost nothing in the benchmark.
+    plan: Add one when Beta matters.
