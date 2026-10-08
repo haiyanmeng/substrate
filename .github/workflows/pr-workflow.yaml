@@ -70,6 +70,13 @@ jobs:
       run: ../../hack/run-tool.sh gotestsum --junitfile "${ARTIFACTS}/apitool.xml"
         --jsonfile "${ARTIFACTS}/apitool.json" --format standard-verbose
         -- -race -v ./...
+    # tools/fidelity-ledger has its own module too; hack/verify/fake-dataplane.sh
+    # runs it against the ledger, and this runs its tests.
+    - name: fidelity-ledger tests
+      working-directory: tools/fidelity-ledger
+      run: ../../hack/run-tool.sh gotestsum --junitfile "${ARTIFACTS}/fidelity-ledger.xml"
+        --jsonfile "${ARTIFACTS}/fidelity-ledger.json" --format standard-verbose
+        -- -race -v ./...
     # Kept apart from the root module so it can move to its own repository.
     - name: gcp-secret-manager credential provider tests
       working-directory: internal/plugins/gcp-secret-manager

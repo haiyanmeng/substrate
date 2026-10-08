@@ -23,6 +23,9 @@
 // atecontroller must not run alongside it: its WorkerPool controller would
 // create real worker pods for the same pools, and its worker syncer deletes
 // every Worker with no live pod.
+//
+// docs/benchmarking/fake-dataplane-fidelity.yaml records which of the real
+// data plane's calls the fakes make, and the known gaps.
 package main
 
 import (
