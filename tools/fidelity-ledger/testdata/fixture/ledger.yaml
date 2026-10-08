@@ -1,0 +1,63 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+scans:
+  - name: caller
+    roots:
+      - ./caller
+    services:
+      - fix.*
+calls:
+  - rpc: fix.Alpha/Ping
+    callers:
+      - caller
+    status: emulated
+    emulation: the fake pings
+  - rpc: fix.Alpha/List
+    callers:
+      - helper
+    status: emulated
+    emulation: the fake lists
+  - rpc: fix.Beta/Ping
+    callers:
+      - caller
+    status: not_emulated
+    gaps:
+      - no-beta
+  - rpc: fix.Beta/Echo
+    callers:
+      - caller
+    status: not_applicable
+    reason: nothing measures echoes
+fakes:
+  name: fakes
+  roots:
+    - ./fake
+  services:
+    - fix.*
+fake_only:
+  - rpc: fix.Alpha/Count
+    callers:
+      - fake
+    gaps:
+      - fake-counts
+gaps:
+  - id: no-beta
+    brief: The fakes have no Beta client.
+    impact: Beta pings cost nothing in the benchmark.
+    plan: Add one when Beta matters.
+  - id: fake-counts
+    brief: The fake counts, which the real caller never does.
+    impact: Counts cost ate-api-server a little.
+    plan: Stop counting.

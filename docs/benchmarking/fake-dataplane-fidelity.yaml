@@ -1,0 +1,336 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The fidelity ledger of the benchmark fake data plane.
+#
+# fake-atelet and fake-workersync (cmd/benchmarking/isolate) stand in for
+# atelet, ateom and atecontroller's worker syncer, so that ate-api-server and
+# Postgres can be measured without worker pods. A result is meaningful only
+# if the fakes cost ate-api-server what the real data plane does.
+#
+# calls lists every gRPC call the real data plane makes across the
+# control-plane boundary, as found by the scans below, with the packages that
+# make it and one status:
+#
+#   emulated        the fakes make the call; emulation says how. Name gaps
+#                   when they make it at a different rate or cost.
+#   not_emulated    the fakes do not make the call; gaps names why it matters.
+#   not_applicable  the benchmark needs no stand-in; reason says why.
+#
+# fake_only lists the calls the fakes make that the real data plane does not,
+# each with the gap it opens.
+#
+# gaps lists each known way the fakes cost ate-api-server something other than
+# the real data plane does, with its impact on results and the plan for it.
+#
+# hack/verify/fake-dataplane.sh, run by make verify, finds the calls with
+# tools/fidelity-ledger and fails when they differ from calls, so a new call,
+# a removed one, or a new caller is classified in the change that makes it. It
+# also finds the calls the fakes make, and fails when an entry for one of the
+# fakes scan's services is emulated but no fake makes it, or is not emulated
+# but a fake makes it, or when a fake makes a call fake_only does not list.
+# The fakes serve AteomHerder rather than call it, so those entries are not
+# checked that way. The check cannot see a change in how often or how
+# expensively a call is made; record those as gaps when you make them.
+
+scans:
+  - name: data plane to ate-api-server
+    # Each root's imports in this module are scanned too.
+    roots:
+      - ./cmd/atelet
+      - ./cmd/ateom-gvisor
+      - ./cmd/ateom-microvm
+      - ./internal/atunnel
+      # fake-workersync stands in for its WorkerPool controller as well as
+      # its worker syncer.
+      - ./cmd/atecontroller
+      - ./cmd/atenet
+    services:
+      - ateapi.*
+  - name: ate-api-server to atelet
+    roots:
+      - ./cmd/ateapi
+    services:
+      - atelet.AteomHerder
+
+calls:
+  - rpc: ateapi.Control/CreateWorker
+    callers:
+      - cmd/atecontroller/internal/workersync
+    status: emulated
+    emulation: >
+      fake-workersync creates a Worker for each pod a fake WorkerPool would
+      have, with the fields the worker syncer copies from the pool and pod.
+  - rpc: ateapi.Control/DeleteWorker
+    callers:
+      - cmd/atecontroller/internal/workersync
+    status: emulated
+    emulation: >
+      fake-workersync deletes a retired Worker once it has no Actors or after
+      --drain-grace, where the syncer deletes it when its pod is gone. It also
+      deletes every Worker of its run on shutdown.
+    gaps:
+      - fake-only-assignment-polling
+  - rpc: ateapi.Control/DrainWorker
+    callers:
+      - cmd/atecontroller/internal/workersync
+    status: emulated
+    emulation: >
+      fake-workersync drains a Worker its pool no longer wants, where the
+      syncer drains one whose pod is terminating.
+    gaps:
+      - worker-restarts
+  - rpc: ateapi.Control/GetActor
+    callers:
+      - cmd/atenet/internal/router/egress
+    status: not_emulated
+    gaps:
+      - atenet-router-traffic
+  - rpc: ateapi.Control/GetActorEgressPolicy
+    callers:
+      - cmd/atenet/internal/router/egress
+    status: not_emulated
+    gaps:
+      - atenet-router-traffic
+  - rpc: ateapi.Control/GetWorker
+    callers:
+      - cmd/atecontroller/internal/workersync
+    status: emulated
+    emulation: >
+      fake-workersync reads a Worker only before updating its labels.
+    gaps:
+      - worker-syncer-resync
+  - rpc: ateapi.Control/ListActors
+    callers:
+      - cmd/atenet/internal/router
+    status: not_emulated
+    gaps:
+      - atenet-router-traffic
+  - rpc: ateapi.Control/ListWorkers
+    callers:
+      - cmd/atecontroller/internal/workersync
+    status: emulated
+    emulation: >
+      fake-workersync lists Workers once at startup, 1000 per page, as the
+      syncer does, to adopt those of an earlier run.
+  - rpc: ateapi.Control/ResumeActor
+    callers:
+      - cmd/atenet/internal/router/ingress
+    status: not_emulated
+    gaps:
+      - atenet-router-traffic
+  - rpc: ateapi.Control/UpdateWorker
+    callers:
+      - cmd/atecontroller/internal/workersync
+    status: emulated
+    emulation: >
+      fake-workersync updates a Worker whose pool labels changed. It never
+      raises the epoch.
+    gaps:
+      - worker-restarts
+  - rpc: ateapi.WorkerService/MintAteomActorCertificate
+    callers:
+      - cmd/atelet
+    status: emulated
+    emulation: >
+      fake-atelet mints the actor's certificate before each Run and Restore
+      that names an egress gateway, as ateom has atelet do, unless
+      --mint-actor-certificate=false. It sends one CSR for every mint; ate-api-server
+      takes only the public key from it.
+    gaps:
+      - mint-renewal
+  - rpc: ateapi.WorkerService/RegisterWorker
+    callers:
+      - cmd/atelet
+    status: emulated
+    emulation: >
+      fake-workersync reports each Worker's capacity and hardware once,
+      through the fake-atelet relay on the Worker's node so that it carries
+      that atelet's identity, and repeats it until ate-api-server accepts it.
+    gaps:
+      - worker-restarts
+      - uniform-hardware
+  - rpc: ateapi.WorkerService/RequestActorSuspend
+    callers:
+      - cmd/atelet
+    status: not_emulated
+    gaps:
+      - actor-suspend-requests
+  - rpc: atelet.AteomHerder/Checkpoint
+    callers:
+      - cmd/ateapi/internal/controlapi
+    status: emulated
+    emulation: >
+      fake-atelet answers with success after --delay-checkpoint, and writes a
+      placeholder object under the snapshot URI of an external checkpoint.
+    gaps:
+      - fixed-herder-latency
+      - placeholder-snapshots
+  - rpc: atelet.AteomHerder/Restore
+    callers:
+      - cmd/ateapi/internal/controlapi
+    status: emulated
+    emulation: >
+      fake-atelet answers with success after --delay-restore, plus the actor
+      certificate mint.
+    gaps:
+      - fixed-herder-latency
+  - rpc: atelet.AteomHerder/Run
+    callers:
+      - cmd/ateapi/internal/controlapi
+    status: emulated
+    emulation: >
+      fake-atelet answers with success after --delay-run, plus the actor
+      certificate mint.
+    gaps:
+      - fixed-herder-latency
+  - rpc: atelet.AteomHerder/Terminate
+    callers:
+      - cmd/ateapi/internal/controlapi
+    status: emulated
+    emulation: >
+      fake-atelet answers with success after --delay-terminate.
+    gaps:
+      - fixed-herder-latency
+  - rpc: atelet.AteomHerder/UploadPausedCheckpoint
+    callers:
+      - cmd/ateapi/internal/controlapi
+    status: emulated
+    emulation: >
+      fake-atelet answers with success after --delay-upload-paused-checkpoint,
+      and writes a placeholder object under the destination snapshot URI.
+    gaps:
+      - fixed-herder-latency
+      - placeholder-snapshots
+
+fakes:
+  name: fakes to ate-api-server
+  roots:
+    - ./cmd/benchmarking/isolate/...
+  services:
+    - ateapi.*
+
+fake_only:
+  - rpc: ateapi.Control/ListWorkerActorAssignments
+    callers:
+      - cmd/benchmarking/isolate/fake-workersync
+    gaps:
+      - fake-only-assignment-polling
+
+gaps:
+  - id: atenet-router-traffic
+    brief: >
+      No atenet router runs against the fake data plane, so none of its calls
+      reach ate-api-server. A router replica sends a ListActors health probe
+      every --health-interval (1s), a ResumeActor for every ingress request,
+      even to a running actor, a GetActor for every egress CONNECT, and a
+      GetActorEgressPolicy per actor every --egress-policy-cache-ttl (10s)
+      while it has egress.
+    impact: >
+      The benchmark's load generator calls ResumeActor directly, once per cold
+      resume rather than once per request, without the router's parking and
+      retries. A deployment whose traffic goes through routers puts more
+      ResumeActor and read load on ate-api-server than the benchmark does.
+    plan: >
+      Run real routers against the fake data plane, or add a load class that
+      makes the router's calls at its rates.
+  - id: actor-suspend-requests
+    brief: >
+      atelet relays an ateom's request to suspend an idle actor it hosts, but
+      the fakes never request a suspend.
+    impact: >
+      None today: nothing in ateom calls internal/ateomsuspend yet, so the
+      real data plane never makes this call either.
+    plan: >
+      Emulate it in fake-atelet when ateom starts requesting suspends, at the
+      rate ateom would.
+  - id: fake-only-assignment-polling
+    brief: >
+      fake-workersync calls ListWorkerActorAssignments, one Actor per page,
+      on every pass (--resync, 10s) while a Worker drains, to decide when to
+      delete it. The real data plane never calls it: the syncer deletes a
+      Worker when its pod is gone.
+    impact: >
+      Adds about six small reads per retired Worker, and only while a fake
+      WorkerPool scales down or changes.
+    plan: >
+      Keep unless a benchmark measures WorkerPool turnover; then delete after
+      --drain-grace without polling.
+  - id: fixed-herder-latency
+    brief: >
+      fake-atelet answers each AteomHerder call after a fixed delay per call
+      type. A real call's time varies with the image, the snapshot size and
+      the node's load.
+    impact: >
+      ate-api-server holds each operation open for the same time, so the
+      benchmark shows no tail from slow nodes and no contention between
+      operations that overlap on one Worker.
+    plan: >
+      Draw the delay from a distribution measured on real workers if tail
+      latency under contention matters to a result.
+  - id: mint-renewal
+    brief: >
+      An actor certificate lasts one hour, and atunnel renews it at 90% of
+      its remaining lifetime, about every 54 minutes per running actor that
+      has egress. The fakes mint only at Run and Restore.
+    impact: >
+      None for actors that run for less than about 54 minutes, which covers
+      the cold-resume benchmark. A benchmark that keeps actors running for
+      hours misses about one mint per actor per 54 minutes.
+    plan: >
+      Add a renewal timer per running actor to fake-atelet when a benchmark
+      keeps actors running that long.
+  - id: placeholder-snapshots
+    brief: >
+      fake-atelet writes one empty object under each snapshot URI, where a
+      real checkpoint writes the snapshot's files and manifest.
+    impact: >
+      ate-api-server copies an actor's snapshot when it creates a tag, golden
+      tags included, so the benchmark's tag creation copies one empty object
+      and costs far less than it would in production.
+    plan: >
+      Write a configurable number and size of objects per snapshot when a
+      benchmark measures tag creation.
+  - id: uniform-hardware
+    brief: >
+      Every fake Worker reports the hardware of the fake-workersync pod's
+      host, where each real Worker reports its own.
+    impact: >
+      Snapshot hardware matching sees a single hardware class, so placement
+      never has to skip a Worker whose hardware does not match a snapshot.
+    plan: >
+      Report a configurable mix of hardware identities when a benchmark
+      measures placement in a mixed fleet.
+  - id: worker-restarts
+    brief: >
+      Fake Workers never restart. A real ateom restart registers the Worker
+      again, the syncer raises its epoch with UpdateWorker, and
+      ate-api-server crashes the Worker's actors.
+    impact: >
+      The benchmark measures a steady fleet only; it shows none of the
+      cost of restarts, evictions or the actor crashes they cause.
+    plan: >
+      Add a restart mode to fake-workersync, raising a Worker's epoch and
+      registering it again, when a benchmark measures fleet churn.
+  - id: worker-syncer-resync
+    brief: >
+      The worker syncer reads every Worker with GetWorker on each pod update
+      and on its informer's 5-minute resync. fake-workersync makes no calls
+      while its fleet is steady.
+    impact: >
+      The benchmark lacks about one GetWorker per Worker every 5 minutes,
+      about 0.7 per second for 200 Workers: small next to actor operations.
+    plan: >
+      Add a 5-minute GetWorker sweep to fake-workersync if a benchmark runs
+      thousands of Workers.

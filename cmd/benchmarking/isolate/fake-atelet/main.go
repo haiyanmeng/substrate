@@ -21,6 +21,9 @@
 //
 // Actors it "runs" do not exist. Never run it on a cluster that serves real
 // actors.
+//
+// docs/benchmarking/fake-dataplane-fidelity.yaml records which of the real
+// data plane's calls the fakes make, and the known gaps.
 package main
 
 import (
