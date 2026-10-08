@@ -51,5 +51,40 @@ class BuildAndPushTest(unittest.TestCase):
         self.assertEqual(push_cmd, ["docker", "push", "gcr.io/p/repo/img:tag"])
 
 
+class FakeDataPlaneArgsTest(unittest.TestCase):
+    def test_absent(self):
+        self.assertEqual(util.fake_data_plane_args(None), [])
+
+    def test_empty_block_selects_the_mode(self):
+        self.assertEqual(util.fake_data_plane_args({}), ["--fake-data-plane"])
+
+    def test_every_key(self):
+        self.assertEqual(
+            util.fake_data_plane_args({
+                "nodes": 4,
+                "run": "nightly",
+                "delay": "250ms",
+            }),
+            [
+                "--fake-data-plane",
+                "--fake-nodes", "4",
+                "--fake-run", "nightly",
+                "--fake-delay", "250ms",
+            ],
+        )
+
+    def test_invalid(self):
+        for block in (
+            {"node": 4},
+            {"nodes": 0},
+            {"nodes": "4"},
+            {"nodes": True},
+            {"workersPerNode": 100},
+            ["nodes"],
+        ):
+            with self.subTest(block=block), self.assertRaises(ValueError):
+                util.fake_data_plane_args(block)
+
+
 if __name__ == "__main__":
     unittest.main()

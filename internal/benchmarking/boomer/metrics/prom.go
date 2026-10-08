@@ -29,6 +29,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// latencyBuckets run from 0.1 ms to about 52 s: a hot-path control-plane RPC
+// takes around a millisecond, so a first bucket at 1 ms would hide its p50.
+var latencyBuckets = prometheus.ExponentialBuckets(0.1, 2, 20)
+
 var (
 	requestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -42,9 +46,18 @@ var (
 		prometheus.HistogramOpts{
 			Name:    "locust_request_duration_milliseconds",
 			Help:    "Request latency in milliseconds, by method/name/status/user_class.",
-			Buckets: prometheus.ExponentialBuckets(1, 2, 16),
+			Buckets: latencyBuckets,
 		},
 		[]string{"method", "name", "status", "user_class"},
+	)
+
+	serverDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "locust_server_duration_milliseconds",
+			Help:    "Server-side latency in milliseconds, read from the response trailer or header, by method/name/user_class.",
+			Buckets: latencyBuckets,
+		},
+		[]string{"method", "name", "user_class"},
 	)
 
 	activeUsers = prometheus.NewGaugeVec(
@@ -57,7 +70,7 @@ var (
 )
 
 func init() {
-	prometheus.MustRegister(requestsTotal, requestDuration, activeUsers)
+	prometheus.MustRegister(requestsTotal, requestDuration, serverDuration, activeUsers)
 }
 
 // Serve starts a /metrics HTTP server on addr. Returns when the server stops
@@ -84,20 +97,29 @@ func Serve(ctx context.Context, addr string) error {
 }
 
 // RecordSuccess reports a successful request to both boomer (→ locust master
-// via ZMQ) and the local Prometheus surface.
+// via ZMQ) and the local Prometheus surface. Boomer takes whole milliseconds,
+// so the locust stats truncate; Prometheus gets the fractional value.
 func RecordSuccess(method, name, userClass string, latency time.Duration, responseBytes int64) {
-	ms := latency.Milliseconds()
-	boomer.RecordSuccess(method, name, ms, responseBytes)
+	boomer.RecordSuccess(method, name, latency.Milliseconds(), responseBytes)
 	requestsTotal.WithLabelValues(method, name, "success", userClass).Inc()
-	requestDuration.WithLabelValues(method, name, "success", userClass).Observe(float64(ms))
+	requestDuration.WithLabelValues(method, name, "success", userClass).Observe(msFloat(latency))
 }
 
 // RecordFailure reports a failed request to both boomer and Prometheus.
 func RecordFailure(method, name, userClass string, latency time.Duration, errMsg string) {
-	ms := latency.Milliseconds()
-	boomer.RecordFailure(method, name, ms, errMsg)
+	boomer.RecordFailure(method, name, latency.Milliseconds(), errMsg)
 	requestsTotal.WithLabelValues(method, name, "failure", userClass).Inc()
-	requestDuration.WithLabelValues(method, name, "failure", userClass).Observe(float64(ms))
+	requestDuration.WithLabelValues(method, name, "failure", userClass).Observe(msFloat(latency))
+}
+
+// RecordServerLatency reports the server's own elapsed time for a request,
+// to Prometheus only: locust has one latency per request, the client's.
+func RecordServerLatency(method, name, userClass string, latency time.Duration) {
+	serverDuration.WithLabelValues(method, name, userClass).Observe(msFloat(latency))
+}
+
+func msFloat(d time.Duration) float64 {
+	return float64(d) / float64(time.Millisecond)
 }
 
 // UpdateUsers shifts the active-users gauge for a class by delta (positive on

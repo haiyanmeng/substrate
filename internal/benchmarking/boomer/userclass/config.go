@@ -53,4 +53,8 @@ type Config struct {
 	SpawnConcurrency int
 	// ActorDeadline is the per-actor timeout covering CreateActor + ResumeActor + Ping (spawn benchmark).
 	ActorDeadline time.Duration
+	// Actors is the size of a fleet shared by every VU, for user classes
+	// whose actor count is independent of the user count (resumecold).
+	// Classes that give each VU its own actors ignore it.
+	Actors int
 }

@@ -13,12 +13,15 @@
 // limitations under the License.
 
 // Package fakeworker holds what the two programs of the benchmark fake data
-// plane share: how a fake Worker is named and placed.
+// plane share: how a fake Worker is named and placed, and how each checks the
+// other's identity on the capacity relay between them.
 package fakeworker
 
 import (
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -30,6 +33,14 @@ import (
 // MaxRunLength bounds the run prefix so every generated name stays well inside
 // the 63-character limit on Worker names.
 const MaxRunLength = 8
+
+// DefaultMaxActors is how many actors a fake Worker holds, the default of
+// ateom's --max-actors, which no WorkerPool field sets for a real worker.
+const DefaultMaxActors = 1000
+
+// MaxActorsAnnotation, on a WorkerPool, overrides DefaultMaxActors for that
+// pool's fake Workers.
+const MaxActorsAnnotation = "ate.dev/fake-max-actors"
 
 // WorkerPoolLabel is the label key the WorkerPool controller selects a pool's
 // worker pods by; a fake pool's status.selector names it the same way.
@@ -96,4 +107,18 @@ func PodUID(name string) string {
 // 254 Workers, which ate-api-server allows.
 func IP(index int) string {
 	return "192.0.2." + strconv.Itoa(index%254+1)
+}
+
+// VerifyPeerID checks that the peer's leaf certificate carries the SPIFFE ID
+// want. It complements the chain verification done against the pod-identity
+// trust bundle: the chain proves the signer, this proves which workload.
+func VerifyPeerID(cs tls.ConnectionState, want string) error {
+	if len(cs.PeerCertificates) == 0 {
+		return errors.New("peer presented no certificate")
+	}
+	leaf := cs.PeerCertificates[0]
+	if len(leaf.URIs) == 0 || leaf.URIs[0].String() != want {
+		return fmt.Errorf("peer SPIFFE ID %v is not %q", leaf.URIs, want)
+	}
+	return nil
 }

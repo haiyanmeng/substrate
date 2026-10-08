@@ -53,7 +53,7 @@ from typing import Any
 import yaml
 
 from testtypes import TYPES
-from util import parse_duration_seconds, run, run_no_check
+from util import fake_data_plane_args, parse_duration_seconds, run, run_no_check
 
 
 SUBSTRATE_DIR = "/workspace/substrate"
@@ -319,6 +319,7 @@ def validate_and_normalize_tests(tests: list[dict[str, Any]]) -> None:
                 f"(want one of {list(TEST_TYPES)})"
             )
         TYPES[ttype].validate(t)
+        fake_data_plane_args(t.get("fakeDataPlane"))
 
 
 def deploy_substrate(ate_args: Iterable[str] = ()) -> None:
@@ -349,6 +350,7 @@ def deploy_workloads(
     actor_memory: str = "",
     wait_timeout_secs: int | str = "",
     worker_memory: str = "",
+    fake_data_plane: dict | None = None,
 ) -> None:
     cmd = [
         "benchmarking/workloads/deploy.sh",
@@ -370,6 +372,10 @@ def deploy_workloads(
     # (whole seconds).
     if wait_timeout_secs != "":
         cmd += ["--wait-timeout", str(wait_timeout_secs)]
+    # A fakeDataPlane block replaces the WorkerPool with fake-atelet and
+    # fake-workersync. teardown_workloads needs no matching flag: deploy.sh
+    # --delete undoes a fake data plane whenever it finds one.
+    cmd += fake_data_plane_args(fake_data_plane)
     # deploy.sh itself blocks until every template's golden snapshot exists.
     run(cmd)
 
@@ -546,6 +552,7 @@ def main() -> None:
                     test.get("actorMemory", ""),
                     test.get("workerWaitTimeout", ""),
                     test.get("workerMemory", ""),
+                    test.get("fakeDataPlane"),
                 )
                 try:
                     status = run_test(
