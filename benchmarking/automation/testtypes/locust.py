@@ -48,6 +48,9 @@ ATEAPI_DEFAULTS = {
     # Load pg_stat_statements and run postgres_exporter next to Postgres,
     # for Prometheus (benchmarking/monitoring.yaml) to scrape.
     "pgStats": True,
+    # Postgres settings as name=value, passed to the server as -c flags in
+    # the restart pgStats makes, over postgresql.conf.
+    "postgresArgs": [],
     # Label one node for ateapi, which holds every replica, and another for
     # the runner, away from the Postgres node, and pin each there. The runner
     # prefers the node pool reserved for load generators.
@@ -92,6 +95,19 @@ def validate(test: dict[str, Any]) -> None:
     for knob in ("pgStats", "pinNodes"):
         if not isinstance(cfg[knob], bool):
             raise ValueError(f"locust test {name!r} ateapi.{knob} must be a bool")
+    args = cfg["postgresArgs"]
+    if not isinstance(args, list) or not all(
+        isinstance(a, str) and POSTGRES_ARG_PATTERN.fullmatch(a) for a in args
+    ):
+        raise ValueError(
+            f"locust test {name!r} ateapi.postgresArgs must be a list of "
+            f"name=value settings, as in commit_delay=100"
+        )
+    if args and not cfg["pgStats"]:
+        raise ValueError(
+            f"locust test {name!r} ateapi.postgresArgs needs pgStats: true, "
+            f"whose Postgres restart applies them"
+        )
     # The cordoned install keeps ate-api-server on the tainted control-plane
     # pool, and pinNodes gives it only an untainted node: no node is both.
     if cfg["pinNodes"] and any(
@@ -115,6 +131,11 @@ def _is_quantity(v: Any) -> bool:
     if isinstance(v, (int, float)):
         return v > 0
     return isinstance(v, str) and bool(QUANTITY_PATTERN.fullmatch(v))
+
+
+# A Postgres setting as postgresArgs spells it: a lowercase name, an equals
+# sign, and a value with no whitespace, which the -c flag takes as is.
+POSTGRES_ARG_PATTERN = re.compile(r"[a-z_]+=\S+")
 
 
 # A non-negative Kubernetes quantity: a decimal number with a binary-SI
@@ -143,7 +164,7 @@ def pre_test(test: dict[str, Any]) -> None:
     # Postgres first: enabling statistics restarts it, and the restarted pod
     # may land on another node, which the roles must then avoid.
     if cfg["pgStats"]:
-        enable_postgres_stats()
+        enable_postgres_stats(cfg["postgresArgs"])
     if cfg["pinNodes"]:
         label_nodes(cfg, test.get("runnerCpu", DEFAULT_RUNNER_CPU))
     if cfg["poolMaxConns"] is not None:
@@ -273,10 +294,23 @@ def role_affinity(role: str) -> dict[str, Any]:
 POSTGRES_EXPORTER_IMAGE = "quay.io/prometheuscommunity/postgres-exporter:v0.17.1"
 
 
-def enable_postgres_stats() -> None:
-    """Load pg_stat_statements and add a postgres_exporter sidecar, which
-    reaches the server over the pod's unix socket (trusted by pg_hba). One
-    patch, thus one Postgres restart, before ateapi rolls."""
+def postgres_args(settings: list[str]) -> list[str]:
+    """The postgres container's args: the base manifest's config_file, which
+    a strategic merge would otherwise drop, pg_stat_statements, then each of
+    settings as a -c flag, which overrides postgresql.conf."""
+    args = [
+        "-c", "config_file=/etc/postgresql/postgresql.conf",
+        "-c", "shared_preload_libraries=pg_stat_statements",
+    ]
+    for setting in settings:
+        args += ["-c", setting]
+    return args
+
+
+def enable_postgres_stats(settings: list[str]) -> None:
+    """Load pg_stat_statements, apply settings, and add a postgres_exporter
+    sidecar, which reaches the server over the pod's unix socket (trusted by
+    pg_hba). One patch, thus one Postgres restart, before ateapi rolls."""
     patch = {
         "spec": {
             "template": {
@@ -284,12 +318,8 @@ def enable_postgres_stats() -> None:
                     "containers": [
                         {
                             "name": "postgres",
-                            # Strategic merge replaces args whole; repeat the
-                            # base manifest's config_file.
-                            "args": [
-                                "-c", "config_file=/etc/postgresql/postgresql.conf",
-                                "-c", "shared_preload_libraries=pg_stat_statements",
-                            ],
+                            # Strategic merge replaces args whole.
+                            "args": postgres_args(settings),
                         },
                         {
                             "name": "postgres-exporter",

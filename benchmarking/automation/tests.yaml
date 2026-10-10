@@ -951,6 +951,111 @@ tests:
       - "--ladder"
       - "6000:3m@2500,6000:3m@3000,6000:3m@3500,6000:3m@4000,6000:3m@4500,6000:3m@5000"
 
+  # The 2 x 8 CPU test against three Postgres setups, to lift the commit
+  # path that stops it at about 3670/s: size10 Postgres; size0 with size10's
+  # WAL and checkpoint settings; and those plus group commit. Each times its
+  # WAL I/O, so pg_stat_io shows the fsync rate and latency.
+  - name: ateapi_cold_resume_pause_fake_2x8cpu_size10
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 2 ate-api-server replicas at 8 CPUs, size10 Postgres: rate ladder 2500-5000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 20m
+    users: 6000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    ateArgs: ["--cluster-size=size10"]
+    fakeDataPlane:
+      nodes: 3
+      delay: 150ms
+    ateapi:
+      cpu: 8
+      replicas: 2
+      memory: 4Gi
+      poolMaxConns: 40
+      postgresArgs:
+        - track_wal_io_timing=on
+    flags:
+      - "--total-actors"
+      - "6000"
+      - "--ladder-spawn-rate"
+      - "6000"
+      - "--ladder"
+      - "6000:3m@2500,6000:3m@3000,6000:3m@3500,6000:3m@4000,6000:3m@4500,6000:3m@5000"
+  # size0's compiled-in 1GB max_wal_size checkpoints every half minute or so
+  # at this test's WAL rate, and its wal_buffers is 4MB, 1/32 of the 128MB
+  # shared_buffers; these are size10's values.
+  - name: ateapi_cold_resume_pause_fake_2x8cpu_walconf
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 2 ate-api-server replicas at 8 CPUs, size0 Postgres with size10's WAL settings: rate ladder 2500-5000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 20m
+    users: 6000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    fakeDataPlane:
+      nodes: 3
+      delay: 150ms
+    ateapi:
+      cpu: 8
+      replicas: 2
+      memory: 4Gi
+      poolMaxConns: 40
+      postgresArgs:
+        - max_wal_size=16GB
+        - min_wal_size=4GB
+        - checkpoint_completion_target=0.9
+        - wal_buffers=64MB
+        - wal_compression=on
+        - track_wal_io_timing=on
+    flags:
+      - "--total-actors"
+      - "6000"
+      - "--ladder-spawn-rate"
+      - "6000"
+      - "--ladder"
+      - "6000:3m@2500,6000:3m@3000,6000:3m@3500,6000:3m@4000,6000:3m@4500,6000:3m@5000"
+  # The WAL flush runs back to back, so a commit that waits commit_delay
+  # (microseconds) before flushing, when commit_siblings other transactions
+  # are open, lets more commits share each fsync.
+  - name: ateapi_cold_resume_pause_fake_2x8cpu_walconf_commitdelay
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 2 ate-api-server replicas at 8 CPUs, size0 Postgres with size10's WAL settings and group commit: rate ladder 2500-5000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 20m
+    users: 6000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    fakeDataPlane:
+      nodes: 3
+      delay: 150ms
+    ateapi:
+      cpu: 8
+      replicas: 2
+      memory: 4Gi
+      poolMaxConns: 40
+      postgresArgs:
+        - max_wal_size=16GB
+        - min_wal_size=4GB
+        - checkpoint_completion_target=0.9
+        - wal_buffers=64MB
+        - wal_compression=on
+        - commit_delay=100
+        - commit_siblings=5
+        - track_wal_io_timing=on
+    flags:
+      - "--total-actors"
+      - "6000"
+      - "--ladder-spawn-rate"
+      - "6000"
+      - "--ladder"
+      - "6000:3m@2500,6000:3m@3000,6000:3m@3500,6000:3m@4000,6000:3m@4500,6000:3m@5000"
+
   # 1,000,000 actors on 1000 fake Workers, against size10 Postgres (80 vCPU,
   # 140Gi, max_connections=300). Each ate-api-server replica opens its pool
   # plus 5 owner and watch connections, so 10 replicas at a pool of 20 hold

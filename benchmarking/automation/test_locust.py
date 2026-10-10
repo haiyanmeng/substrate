@@ -58,6 +58,7 @@ class ValidateTest(unittest.TestCase):
         self.assertEqual(cfg["memory"], "4Gi")
         self.assertIsNone(cfg["poolMaxConns"])
         self.assertTrue(cfg["pgStats"])
+        self.assertEqual(cfg["postgresArgs"], [])
         self.assertTrue(cfg["pinNodes"])
 
     def test_valid_knobs(self):
@@ -67,6 +68,8 @@ class ValidateTest(unittest.TestCase):
             ateapi={"cpu": "1500m", "memory": "8Gi", "replicas": 2,
                     "poolMaxConns": 16, "pgStats": False, "pinNodes": False},
         ))
+        locust.validate(entry(ateapi={
+            "cpu": 2, "postgresArgs": ["commit_delay=100", "max_wal_size=16GB"]}))
 
     def test_invalid(self):
         bad = [
@@ -82,6 +85,13 @@ class ValidateTest(unittest.TestCase):
             {"ateapi": {"cpu": 2, "pgStats": "yes"}},
             {"ateapi": {"cpu": 2, "pinNodes": "yes"}},
             {"ateapi": {"cpu": 2, "memory": "4 GiB"}},
+            {"ateapi": {"cpu": 2, "postgresArgs": "commit_delay=100"}},
+            {"ateapi": {"cpu": 2, "postgresArgs": ["commit_delay"]}},
+            {"ateapi": {"cpu": 2, "postgresArgs": ["commit_delay = 100"]}},
+            {"ateapi": {"cpu": 2, "postgresArgs": ["-c commit_delay=100"]}},
+            {"ateapi": {"cpu": 2, "postgresArgs": [100]}},
+            # The settings ride on the restart pgStats makes.
+            {"ateapi": {"cpu": 2, "pgStats": False, "postgresArgs": ["commit_delay=100"]}},
         ]
         for fields in bad:
             with self.assertRaises(ValueError, msg=repr(fields)):
@@ -220,6 +230,34 @@ class PreTestTest(unittest.TestCase):
             [c for c in calls if c != "run_no_check"],
             ["enable_postgres_stats", "label_nodes", "set_pool_max_conns", "pin_ateapi"],
         )
+
+
+class PostgresArgsTest(unittest.TestCase):
+    def test_base_args_first_then_settings(self):
+        self.assertEqual(
+            locust.postgres_args(["commit_delay=100", "wal_buffers=64MB"]),
+            [
+                "-c", "config_file=/etc/postgresql/postgresql.conf",
+                "-c", "shared_preload_libraries=pg_stat_statements",
+                "-c", "commit_delay=100",
+                "-c", "wal_buffers=64MB",
+            ],
+        )
+
+    def test_pre_test_passes_the_settings(self):
+        got = []
+        stubs = {
+            "enable_postgres_stats": lambda settings: got.append(settings),
+            "label_nodes": lambda *_: None,
+            "pin_ateapi": lambda *_: None,
+            "run_no_check": lambda *_: None,
+        }
+        for name, fake in stubs.items():
+            patcher = mock.patch.object(locust, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        locust.pre_test(entry(ateapi={"cpu": 2, "postgresArgs": ["commit_delay=100"]}))
+        self.assertEqual(got, [["commit_delay=100"]])
 
 
 class PoolMaxConnsTest(unittest.TestCase):
