@@ -895,6 +895,62 @@ tests:
       - "--ladder"
       - "6000:3m@2500,6000:3m@3000,6000:3m@3500,6000:3m@4000,6000:3m@4500,6000:3m@5000"
 
+  # Three and four 4 CPU replicas, 12 and 16 CPUs in all: whether replicas
+  # keep scaling as 2 x 4 matched 1 x 8. Each replica holds its pool plus 5
+  # owner and watch connections within size0's 100, so the pools are 26 and
+  # 18. 4 x 4 has the CPUs and the ladder of 2 x 8, which Postgres's commit
+  # path stopped at about 3670/s.
+  - name: ateapi_cold_resume_pause_fake_3x4cpu
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 3 ate-api-server replicas at 4 CPUs: rate ladder 2000-4500 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 20m
+    users: 6000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    fakeDataPlane:
+      nodes: 3
+      delay: 150ms
+    ateapi:
+      cpu: 4
+      replicas: 3
+      memory: 4Gi
+      poolMaxConns: 26
+    flags:
+      - "--total-actors"
+      - "6000"
+      - "--ladder-spawn-rate"
+      - "6000"
+      - "--ladder"
+      - "6000:3m@2000,6000:3m@2500,6000:3m@3000,6000:3m@3500,6000:3m@4000,6000:3m@4500"
+  - name: ateapi_cold_resume_pause_fake_4x4cpu
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 4 ate-api-server replicas at 4 CPUs: rate ladder 2500-5000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 20m
+    users: 6000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    fakeDataPlane:
+      nodes: 3
+      delay: 150ms
+    ateapi:
+      cpu: 4
+      replicas: 4
+      memory: 4Gi
+      poolMaxConns: 18
+    flags:
+      - "--total-actors"
+      - "6000"
+      - "--ladder-spawn-rate"
+      - "6000"
+      - "--ladder"
+      - "6000:3m@2500,6000:3m@3000,6000:3m@3500,6000:3m@4000,6000:3m@4500,6000:3m@5000"
+
   # 1,000,000 actors on 1000 fake Workers, against size10 Postgres (80 vCPU,
   # 140Gi, max_connections=300). Each ate-api-server replica opens its pool
   # plus 5 owner and watch connections, so 10 replicas at a pool of 20 hold
