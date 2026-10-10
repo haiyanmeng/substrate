@@ -134,7 +134,7 @@ func (r *runtime) startFleet(ctx context.Context) error {
 
 	// Bounds the RPCs in flight while warming: each first resume is a cold
 	// start on a worker, and a few hundred at once would queue in ateapi.
-	const warmParallelism = 16
+	const warmParallelism = 500
 	sem := make(chan struct{}, warmParallelism)
 	var wg sync.WaitGroup
 	for range n {
