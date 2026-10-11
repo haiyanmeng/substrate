@@ -14,7 +14,9 @@
 
 """Unit tests for orchestrator.py: python3 benchmarking/automation/test_orchestrator.py"""
 
+import json
 import os
+import subprocess
 import unittest
 from unittest import mock
 
@@ -129,6 +131,88 @@ class JobNameTest(unittest.TestCase):
             orchestrator.job_name(test, self.COMMIT),
             orchestrator.job_name(test, self.COMMIT),
         )
+
+
+
+def completed(stdout="", returncode=0, stderr=""):
+    return mock.Mock(stdout=stdout, returncode=returncode, stderr=stderr)
+
+
+JOB_SUCCEEDED = completed(json.dumps({"status": {"succeeded": 1}}))
+JOB_RUNNING = completed(json.dumps({"status": {"active": 1}}))
+CREDENTIALS_DOWN = completed(returncode=1, stderr="getting credentials: exec failed")
+
+
+class WaitForJobTest(unittest.TestCase):
+    """wait_for_job against a fake clock: time.sleep advances it."""
+
+    def setUp(self):
+        self.now = 0.0
+        for target, fake in {
+            "orchestrator.time.time": lambda: self.now,
+            "orchestrator.time.sleep": self.sleep,
+        }.items():
+            patcher = mock.patch(target, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def polls(self, *results):
+        """Patch kubectl to answer each poll with the next result; the last
+        repeats. A result that is an exception is raised instead."""
+        answers = list(results)
+
+        def run(*_, **kwargs):
+            self.assertIn("timeout", kwargs, "every poll must be bounded")
+            answer = answers.pop(0) if len(answers) > 1 else answers[0]
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        patcher = mock.patch("orchestrator.subprocess.run", side_effect=run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_succeeds(self):
+        self.polls(JOB_RUNNING, JOB_RUNNING, JOB_SUCCEEDED)
+        self.assertEqual(orchestrator.wait_for_job("j", 600), "complete")
+
+    def test_a_hung_poll_is_cut_off_and_retried(self):
+        self.polls(subprocess.TimeoutExpired("kubectl", 60), JOB_SUCCEEDED)
+        self.assertEqual(orchestrator.wait_for_job("j", 600), "complete")
+
+    def test_failing_polls_fall_back_to_the_uploaded_results(self):
+        self.polls(CREDENTIALS_DOWN)
+        asked = []
+
+        def uploaded():
+            asked.append(self.now)
+            return "complete" if len(asked) >= 2 else None
+
+        self.assertEqual(orchestrator.wait_for_job("j", 3600, uploaded), "complete")
+        # First asked once polls had failed for UPLOAD_CHECK_AFTER_S, then
+        # again no sooner than UPLOAD_CHECK_EVERY_S later.
+        self.assertGreaterEqual(asked[0], orchestrator.UPLOAD_CHECK_AFTER_S)
+        self.assertGreaterEqual(asked[1] - asked[0], orchestrator.UPLOAD_CHECK_EVERY_S)
+        self.assertLess(self.now, 3600)
+
+    def test_recovered_polls_restart_the_failure_clock(self):
+        # Failures shorter than UPLOAD_CHECK_AFTER_S, apart, never ask.
+        short = [CREDENTIALS_DOWN] * 10 + [JOB_RUNNING]
+        self.polls(*short, *short, JOB_SUCCEEDED)
+        uploaded = mock.Mock(return_value="complete")
+        self.assertEqual(orchestrator.wait_for_job("j", 3600, uploaded), "complete")
+        uploaded.assert_not_called()
+
+    def test_the_deadline_asks_once_more(self):
+        self.polls(JOB_RUNNING)
+        self.assertEqual(orchestrator.wait_for_job("j", 60, lambda: "failed"), "failed")
+
+    def test_timeout_without_uploaded_results(self):
+        self.polls(CREDENTIALS_DOWN)
+        self.assertEqual(orchestrator.wait_for_job("j", 900), "timeout")
 
 
 if __name__ == "__main__":
