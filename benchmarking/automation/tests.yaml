@@ -1090,6 +1090,39 @@ tests:
       - "8000"
       - "--ladder"
       - "8000:3m@3000,8000:3m@3500,8000:3m@4000,8000:3m@4500,8000:3m@5000,8000:3m@5500,8000:3m@6000,8000:3m@6500"
+  # Four 8 CPU replicas, 32 CPUs in all, against size10 Postgres: the next
+  # point after 3 x 8 on whether the ceiling keeps rising with
+  # ate-api-server's CPU, toward about 7300/s if it doubles 2 x 8's. The pools
+  # stay at 40, 4 x (40 + 5) = 180 of size10's 300 connections, and the
+  # runner gets the 16 CPUs the 1M-actor runs used at about 7000/s.
+  - name: ateapi_cold_resume_pause_fake_4x8cpu_size10
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 4 ate-api-server replicas at 8 CPUs, size10 Postgres: rate ladder 4000-8000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 29m
+    users: 10000
+    workerCount: 200
+    runnerCpu: "16"
+    runnerMemory: "4Gi"
+    ateArgs: ["--cluster-size=size10"]
+    fakeDataPlane:
+      nodes: 3
+      delay: 150ms
+    ateapi:
+      cpu: 8
+      replicas: 4
+      memory: 4Gi
+      poolMaxConns: 40
+      postgresArgs:
+        - track_wal_io_timing=on
+    flags:
+      - "--total-actors"
+      - "10000"
+      - "--ladder-spawn-rate"
+      - "10000"
+      - "--ladder"
+      - "10000:3m@4000,10000:3m@4500,10000:3m@5000,10000:3m@5500,10000:3m@6000,10000:3m@6500,10000:3m@7000,10000:3m@7500,10000:3m@8000"
 
   # 1,000,000 actors on 1000 fake Workers, against size10 Postgres (80 vCPU,
   # 140Gi, max_connections=300). Each ate-api-server replica opens its pool
