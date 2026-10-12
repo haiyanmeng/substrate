@@ -590,7 +590,6 @@ def main() -> None:
     )
 
     files: list[tuple[Path, str]] = [
-        (status_path, "status.json"),
         (logs_path, "logs.txt"),
         (traces_path, "traces.txt"),
         (jsonl_path, "stats.jsonl"),
@@ -601,6 +600,9 @@ def main() -> None:
         (server_summary_json, "server_summary.json"),
         # TODO: remove after data migration
         (jsonl_path, f"{args.name}.jsonl"),
+        # Last, so that a reader finding it knows every file is in place
+        # (testtypes/locust.py results_uploaded).
+        (status_path, "status.json"),
     ]
     for src, basename in files:
         if not src.exists():

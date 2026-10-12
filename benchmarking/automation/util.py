@@ -65,3 +65,51 @@ def parse_duration_seconds(s: str) -> int:
     n = int(m.group(1))
     unit = m.group(2) or "s"
     return n * {"s": 1, "m": 60, "h": 3600}[unit]
+
+
+# The keys of a tests.yaml fakeDataPlane block and the
+# benchmarking/workloads/deploy.sh flag each one sets.
+FAKE_DATA_PLANE_FLAGS = {
+    "nodes": "--fake-nodes",
+    "run": "--fake-run",
+    "delay": "--fake-delay",
+}
+
+
+# What deploy.sh accepts for --fake-run, and a Go duration for --fake-delay,
+# as fake-atelet parses it.
+FAKE_RUN_PATTERN = re.compile(r"[a-z0-9]{1,8}")
+FAKE_DELAY_PATTERN = re.compile(r"0|([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+")
+
+
+def fake_data_plane_args(block: dict | None) -> list[str]:
+    """Return the deploy.sh flags for a tests.yaml fakeDataPlane block, or
+    none when the entry has no block. Raises ValueError on an unknown key or
+    a value deploy.sh would reject, so a bad entry fails before any cluster
+    work rather than in deploy.sh."""
+    if block is None:
+        return []
+    if not isinstance(block, dict):
+        raise ValueError(f"fakeDataPlane must be a mapping, got {block!r}")
+    unknown = sorted(set(block) - set(FAKE_DATA_PLANE_FLAGS))
+    if unknown:
+        raise ValueError(
+            f"fakeDataPlane has unknown keys {unknown} "
+            f"(want some of {sorted(FAKE_DATA_PLANE_FLAGS)})"
+        )
+    args = ["--fake-data-plane"]
+    for key, flag in FAKE_DATA_PLANE_FLAGS.items():
+        if key not in block:
+            continue
+        value = block[key]
+        if key == "nodes":
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"fakeDataPlane.{key} must be a positive integer, got {value!r}")
+        elif key == "run":
+            if not isinstance(value, str) or not FAKE_RUN_PATTERN.fullmatch(value):
+                raise ValueError(f"fakeDataPlane.{key} must be 1 to 8 lowercase letters or digits, got {value!r}")
+        elif key == "delay":
+            if not isinstance(value, str) or not FAKE_DELAY_PATTERN.fullmatch(value):
+                raise ValueError(f"fakeDataPlane.{key} must be a duration string such as 500ms, got {value!r}")
+        args += [flag, str(value)]
+    return args

@@ -46,14 +46,14 @@ import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from testtypes import TYPES
-from util import parse_duration_seconds, run, run_no_check
+from util import fake_data_plane_args, parse_duration_seconds, run, run_no_check
 
 
 SUBSTRATE_DIR = "/workspace/substrate"
@@ -268,26 +268,76 @@ def wait_for_no_active_runners(timeout: int = 300) -> None:
     )
 
 
-def wait_for_job(name: str, timeout_seconds: int) -> str:
+# A poll's kubectl gets this long for its API request. kubectl's exec
+# credential plugin can retry for hours when it cannot get a token, before any
+# request is made, so the subprocess is bounded too.
+KUBECTL_POLL_TIMEOUT_S = 30
+# After polls have failed this long in a row, wait_for_job asks whether the
+# runner already uploaded its results, and again this often after that.
+UPLOAD_CHECK_AFTER_S = 300
+UPLOAD_CHECK_EVERY_S = 120
+# How often a run of failed polls is logged, so an outage does not flood the log.
+POLL_FAILURE_LOG_EVERY_S = 300
+
+
+def wait_for_job(
+    name: str,
+    timeout_seconds: int,
+    uploaded: Callable[[], str | None] = lambda: None,
+) -> str:
+    """Poll the Job until it succeeds or fails, or timeout_seconds pass.
+
+    A failed poll, as when kubectl cannot get credentials, is retried. Once
+    polls have failed for UPLOAD_CHECK_AFTER_S in a row, and once more at the
+    deadline, uploaded() is asked whether the runner already wrote its
+    results; a "complete" or "failed" answer ends the wait.
+    """
     start = time.time()
+    failing_since = last_logged = last_checked = None
     while time.time() - start < timeout_seconds:
-        r = subprocess.run(
-            ["kubectl", "get", "job", name, "-n", NAMESPACE, "-o", "json"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if r.returncode != 0:
-            print(f"kubectl get job failed: {r.stderr}", flush=True)
-            time.sleep(5)
+        try:
+            r = subprocess.run(
+                ["kubectl", "get", "job", name, "-n", NAMESPACE, "-o", "json",
+                 f"--request-timeout={KUBECTL_POLL_TIMEOUT_S}s"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2 * KUBECTL_POLL_TIMEOUT_S,
+            )
+            err = r.stderr.strip() if r.returncode != 0 else None
+        except subprocess.TimeoutExpired:
+            r, err = None, f"no answer in {2 * KUBECTL_POLL_TIMEOUT_S}s"
+
+        if err is None:
+            if failing_since is not None:
+                print(f"kubectl get job {name} works again after "
+                      f"{time.time() - failing_since:.0f}s", flush=True)
+            failing_since = last_logged = last_checked = None
+            status = json.loads(r.stdout).get("status", {})
+            if status.get("succeeded", 0) >= 1:
+                return "complete"
+            if status.get("failed", 0) >= 1:
+                return "failed"
+            time.sleep(10)
             continue
-        status = json.loads(r.stdout).get("status", {})
-        if status.get("succeeded", 0) >= 1:
-            return "complete"
-        if status.get("failed", 0) >= 1:
-            return "failed"
-        time.sleep(10)
-    return "timeout"
+
+        now = time.time()
+        if failing_since is None:
+            failing_since = now
+        if last_logged is None or now - last_logged >= POLL_FAILURE_LOG_EVERY_S:
+            print(f"kubectl get job {name} failing for {now - failing_since:.0f}s: "
+                  f"{err[:300]}", flush=True)
+            last_logged = now
+        if now - failing_since >= UPLOAD_CHECK_AFTER_S and (
+            last_checked is None or now - last_checked >= UPLOAD_CHECK_EVERY_S
+        ):
+            last_checked = now
+            if result := uploaded():
+                print(f"Job {name}: the runner uploaded its results ({result}) "
+                      f"while kubectl could not reach the cluster", flush=True)
+                return result
+        time.sleep(15)
+    return uploaded() or "timeout"
 
 
 SANDBOX_CLASSES = ("gvisor", "microvm")
@@ -319,6 +369,7 @@ def validate_and_normalize_tests(tests: list[dict[str, Any]]) -> None:
                 f"(want one of {list(TEST_TYPES)})"
             )
         TYPES[ttype].validate(t)
+        fake_data_plane_args(t.get("fakeDataPlane"))
 
 
 def deploy_substrate(ate_args: Iterable[str] = ()) -> None:
@@ -349,6 +400,7 @@ def deploy_workloads(
     actor_memory: str = "",
     wait_timeout_secs: int | str = "",
     worker_memory: str = "",
+    fake_data_plane: dict | None = None,
 ) -> None:
     cmd = [
         "benchmarking/workloads/deploy.sh",
@@ -370,6 +422,10 @@ def deploy_workloads(
     # (whole seconds).
     if wait_timeout_secs != "":
         cmd += ["--wait-timeout", str(wait_timeout_secs)]
+    # A fakeDataPlane block replaces the WorkerPool with fake-atelet and
+    # fake-workersync. teardown_workloads needs no matching flag: deploy.sh
+    # --delete undoes a fake data plane whenever it finds one.
+    cmd += fake_data_plane_args(fake_data_plane)
     # deploy.sh itself blocks until every template's golden snapshot exists.
     run(cmd)
 
@@ -399,12 +455,16 @@ def run_test(
     subs.update(mod.job_subs(test))
     manifest = render_template(tmpl, subs, test.get("flags", []))
     wait_for_no_active_runners()
+    submitted = time.time()
     print(f"Submitting Job {job}", flush=True)
     subprocess.run(
         ["kubectl", "apply", "-f", "-"], input=manifest, text=True, check=True
     )
     timeout = parse_duration_seconds(test["duration"]) + 1800
-    result = wait_for_job(job, timeout)
+    result = wait_for_job(
+        job, timeout,
+        uploaded=lambda: mod.results_uploaded(test, dest, commit, submitted),
+    )
     print(f"Job {job} result: {result}", flush=True)
     run_no_check(
         ["kubectl", "logs", f"job/{job}", "-n", NAMESPACE, "--tail=500"]
@@ -546,6 +606,7 @@ def main() -> None:
                     test.get("actorMemory", ""),
                     test.get("workerWaitTimeout", ""),
                     test.get("workerMemory", ""),
+                    test.get("fakeDataPlane"),
                 )
                 try:
                     status = run_test(
