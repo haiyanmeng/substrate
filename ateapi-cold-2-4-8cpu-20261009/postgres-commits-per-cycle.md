@@ -6,6 +6,7 @@ Every cold resume benchmark measures 25.0–25.1 Postgres commits per resume + p
 - **Measurements:** `pg_stat_statements` and `pg_stat_database`, scraped by postgres-exporter into the benchmarking Prometheus during the 2026-10-10 size10 runs. These are the pd-ssd run (run_ts 1791638643), the pd-balanced run (1791597772) and the 10,000-Worker run (1791633612).
   - The exporter keeps only each statement's `queryid`, not its text, so the code maps IDs to statements.
   - The IDs are the same in all three runs, because each fresh install creates the schema the same way.
+- **On `main` (`052c3487`, 2026-10-12) a cycle is 24 commits, not 25.** `c4129c94` dropped the pause's re-read of the actor after the release (pause row 9 below): `ensurePausedFinalized` now updates to PAUSED from the `GetActor` it made before the release. The pause is 11 commits, 14 of the 24 are read-only, and the write commits are still 10, so the WAL-flush analysis is unchanged. The store SQL is the same as at `5af49ce9`; workflow line numbers have shifted. The tables below describe `5af49ce9`, the code the benchmarks ran.
 
 ## Summary
 
