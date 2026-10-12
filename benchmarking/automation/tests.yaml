@@ -1245,6 +1245,67 @@ tests:
       - "18000"
       - "--ladder"
       - "18000:3m@5000,18000:3m@5500,18000:3m@6000,18000:3m@6500,18000:3m@7000,18000:3m@7500,18000:3m@8000,18000:3m@8500,18000:3m@9000,18000:3m@9500,18000:3m@10000,18000:3m@10500"
+  # The 7 x 8 and 8 x 8 tests with fake-atelet answering at once instead of
+  # after 150 ms, everything else the same. Without the delay a cycle holds
+  # its actor's lease and its users for far less time, which changes how many
+  # commits are in flight at each WAL flush; the 150 ms runs stopped at about
+  # 8200 cycles/s. The ladders start higher and reach further.
+  - name: ateapi_cold_resume_pause_fake_7x8cpu_size10_nodelay
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane with no fake-atelet delay, 7 ate-api-server replicas at 8 CPUs, size10 Postgres: rate ladder 6000-11000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 35m
+    users: 16000
+    workerCount: 200
+    runnerCpu: "16"
+    runnerMemory: "6Gi"
+    ateArgs: ["--cluster-size=size10"]
+    fakeDataPlane:
+      nodes: 3
+      delay: "0s"
+    ateapi:
+      cpu: 8
+      replicas: 7
+      memory: 4Gi
+      poolMaxConns: 35
+      postgresArgs:
+        - track_wal_io_timing=on
+    flags:
+      - "--total-actors"
+      - "16000"
+      - "--ladder-spawn-rate"
+      - "16000"
+      - "--ladder"
+      - "16000:3m@6000,16000:3m@6500,16000:3m@7000,16000:3m@7500,16000:3m@8000,16000:3m@8500,16000:3m@9000,16000:3m@9500,16000:3m@10000,16000:3m@10500,16000:3m@11000"
+  - name: ateapi_cold_resume_pause_fake_8x8cpu_size10_nodelay
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane with no fake-atelet delay, 8 ate-api-server replicas at 8 CPUs, size10 Postgres: rate ladder 6000-11500 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumecold.py,/app/shapes/ladder_shape.py
+    duration: 38m
+    users: 18000
+    workerCount: 200
+    runnerCpu: "16"
+    runnerMemory: "7Gi"
+    ateArgs: ["--cluster-size=size10"]
+    fakeDataPlane:
+      nodes: 3
+      delay: "0s"
+    ateapi:
+      cpu: 8
+      replicas: 8
+      memory: 4Gi
+      poolMaxConns: 30
+      postgresArgs:
+        - track_wal_io_timing=on
+    flags:
+      - "--total-actors"
+      - "18000"
+      - "--ladder-spawn-rate"
+      - "18000"
+      - "--ladder"
+      - "18000:3m@6000,18000:3m@6500,18000:3m@7000,18000:3m@7500,18000:3m@8000,18000:3m@8500,18000:3m@9000,18000:3m@9500,18000:3m@10000,18000:3m@10500,18000:3m@11000,18000:3m@11500"
 
   # 1,000,000 actors on 1000 fake Workers, against size10 Postgres (80 vCPU,
   # 140Gi, max_connections=300). Each ate-api-server replica opens its pool
