@@ -4,7 +4,8 @@ On size0 Postgres, ate-api-server stopped scaling past two replicas: 4 × 4 CPUs
 
 **Result: the ceiling rises with each replica up to 7, by less each time, and stops there.**
 - **Ceilings:** about 3680, 4930, 5930, 6750, 7340, 8200 and 8150 cycles/s from 2 to 8 replicas. 7 × 8 and 8 × 8 are the same within 1%, at about 205,000 commits/s.
-- **Postgres's WAL flush sets the cap.** More replicas let each fsync carry more commits, about 50 at 2 × 8 and 150 at 6 × 8, but each fsync takes longer as replicas are added, from 0.52 to 0.77 ms, so commits per second level off. Why fsyncs slow down is open: not because each writes more.
+- **Postgres's WAL flush sets the cap.** More replicas let each fsync carry more commits, about 50 at 2 × 8 and 120–160 at 5–8 × 8, but fsyncs also take longer, about 0.5 ms at 2–3 replicas against 0.6–0.8 ms at 5–8, so commits per second level off. At the same configuration fsync latency varies by up to about 30% between runs, and the ceiling with it.
+- **A repeat of the whole series** on 2026-10-12 matched the first runs within about ±2%, except 4 × 8 (−3.3%) and 6 × 8 (+6.7%), whose fsyncs were slower and faster than the first time.
 - **The fake's 150 ms delay is not what limits it.** With fake-atelet answering at once, 7 × 8 reached the same ceiling, about 8100 cycles/s, and 8 × 8 6% less, about 7680.
 - **ate-api-server's CPU does not:** its share in use falls from 85% at 2 × 8 to 71% at 8 × 8.
 - **Each cycle costs more ate-api-server CPU** as replicas are added: 3.67 ms at 2 × 8, 5.6 ms at 8 × 8, 53% more.
@@ -46,6 +47,12 @@ Cluster `nh-prow-parity` (project `haiyanmeng-gke-dev`, 3 × c3-highcpu-88 for t
 - **Ladders:** 7 × 8 ran 6000–11000/s from 00:19 to 00:52 (run_ts 1791764343), and 8 × 8 ran 6000–11500/s from 01:00 to 01:37 (run_ts 1791766842). Local copies are in `results/7x8cpu-size10-nodelay/` and `results/8x8cpu-size10-nodelay/`.
 - **WAL samples:** for every step of both, in `results/8x8cpu-size10-nodelay/wal-io-7x8-and-8x8-nodelay.csv`.
 - **Log:** `~/bench-runs/ateapi-cold-7x8-8x8-nodelay-size10-20261011/orchestrator.log`.
+
+**Repeat of the series**
+- **Tests:** `ateapi_cold_resume_pause_fake_2x8cpu_size10` and `_3x8cpu_size10` to `_8x8cpu_size10`, run back to back at `5c2002bf`, the same test entries as the first runs, on 2026-10-12, 02:13–07:04 UTC (log `~/bench-runs/ateapi-cold-series-9tests-20261012/orchestrator.log`). The same run repeated the size0 1 × 8 and 2 × 8 tests of `summary.md`.
+- **Outcome:** every runner Job completed with no request failed, except 4 × 8, whose substrate install failed: ate-api-server did not become ready before ate-setup's rollout deadline. 4 × 8 was rerun alone, 12:29–13:08 UTC, and completed (log `~/bench-runs/ateapi-cold-4x8-size10-rerun-20261012/orchestrator.log`).
+- **Interruptions:** none. The workstation was held awake; one 16-second credential failure during 7 × 8 was logged and retried by the bounded `wait_for_job`.
+- **Local copies:** `results/repeat-20261012/<test>/`, with each run's `steps.jsonl`. WAL samples for every step are in `results/repeat-20261012/wal-io-series.csv` and, for the 4 × 8 rerun, `results/repeat-20261012/4x8cpu_size10/wal-io-4x8.csv`. They include bytes per fsync for every run.
 
 **Other**
 - **2 × 8 on size10:** `ateapi_cold_resume_pause_fake_2x8cpu_size10`, run_ts 1791671486 at `2a04ee26`, from `summary-2x8-postgres.md`. `2a04ee26`, `3d02ace1` and `f50a785a` differ only in benchmark test definitions and automation, not in ate-api-server code.
@@ -108,8 +115,9 @@ For reference, the 1M-actor 10 × 8 CPU run on size10 (`summary-size10.md`, at `
 - The WAL flush runs back to back at every step of every run, fsyncs taking 96–99% of wall time. Throughput is therefore fsyncs/s times the commits each fsync covers.
 - More replicas keep more Postgres connections active, from 39–48 at 2 × 8 to 138–167 at 6–8 × 8, and so more commits waiting at each flush: about 50 per fsync at 2 × 8, 86 at 4 × 8, 120 at 5 × 8 and 150 at 6 × 8.
 - This is the mechanism `summary-2x8-postgres.md` inferred from 2 × 8 alone; the series shows it directly.
-- But each fsync takes longer as replicas are added: 0.52 ms at 50 commits, 0.55 ms at 86, 0.66 ms at 120 and 0.77 ms at 150. Fsyncs/s fall from about 1,800 to about 1,220.
-- The size of each fsync does not explain the slowdown. In the no-delay runs, where the sampler also recorded WAL bytes, 7 × 8's fsyncs of about 35 KB took 0.60–0.64 ms, 8 × 8's of about 40 KB took 0.77–0.79 ms, and 8 × 8's of 64 KB at 7000/s took 0.75 ms. What slows them is not measured. More backends contending for each flush, with more replicas and more active connections, is a candidate.
+- But fsyncs also took longer in these runs: 0.52 ms at 50 commits, 0.55 ms at 86, 0.66 ms at 120 and 0.77 ms at 150. Fsyncs/s fell from about 1,800 to about 1,220.
+- Part of that is run-to-run variation, not the replica count (see Repeat of the series). In the repeat, fsyncs at the ceiling took 0.48–0.51 ms at 2 and 3 replicas but 0.57–0.68 ms at 4 to 8, in no order: 0.62 at 4 × 8, 0.62–0.65 at 5 × 8, 0.57–0.60 at 6 × 8, 0.66–0.68 at 7 × 8 and 0.61–0.64 at 8 × 8. The first 6 × 8 run's 0.77 ms was the slowest of either series.
+- The size of each fsync does not explain the latency either. Across the no-delay runs and the repeat, which recorded WAL bytes, fsyncs of 18–64 KB took 0.48–0.79 ms with no relation between the two. What sets fsync latency on this volume, and why it is about 0.5 ms at 2–3 replicas but higher at 4 and up, is not measured.
 - Commits per second therefore rise less with each replica, about 92,000, 148,000, 169,000 and 183,000 from 2 to 6 replicas, and stop at about 205,000 at 7 and 8 replicas: 8200 cycles/s at 25 commits per cycle.
 - The 8 × 8 run's one sampled step had 143 commits per fsync at 0.65 ms, a smaller and faster batch than 6 × 8's. It used pools of 30, and one sample is too few to say more.
 
@@ -144,6 +152,23 @@ For reference, the 1M-actor 10 × 8 CPU run on size10 (`summary-size10.md`, at `
 - **8 × 8 is 6% lower without the delay.** Its fsyncs carry more commits (157–161 against 131–139 at 7 × 8) but take longer (0.77–0.79 against 0.60–0.64 ms), so fewer commits get through. One run each, but the gap is several times the run-to-run variation.
 - **Without the delay, latency is the control plane's own.** Below saturation a resume takes 26 ms at 6000/s at 7 × 8 (server p50 11 ms) and 33 ms at 8 × 8, rising to 60–112 ms and 101–221 ms in the steps before the ceiling.
 - **Past the ceiling the calls are served very unevenly.** A resume's server p50 is 23–400 ms but its p90 4.7–7.9 s and p99 11.7–12.6 s, far wider than with the delay (p99 3.2–6.4 s): most calls get through quickly while a few wait many seconds. Where they wait, such as for a pool connection or an actor's lease, these runs do not show.
+
+**The repeat of the series.** Every size10 test was run again on 2026-10-12, with the same test entries:
+
+| ate-api-server | First run | Repeat | Change | Repeat: fsyncs/s at the ceiling | Mean fsync | Commits per fsync | First run's mean fsync |
+|---|---|---|---|---|---|---|---|
+| 2 × 8 | about 3680 | about 3755 (3705–3797) | +2.1% | 1,889–1,976 | 0.48–0.50 ms | 48–49 | 0.52 ms |
+| 3 × 8 | about 4930 | about 5015 (4955–5040) | +1.7% | 1,824–1,885 | 0.50–0.51 ms | 67 | 0.54 ms (at 4000/s) |
+| 4 × 8 | about 5930 | about 5735 (5688–5880) | −3.3% | 1,508–1,547 | 0.61–0.62 ms | 93–97 | 0.54–0.56 ms |
+| 5 × 8 | about 6750 | about 6700 (6659–6870) | −0.7% | 1,430–1,501 | 0.62–0.65 ms | 112–116 | 0.64–0.68 ms |
+| 6 × 8 | about 7340 | about 7830 (7808–7952) | +6.7% | 1,537–1,620 | 0.57–0.60 ms | 121–127 | 0.76–0.78 ms |
+| 7 × 8 | about 8200 | about 8100 (8047–8147) | −1.2% | 1,358–1,414 | 0.66–0.68 ms | 145–147 | not sampled |
+| 8 × 8 | about 8150 | about 8230 (8205–8247) | +1.0% | 1,449–1,506 | 0.61–0.64 ms | 137–142 | 0.65 ms (last step) |
+
+- **The series reproduces.** The ceiling rises with each replica and levels off at about 8100–8250 cycles/s at 7 and 8 replicas, with commits at 200,000–206,000/s and the flush busy 96–98% of the time. ate-api-server's CPU per cycle matched the first runs at every size: 3.5–3.7 ms at 2 × 8, 4.1–4.2 at 3 × 8, 4.4–4.6 at 4 × 8, 4.7–4.8 at 5 × 8, 5.0–5.1 at 6 × 8, 5.2–5.3 at 7 × 8 and 5.4–5.6 at 8 × 8.
+- **Run-to-run variation is about ±2% on this volume**, larger than the ±1% of the size0 2 and 4 CPU repeats in `summary.md`.
+- **The two larger changes follow fsync latency.** 6 × 8's fsyncs took 0.57–0.60 ms against 0.76–0.78 ms the first time, and its ceiling rose 6.7%; 4 × 8's took 0.61–0.62 against 0.54–0.56 ms, and its ceiling fell 3.3%. With the flush running back to back, a slower fsync is a lower ceiling, at the same configuration.
+- **This revises the reading of the first series.** Fsyncs are about 0.5 ms at 2 and 3 replicas and 0.57–0.78 ms at 4 to 8, but within that range their latency varies between runs as much as between replica counts. The first series' steady rise from 0.55 ms at 4 × 8 to 0.77 ms at 6 × 8 was partly that variation. The plateau at 7 and 8 replicas held in both series.
 
 **Postgres's resources have room; its commit path does not.**
 - At most 37.5 of size10's 80 cores and 21.5GiB of its 140Gi, at 7 and 8 × 8.
@@ -335,7 +360,7 @@ From 5 × 8 on, the per-replica column gives the busiest replica and the range o
 
 ## Confidence and limits
 
-- **One run per configuration.** The gains from 2 to 7 replicas are far larger than the about ±1% run-to-run variation; 7 × 8 and 8 × 8 are the same within it. The exact factors rest on single runs.
+- **Two runs per configuration** from 2 × 8 to 8 × 8 (one for the no-delay tests). Run-to-run variation is about ±2%, up to 6.7% when fsync latency differs between runs. The gains from 2 to 7 replicas are far larger than that; 7 × 8 and 8 × 8 are the same within it in both series. The tables and per-step data above are from the first series; the repeat's are in `results/repeat-20261012/`.
 - **Measured directly:** the flush's busy share, fsync latency and commits per fsync, with `track_wal_io_timing` on:
   - every step of 4 × 8, 5 × 8 and 6 × 8, and of both no-delay runs
   - the steps through 4000/s of 3 × 8
@@ -345,7 +370,7 @@ From 5 × 8 on, the per-replica column gives the busiest replica and the range o
 - **Run interruptions:** 7 × 8 and 8 × 8 ran while their orchestrator was suspended or gone. Their runners and Prometheus, which produced every figure here except the WAL samples, ran in the cluster and were unaffected.
 - **Inferred:**
   - that larger batches come from more commits in flight, from the matching rise in active connections and `WALWrite` waits across the runs
-  - why fsyncs slow down with more replicas: bytes per fsync, recorded in the no-delay runs, do not explain it
+  - what sets fsync latency, about 0.5 ms at 2–3 replicas and 0.57–0.78 ms at 4–8, varying between runs at the same configuration; bytes per fsync do not explain it
   - that the flush sets the 7 × 8 and 8 × 8 ceiling, from the cap on commits per second continuing the trend of the sampled runs and from ate-api-server's and Postgres's idle CPU; neither run has WAL samples at its saturated steps but the last of 8 × 8
   - why the busiest replica at 2 to 4 replicas uses more CPU than the others
 - **Scope:**
@@ -356,6 +381,6 @@ From 5 × 8 on, the per-replica column gives the busiest replica and the range o
 ## Next steps
 
 1. **The 7 × 8 test on `dee31f7f`** (branch `actor-update-in-worker-txn`): 20 commits per cycle instead of 25 and 8 writes instead of 10. With the flush capping commits per second, fewer per cycle is the most direct way past about 8200 cycles/s. It raised the 1M-actor ceiling 8% (`summary-size10.md`).
-2. **Why fsyncs slow down with more replicas.** Bytes per fsync do not explain it (see Without the fake delay). Postgres's `WALWrite` lock waits and its WAL writer's activity at 7 × 8 against 8 × 8 would show whether contention for the flush does. Lower-latency storage (pd-ssd or Hyperdisk) is worth a 7 × 8 run only if the disk turns out to be the slow part.
+2. **What sets fsync latency.** It varies between runs at the same configuration (see The repeat of the series) and is not explained by bytes per fsync. The volume's own latency over time (Cloud Monitoring's disk metrics) next to Postgres's fsync time would show whether the disk varies. If it does, lower-latency storage (pd-ssd or Hyperdisk) at 7 × 8 is worth a run, with several repeats to see past the variation.
 3. **Where calls wait past the ceiling.** Without the delay a few calls wait 10+ s while most take 25 ms. A trace of the slowest calls, or pool-wait metrics from ate-api-server, would show whether they wait for a pool connection, an actor's lease or something else.
 4. **A Go CPU profile of ate-api-server** at 5000/s at 4 × 8 and 8 × 8, to see what each added replica costs per cycle.

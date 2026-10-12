@@ -10,6 +10,7 @@
 - `ateapi_cold_resume_pause_fake_2x4cpu`, at `034f879e`, 18:49–19:22 UTC: complete, no request failed. Results under run_ts 1791572118, local copy in `results/2x4cpu/`, log in `~/bench-runs/ateapi-cold-2x4cpu-20261009/orchestrator.log`. Postgres restarted onto a different node in this run, so ate-api-server ran on `…-4d75` and the runner on `…-9v65`; all three are the same machine type, each role on its own node.
 - `ateapi_cold_resume_pause_fake_2x8cpu`, at `00f9fc57` (which adds that test), 21:42–22:12 UTC: complete, no request failed. Results under run_ts 1791582469, local copy in `results/2x8cpu/`, log in `~/bench-runs/ateapi-cold-2x8cpu-20261009/orchestrator.log`. A first attempt at 20:31 is invalid: the GKE API server failed requests at 20:38, the orchestrator's partial teardown deleted the benchmark templates, and every resume after that failed; its results are kept in `results/2x8cpu-invalid-20261009T2038/` with an explanation.
 - `ateapi_cold_resume_pause_fake_3x4cpu` and `_4x4cpu`, at `30d76d8c` (which adds those tests), run back to back on 2026-10-10, 20:19–21:50 UTC: both complete, no request failed. Results under run_ts 1791663938 and 1791666408, local copies in `results/3x4cpu/` and `results/4x4cpu/`, with Postgres's WAL fsync, commit and wait counters sampled every 15 s for both runs in `results/4x4cpu/wal-io-3x4-and-4x4.csv` (`track_wal_io_timing` off, so counts without times); log in `~/bench-runs/ateapi-cold-3x4-4x4cpu-20261010/orchestrator.log`.
+- Repeats of `ateapi_cold_resume_pause_fake_8cpu` (fine ladder) and `_2x8cpu`, at `5c2002bf` with the same test entries, on 2026-10-12 as the first two tests of a nine-test series (02:13–03:05 UTC, log `~/bench-runs/ateapi-cold-series-9tests-20261012/orchestrator.log`): both complete, no request failed. Results under run_ts 1791771556 and 1791773134, local copies in `results/repeat-20261012/8cpu/` and `results/repeat-20261012/2x8cpu/`. See Repeats below.
 - The 1M-actor runs on size10 Postgres, 2026-10-10, are in `summary-size10.md`; 2 × 8 CPU against three Postgres setups is in `summary-2x8-postgres.md`; and 2 to 8 × 8 CPU replicas on size10 Postgres are in `summary-size10-replicas.md`.
 
 ## Setup
@@ -73,6 +74,15 @@ The 8 CPU fine run applied the same settings as the 8 CPU test; it differs only 
 | 16 (2 × 8) | about 3670 | 1.26× for 1.6× the CPU |
 
 Throughput keeps rising with ate-api-server's total CPU, but above about 2000/s each cycle costs more, whether the CPU is in one replica or two (see Replicas versus CPU), and at about 3700/s Postgres's commit path stops it (see Postgres's commit path). Well below the ceiling, a resume takes 157–160 ms (150 ms of it fake-atelet) and a pause about the same, rising to 170–190 ms just below it; past it, both rise to 600+ ms as calls queue at the server, until every user is busy.
+
+**Repeats.** The 8 CPU fine-ladder and 2 × 8 CPU tests were run again on 2026-10-12, with the same test entries:
+
+| Test | First run | Repeat | Change | Repeat: ate-api-server cores at the ceiling | CPU per cycle | Commits/s |
+|---|---|---|---|---|---|---|
+| 8 CPU, fine ladder | about 2610 (2598–2615) | about 2627 (2614–2645) | +0.6% | 7.75 of 8, throttled 3–5% | 2.93–2.97 ms | 65,300–66,200 |
+| 2 × 8 CPU | about 3670 (3648–3674) | about 3735 (3723–3741) | +1.8% | 13.1–13.7 of 16 | 3.50–3.66 ms | 93,000–93,600 |
+
+Both repeat their first runs within 2%, with the same bottlenecks: at 8 CPUs ate-api-server held at 7.75 of its 8 cores as before, and at 2 × 8 commits stopped at about 93,000/s with ate-api-server at 82–86% of its CPU and 22–31 connections waiting on the WAL write. The size10 runs repeated in the same series are in `summary-size10-replicas.md`, where run-to-run variation was about ±2%, up to 6.7% when fsync latency differed.
 
 **Replicas versus CPU.** Splitting ate-api-server's CPU across two replicas did not raise the ceiling:
 
@@ -332,11 +342,11 @@ In every step past the ceiling, cycles/s equals users ÷ cycle time (2 CPU at 15
 
 **Directional**
 
-- The 8 CPU ceiling, about 2610/s: one fine-ladder run. Its bottleneck is ate-api-server: it held at 97% of its 8 cores, and the 10 CPU run raised the ceiling.
+- The 8 CPU ceiling, about 2610/s: two fine-ladder runs within 0.6% (2610 and 2627). Its bottleneck is ate-api-server: it held at 97% of its 8 cores in both, and the 10 CPU run raised the ceiling.
 - The 10 CPU ceiling, about 2900/s: one run. Below 100% CPU at saturation, so part of the limit is not CPU; what it is, this data cannot say.
 - The 2 × 2 CPU ceiling, about 1460/s, 5% below one 4 CPU replica: one run, but the gap is larger than the ±1% run-to-run variation at 4 CPUs, and its cause, the higher CPU per cycle, is measured. Which of the listed overheads accounts for it is not.
 - The 2 × 4 CPU ceiling, about 2600/s, the same as one 8 CPU replica: one run each, so "the same" means within a few percent.
-- The 2 × 8 CPU ceiling, about 3670/s, and its cause, Postgres's commit path: one valid run. The WAL-write waits, with CPU, disk bandwidth and memory all below saturation, point clearly at it; a run with group commit or `synchronous_commit = off` would confirm it.
+- The 2 × 8 CPU ceiling, about 3670/s, and its cause, Postgres's commit path: two valid runs within 1.8% (3670 and 3735). The WAL-write waits, with CPU, disk bandwidth and memory all below saturation, point clearly at it; a run with group commit or `synchronous_commit = off` would confirm it.
 - The 3 × 4 and 4 × 4 ceilings, about 3160 and 3385/s, and their cause: one run each. That no replica reached its CPU limit is measured; that Postgres's WAL flush sets them rests on fsyncs/s staying flat at every load, with fsync times not recorded. 4 × 4 falling 8% below 2 × 8 at the same CPU is larger than the ±1% run-to-run variation, but why more replicas leave fewer commits per fsync is not measured.
 - The 1.89×, 1.69× and 1.11× scaling factors: the 2 and 4 CPU ceilings repeat within about 1%; the 8 and 10 CPU ones rest on a single run each.
 - ate-api-server's higher CPU per cycle at high rates: the 2 × 4 test shows it follows the rate, not the replica size, which points at system-wide contention rather than one replica's concurrency. Where in ate-api-server the extra CPU goes is not measured.
@@ -349,7 +359,7 @@ In every step past the ceiling, cycles/s equals users ÷ cycle time (2 CPU at 15
 
 - Isolate mode: a fixed 150 ms per call with no tail, no Worker churn, one placeholder object per snapshot, no router traffic, and pause rather than suspend.
 - One configuration: size0 Postgres with default tuning (2Gi memory limit, `shared_buffers = 128MB`, default WAL and commit settings), one ate-api-server replica with pool 64 (two with pool 40 in the two-replica tests), c3-highcpu-88 nodes. Postgres tuning, above all of the commit path, may move the 8 CPU and larger results; `summary-size10.md` has the 1M-actor runs on size10 Postgres.
-- No repeat run at 8 or 10 CPUs or of any multi-replica test; run-to-run variation is about ±1% at 2 and 4 CPUs.
+- No repeat run at 10 CPUs or of any multi-replica test but 2 × 8; run-to-run variation is about ±1% at 2 and 4 CPUs and up to 2% at 8 and 2 × 8 CPUs.
 
 **To make it conclusive**
 
@@ -357,7 +367,7 @@ In every step past the ceiling, cycles/s equals users ÷ cycle time (2 CPU at 15
 2. Fewer commits per cycle in ate-api-server: at 25 per resume and pause, the largest lever on the commit path.
 3. A `pg_stat_statements` breakdown of the saturated steps of the 8 CPU, 10 CPU, 2 × 4 and 2 × 8 runs, from the cluster's Prometheus while it is retained: which statements commit most and which waits grow with the rate.
 4. A Go CPU profile of ate-api-server at 2500–3000/s, to see where its CPU per cycle grows with the rate.
-5. Repeat the 8 CPU and 2 × 8 CPU tests two or three times.
+5. Repeat the 10 CPU, 2 × 2 and 2 × 4 CPU tests. The 8 CPU and 2 × 8 CPU tests were repeated on 2026-10-12 (see Repeats).
 6. Finer server buckets, or Prometheus native histograms, if p99 matters.
 7. The 3 × 4 and 4 × 4 CPU tests on size10 Postgres, with `track_wal_io_timing = on`, to see whether replicas scale with ate-api-server's total CPU once size0's commit path no longer caps them.
 
