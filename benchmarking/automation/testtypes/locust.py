@@ -18,7 +18,10 @@ The runner Job wraps benchmarking/locust/runner.py, which drives locust
 (and boomer for glutton tests) and uploads its own results.
 """
 
+import json
 import os
+import re
+import subprocess
 from typing import Any
 
 from util import build_and_push
@@ -31,6 +34,38 @@ def validate(test: dict[str, Any]) -> None:
     for field in ("file", "duration", "users"):
         if field not in test:
             raise ValueError(f"locust test {name!r} missing {field!r}")
+
+
+def results_uploaded(test: dict[str, Any], dest: str, commit: str, since: float) -> str | None:
+    """Whether the runner Job for test at commit, submitted at since, already
+    uploaded its results: "complete" or "failed" by its status.json, or None
+    if there is none yet or it cannot be read. runner.py uploads status.json
+    last, so finding it means every file is in place."""
+    pattern = (f"{dest.rstrip('/')}/runs/{test['name']}"
+               f"/run_date=*/run_ts=*/run_tag={commit}/status.json")
+    try:
+        ls = subprocess.run(["gcloud", "storage", "ls", pattern],
+                            capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return None
+    if ls.returncode != 0:
+        return None
+    for uri in sorted(ls.stdout.split(), reverse=True):
+        m = re.search(r"/run_ts=(\d+)/", uri)
+        # An earlier run of the same test at the same commit is not this one.
+        if not m or int(m[1]) < since:
+            continue
+        try:
+            cat = subprocess.run(["gcloud", "storage", "cat", uri],
+                                 capture_output=True, text=True, timeout=60)
+            status = json.loads(cat.stdout) if cat.returncode == 0 else None
+        except (subprocess.TimeoutExpired, json.JSONDecodeError):
+            return None
+        if not isinstance(status, dict):
+            return None
+        # runner.py exits non-zero only when no stats were generated.
+        return "complete" if status.get("stats_generated") else "failed"
+    return None
 
 
 def build_image(commit: str) -> str:

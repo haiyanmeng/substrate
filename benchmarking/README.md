@@ -520,7 +520,8 @@ them are checked into the repository.
 
 * `status.json`: `locust_exit_code` and `stats_generated`. Deliberately just
   those two keys, because it is what CI orchestration reads to decide whether a
-  trial ran at all.
+  trial ran at all. It is uploaded last, so finding it means every other file
+  is in place.
 * `stats.csv`, `stats_history.csv`, `failures.csv`, `exceptions.csv`: Locust's
   own CSV output. `stats_history.csv` has a row per operation every second as
   well as the `Aggregated` row, so each operation's latency can be charted

@@ -106,6 +106,12 @@ def validate(test: dict[str, Any]) -> None:
         )
 
 
+def results_uploaded(test: dict[str, Any], dest: str, commit: str, since: float) -> str | None:
+    """Always None: the Job's own completion is the only signal, so a run that
+    loses the cluster waits for it, as before."""
+    return None
+
+
 def build_image(commit: str) -> str:
     """Build & push the nighthawk capacity-benchmark runner image."""
     return build_and_push(

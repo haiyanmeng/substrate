@@ -30,6 +30,11 @@ Each module implements the TestType hooks, called in lifecycle order:
                         itself is always the same shared machinery:
                         orchestrator renders the template, submits the
                         Job, waits, tails logs, deletes it.
+  results_uploaded(test, dest, commit, since)
+                        while orchestrator cannot reach the cluster to see
+                        the Job finish: "complete" or "failed" if the Job
+                        submitted at since already uploaded its results,
+                        else None.
 
 No post_test hook: teardown is type-independent today. Name it here when
 a type needs one.
@@ -51,6 +56,7 @@ class TestType(Protocol):
     def pre_test(self, test: dict[str, Any]) -> None: ...
     def job_tmpl(self, manifests_dir: str) -> str: ...
     def job_subs(self, test: dict[str, Any]) -> dict[str, Any]: ...
+    def results_uploaded(self, test: dict[str, Any], dest: str, commit: str, since: float) -> str | None: ...
 
 
 TYPES: dict[str, TestType] = {
