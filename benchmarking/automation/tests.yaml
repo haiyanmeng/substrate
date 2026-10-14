@@ -677,3 +677,33 @@ tests:
     nighthawk-ingress:
       envoyCpu: 16
       tailLatencySloMs: 25
+  # ate-api-server and Postgres cold resume ceiling on the fake data plane.
+  # Each user owns one actor: its first iteration creates the actor and
+  # makes it cold, in the step that adds the user, and every later one
+  # resumes it and pauses it again. fake-atelet answers each call, restore
+  # and checkpoint alike, after 150 ms on every atelet node, so a cycle
+  # spends 300 ms in the data plane, after minting the actor's certificate
+  # on each restore as ateom does. The 200 fake Workers hold 1000 actors
+  # each, so placement never binds. resumepaused sends the actors no
+  # requests, which the fake data plane needs.
+  - name: ateapi_cold_resume_pause_fake_2cpu
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, ate-api-server at 2 CPUs: rate ladder 100-1500 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumepaused.py,/app/shapes/ladder_shape.py
+    duration: 23m
+    users: 1000
+    workerCount: 200
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    isolate:
+      delay: 150ms
+    ateapi:
+      cpu: 2
+      memory: 4Gi
+      poolMaxConns: 64
+    flags:
+      - "--ladder-spawn-rate"
+      - "1000"
+      - "--ladder"
+      - "1000:3m@100,1000:3m@200,1000:3m@400,1000:3m@600,1000:3m@800,1000:3m@1000,1000:3m@1500"
