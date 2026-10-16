@@ -935,7 +935,8 @@ tests:
   # Two 8 CPU replicas, 16 CPUs in all: whether the ceiling keeps rising
   # with ate-api-server's total CPU past one 10 CPU replica's, to about
   # 4400/s, or Postgres contention caps it first. 6000 users keep every step
-  # from running out of users.
+  # from running out of users. track_wal_io_timing records the WAL fsync
+  # times, to tell the WAL flush from the rest of the commit path.
   - name: ateapi_cold_resume_pause_fake_2x8cpu
     type: locust
     description: "ate-api-server cold resume on the fake data plane, 2 ate-api-server replicas at 8 CPUs: rate ladder 2500-5000 cold resumes/s"
@@ -957,6 +958,9 @@ tests:
         cpu: 8
         memory: 4Gi
         poolMaxConns: 40
+      postgres:
+        args:
+          - track_wal_io_timing=on
     flags:
       - "--ladder-spawn-rate"
       - "6000"
@@ -1333,6 +1337,39 @@ tests:
       - "18000"
       - "--ladder"
       - "18000:3m@5000,18000:3m@5500,18000:3m@6000,18000:3m@6500,18000:3m@7000,18000:3m@7500,18000:3m@8000,18000:3m@8500,18000:3m@9000,18000:3m@9500,18000:3m@10000,18000:3m@10500"
+  # Nine 8 CPU replicas, 72 CPUs in all, still within the ateapi node's 88.
+  # Pools of 26 keep 9 x (26 + 5) = 279 connections within size10's 300, as
+  # at 7 and 8 x 8.
+  - name: ateapi_cold_resume_pause_fake_9x8cpu_size10
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 9 ate-api-server replicas at 8 CPUs, size10 Postgres: rate ladder 5000-11000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumepaused.py,/app/shapes/ladder_shape.py
+    duration: 41m
+    users: 20000
+    workerCount: 200
+    actorCPU: "10m"
+    runnerCpu: "16"
+    runnerMemory: "8Gi"
+    isolate:
+      delay: 150ms
+    ateArgs:
+      - "--cluster-size=size10"
+      - "--cordon-control-plane"
+    controlPlane:
+      apiServer:
+        replicas: 9
+        cpu: 8
+        memory: 4Gi
+        poolMaxConns: 26
+      postgres:
+        args:
+          - track_wal_io_timing=on
+    flags:
+      - "--ladder-spawn-rate"
+      - "20000"
+      - "--ladder"
+      - "20000:3m@5000,20000:3m@5500,20000:3m@6000,20000:3m@6500,20000:3m@7000,20000:3m@7500,20000:3m@8000,20000:3m@8500,20000:3m@9000,20000:3m@9500,20000:3m@10000,20000:3m@10500,20000:3m@11000"
   # The 7 x 8 and 8 x 8 tests with fake-atelet answering at once instead of
   # after 150 ms, everything else the same. Without the delay a cycle holds
   # its actor's lease and its users for far less time, which changes how many
