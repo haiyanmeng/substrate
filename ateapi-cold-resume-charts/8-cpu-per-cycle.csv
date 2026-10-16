@@ -1,0 +1,15 @@
+postgres,setup,ceiling_cycles_per_s,share_of_ceiling_at_5000,plotted_at_5000,ateapi_ms_per_cycle_at_ceiling,postgres_ms_per_cycle_at_ceiling,ateapi_ms_per_cycle_at_5000,postgres_ms_per_cycle_at_5000
+size0,1 × 2,792,,False,2.52,2.83,,
+size0,1 × 4,1528,,False,2.6,2.74,,
+size0,1 × 8,2633,,False,2.97,2.81,,
+size0,1 × 10,2908,,False,3.24,2.87,,
+size0,2 × 4,2562,,False,2.99,2.84,,
+size0,2 × 8,3632,,False,3.71,3.05,,
+size10,2 × 8,3744,,False,3.53,3.11,,
+size10,3 × 8,4961,1.01,False,3.97,4.13,3.85,4.06
+size10,4 × 8,5959,0.84,True,4.63,3.73,4.61,3.55
+size10,5 × 8,6861,0.73,True,4.91,4.02,5.06,3.66
+size10,6 × 8,7399,0.68,True,5.02,4.33,5.17,3.6
+size10,7 × 8,7493,0.67,True,5.4,4.3,5.29,3.77
+size10,8 × 8,7381,0.68,True,5.76,4.45,5.5,3.84
+size10,9 × 8,7449,0.67,True,6.09,4.43,5.68,4.03
