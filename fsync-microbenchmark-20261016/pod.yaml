@@ -1,0 +1,42 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+apiVersion: v1
+kind: Pod
+metadata: {name: bench, namespace: fsync-bench}
+spec:
+  nodeSelector: {kubernetes.io/hostname: gke-nh-prow-parity-default-pool-ca559d59-9v65}
+  restartPolicy: Never
+  containers:
+  - name: bench
+    image: postgres:18-alpine
+    command: ["sh", "/scripts/bench.sh"]
+    securityContext: {runAsUser: 0}
+    resources: {requests: {cpu: "2", memory: 4Gi}, limits: {memory: 12Gi}}
+    volumeMounts:
+    - {name: scripts, mountPath: /scripts}
+    - {name: tmpfs, mountPath: /mnt/tmpfs}
+    - {name: pdb, mountPath: /mnt/pdb}
+    - {name: pdssd, mountPath: /mnt/pdssd}
+    - {name: hdb, mountPath: /mnt/hdb}
+    volumeDevices:
+    - {name: pdbblock, devicePath: /dev/pdb-block}
+  volumes:
+  - {name: scripts, configMap: {name: bench}}
+  - {name: tmpfs, emptyDir: {medium: Memory, sizeLimit: 10Gi}}
+  - {name: pdb, persistentVolumeClaim: {claimName: pdb-fs}}
+  - {name: pdbblock, persistentVolumeClaim: {claimName: pdb-block}}
+  - {name: pdssd, persistentVolumeClaim: {claimName: pdssd-fs}}
+  - {name: hdb, persistentVolumeClaim: {claimName: hdb-fs}}

@@ -1,0 +1,37 @@
+10 seconds per test
+O_DIRECT supported on this platform for open_datasync and open_sync.
+
+Compare file sync methods using one 8kB write:
+(in "wal_sync_method" preference order, except fdatasync is Linux's default)
+        open_datasync                      2026.157 ops/sec     494 usecs/op
+        fdatasync                          1877.778 ops/sec     533 usecs/op
+        fsync                               608.802 ops/sec    1643 usecs/op
+        fsync_writethrough                              n/a
+        open_sync                           628.721 ops/sec    1591 usecs/op
+
+Compare file sync methods using two 8kB writes:
+(in "wal_sync_method" preference order, except fdatasync is Linux's default)
+        open_datasync                      1057.446 ops/sec     946 usecs/op
+        fdatasync                          1876.355 ops/sec     533 usecs/op
+        fsync                               577.119 ops/sec    1733 usecs/op
+        fsync_writethrough                              n/a
+        open_sync                           285.882 ops/sec    3498 usecs/op
+
+Compare open_sync with different write sizes:
+(This is designed to compare the cost of writing 16kB in different write
+open_sync sizes.)
+         1 * 16kB open_sync write           619.213 ops/sec    1615 usecs/op
+         2 *  8kB open_sync writes          272.265 ops/sec    3673 usecs/op
+         4 *  4kB open_sync writes          163.508 ops/sec    6116 usecs/op
+         8 *  2kB open_sync writes           70.554 ops/sec   14174 usecs/op
+        16 *  1kB open_sync writes           37.154 ops/sec   26915 usecs/op
+
+Test if fsync on non-write file descriptor is honored:
+(If the times are similar, fsync() can sync data written on a different
+descriptor.)
+        write, fsync, close                 572.016 ops/sec    1748 usecs/op
+        write, close, fsync                 585.250 ops/sec    1709 usecs/op
+
+Non-sync'ed 8kB writes:
+        write                           1744050.463 ops/sec       1 usecs/op
+
