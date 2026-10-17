@@ -1,0 +1,36 @@
+10 seconds per test
+O_DIRECT supported on this platform for open_datasync and open_sync.
+
+Compare file sync methods using one 8kB write:
+(in "wal_sync_method" preference order, except fdatasync is Linux's default)
+        open_datasync                   2042208.241 ops/sec       0 usecs/op
+        fdatasync                       1663096.177 ops/sec       1 usecs/op
+        fsync                           1659940.840 ops/sec       1 usecs/op
+        fsync_writethrough                              n/a
+        open_sync                       2036484.516 ops/sec       0 usecs/op
+
+Compare file sync methods using two 8kB writes:
+(in "wal_sync_method" preference order, except fdatasync is Linux's default)
+        open_datasync                   1012672.772 ops/sec       1 usecs/op
+        fdatasync                        909600.462 ops/sec       1 usecs/op
+        fsync                            907959.912 ops/sec       1 usecs/op
+        fsync_writethrough                              n/a
+        open_sync                       1008662.381 ops/sec       1 usecs/op
+
+Compare open_sync with different write sizes:
+(This is designed to compare the cost of writing 16kB in different write
+open_sync sizes.)
+         1 * 16kB open_sync write       1272093.901 ops/sec       1 usecs/op
+         2 *  8kB open_sync writes      1011902.689 ops/sec       1 usecs/op
+         4 *  4kB open_sync writes       723699.297 ops/sec       1 usecs/op
+         8 *  2kB open_sync writes       375597.899 ops/sec       3 usecs/op
+        16 *  1kB open_sync writes       191025.870 ops/sec       5 usecs/op
+
+Test if fsync on non-write file descriptor is honored:
+(If the times are similar, fsync() can sync data written on a different
+descriptor.)
+        write, fsync, close              349976.865 ops/sec       3 usecs/op
+        write, close, fsync              349281.822 ops/sec       3 usecs/op
+
+Non-sync'ed 8kB writes:
+        write                           2045383.714 ops/sec       0 usecs/op
