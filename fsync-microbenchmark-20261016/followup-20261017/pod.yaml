@@ -1,0 +1,46 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+apiVersion: v1
+kind: Pod
+metadata: {name: bench, namespace: fsync-bench}
+spec:
+  nodeSelector: {kubernetes.io/hostname: gke-nh-prow-parity-default-pool-ca559d59-9v65}
+  restartPolicy: Never
+  containers:
+  - name: bench
+    image: postgres:18-alpine
+    command: ["sh", "/scripts/bench.sh",
+              "pd-balanced-a:/mnt/pdb-a", "pd-balanced-b:/mnt/pdb-b",
+              "hyperdisk-balanced-provisioned-a:/mnt/hdbp-a", "hyperdisk-balanced-provisioned-b:/mnt/hdbp-b",
+              "hyperdisk-extreme-a:/mnt/hde-a", "hyperdisk-extreme-b:/mnt/hde-b"]
+    securityContext: {runAsUser: 0}
+    resources: {requests: {cpu: "2", memory: 4Gi}, limits: {memory: 12Gi}}
+    volumeMounts:
+    - {name: scripts, mountPath: /scripts}
+    - {name: pdb-a, mountPath: /mnt/pdb-a}
+    - {name: pdb-b, mountPath: /mnt/pdb-b}
+    - {name: hdbp-a, mountPath: /mnt/hdbp-a}
+    - {name: hdbp-b, mountPath: /mnt/hdbp-b}
+    - {name: hde-a, mountPath: /mnt/hde-a}
+    - {name: hde-b, mountPath: /mnt/hde-b}
+  volumes:
+  - {name: scripts, configMap: {name: bench}}
+  - {name: pdb-a, persistentVolumeClaim: {claimName: pdb-a}}
+  - {name: pdb-b, persistentVolumeClaim: {claimName: pdb-b}}
+  - {name: hdbp-a, persistentVolumeClaim: {claimName: hdbp-a}}
+  - {name: hdbp-b, persistentVolumeClaim: {claimName: hdbp-b}}
+  - {name: hde-a, persistentVolumeClaim: {claimName: hde-a}}
+  - {name: hde-b, persistentVolumeClaim: {claimName: hde-b}}

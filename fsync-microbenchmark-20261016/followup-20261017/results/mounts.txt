@@ -1,0 +1,6 @@
+/dev/nvme0n2 on /mnt/pdb-a type ext4 (rw,relatime)
+/dev/nvme0n7 on /mnt/pdb-b type ext4 (rw,relatime)
+/dev/nvme0n5 on /mnt/hdbp-a type ext4 (rw,relatime)
+/dev/nvme0n6 on /mnt/hdbp-b type ext4 (rw,relatime)
+/dev/nvme0n4 on /mnt/hde-a type ext4 (rw,relatime)
+/dev/nvme0n3 on /mnt/hde-b type ext4 (rw,relatime)

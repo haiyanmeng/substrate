@@ -1,0 +1,18 @@
+== 2026-10-17T15:02:37Z pd-balanced-a pg_test_fsync
+== 2026-10-17T15:05:17Z pd-balanced-a fio alone
+== 2026-10-17T15:05:48Z pd-balanced-a fio with background random writes
+== 2026-10-17T15:06:19Z pd-balanced-b pg_test_fsync
+== 2026-10-17T15:08:59Z pd-balanced-b fio alone
+== 2026-10-17T15:09:30Z pd-balanced-b fio with background random writes
+== 2026-10-17T15:10:01Z hyperdisk-balanced-provisioned-a pg_test_fsync
+== 2026-10-17T15:12:41Z hyperdisk-balanced-provisioned-a fio alone
+== 2026-10-17T15:13:12Z hyperdisk-balanced-provisioned-a fio with background random writes
+== 2026-10-17T15:13:43Z hyperdisk-balanced-provisioned-b pg_test_fsync
+== 2026-10-17T15:16:23Z hyperdisk-balanced-provisioned-b fio alone
+== 2026-10-17T15:16:54Z hyperdisk-balanced-provisioned-b fio with background random writes
+== 2026-10-17T15:17:25Z hyperdisk-extreme-a pg_test_fsync
+== 2026-10-17T15:20:05Z hyperdisk-extreme-a fio alone
+== 2026-10-17T15:20:36Z hyperdisk-extreme-a fio with background random writes
+== 2026-10-17T15:21:07Z hyperdisk-extreme-b pg_test_fsync
+== 2026-10-17T15:23:48Z hyperdisk-extreme-b fio alone
+== 2026-10-17T15:24:18Z hyperdisk-extreme-b fio with background random writes
