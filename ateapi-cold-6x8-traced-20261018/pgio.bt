@@ -1,0 +1,80 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
+// Traces Postgres's disk I/O on the node running postgres-0.
+// $1 = kernel dev_t of the Postgres data volume ((major << 20) | minor).
+// $2 = seconds to run. Every 30 s prints, then clears:
+//   fdatasync/fsync calls from processes named postgres: count, summed ns, latency histogram (us)
+//   block requests on the data device by rwbs code: count, summed issue->complete ns, sectors, histogram (us)
+//   jbd2 commits on the data device: count and summed start->end ns
+// On exit also prints whole-run histograms (@*_all).
+tracepoint:syscalls:sys_enter_fdatasync /comm == "postgres"/ { @fds_t[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_fdatasync /@fds_t[tid]/ {
+  $d = nsecs - @fds_t[tid];
+  @fdatasync_n = count(); @fdatasync_ns = sum($d); @fdatasync_us = hist($d / 1000); @fdatasync_all_us = hist($d / 1000);
+  delete(@fds_t[tid]);
+}
+tracepoint:syscalls:sys_enter_fsync /comm == "postgres"/ { @fs_t[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_fsync /@fs_t[tid]/ {
+  $d = nsecs - @fs_t[tid];
+  @fsync_n = count(); @fsync_ns = sum($d); @fsync_all_us = hist($d / 1000);
+  delete(@fs_t[tid]);
+}
+tracepoint:block:block_rq_issue /args.dev == $1/ { @rq_t[args.sector] = nsecs; }
+tracepoint:block:block_rq_complete /args.dev == $1 && @rq_t[args.sector]/ {
+  $d = nsecs - @rq_t[args.sector];
+  // rwbs is char[8] with stale bytes after the NUL, so keying by it splits one type
+  // across several keys. Map the types seen on PD to codes (legend printed at start).
+  $k = 99;
+  if (strncmp(args.rwbs, "FF", 3) == 0) { $k = 1; }
+  if (strncmp(args.rwbs, "WFSM", 5) == 0) { $k = 2; }
+  if (strncmp(args.rwbs, "WSM", 4) == 0) { $k = 3; }
+  if (strncmp(args.rwbs, "WS", 3) == 0) { $k = 4; }
+  if (strncmp(args.rwbs, "WM", 3) == 0) { $k = 5; }
+  if (strncmp(args.rwbs, "W", 2) == 0) { $k = 6; }
+  if (strncmp(args.rwbs, "WFS", 4) == 0) { $k = 7; }
+  if (strncmp(args.rwbs, "FWS", 4) == 0) { $k = 8; }
+  if (strncmp(args.rwbs, "FWFS", 5) == 0) { $k = 9; }
+  if (strncmp(args.rwbs, "R", 2) == 0) { $k = 10; }
+  if (strncmp(args.rwbs, "RM", 3) == 0) { $k = 11; }
+  if (strncmp(args.rwbs, "RA", 3) == 0) { $k = 12; }
+  if ($k == 99) { @blk_other[args.rwbs] = count(); }
+  @blk_n[$k] = count(); @blk_ns[$k] = sum($d); @blk_sectors[$k] = sum(args.nr_sector);
+  @blk_us[$k] = hist($d / 1000); @blk_all_us[$k] = hist($d / 1000);
+  delete(@rq_t[args.sector]);
+}
+tracepoint:jbd2:jbd2_start_commit /args.dev == $1/ { @jc_t[args.transaction] = nsecs; }
+tracepoint:jbd2:jbd2_end_commit /args.dev == $1 && @jc_t[args.transaction]/ {
+  @jbd2_n = count(); @jbd2_ns = sum(nsecs - @jc_t[args.transaction]);
+  delete(@jc_t[args.transaction]);
+}
+BEGIN { printf("rwbs codes: 1=FF 2=WFSM 3=WSM 4=WS 5=WM 6=W 7=WFS 8=FWS 9=FWFS 10=R 11=RM 12=RA 99=other (see @blk_other)\n"); }
+interval:s:30 {
+  time("=== %Y-%m-%dT%H:%M:%SZ\n");
+  print(@fdatasync_n); print(@fdatasync_ns); print(@fdatasync_us);
+  print(@fsync_n); print(@fsync_ns);
+  print(@blk_n); print(@blk_ns); print(@blk_sectors); print(@blk_us);
+  print(@jbd2_n); print(@jbd2_ns); print(@blk_other);
+  clear(@fdatasync_n); clear(@fdatasync_ns); clear(@fdatasync_us); clear(@fsync_n); clear(@fsync_ns);
+  clear(@blk_n); clear(@blk_ns); clear(@blk_sectors); clear(@blk_us); clear(@jbd2_n); clear(@jbd2_ns); clear(@blk_other);
+  @elapsed += 30;
+  if (@elapsed >= $2) { exit(); }
+}
+END {
+  time("=== END %Y-%m-%dT%H:%M:%SZ\n");
+  clear(@fds_t); clear(@fs_t); clear(@rq_t); clear(@jc_t); clear(@elapsed);
+  clear(@fdatasync_n); clear(@fdatasync_ns); clear(@fdatasync_us); clear(@fsync_n); clear(@fsync_ns);
+  clear(@blk_n); clear(@blk_ns); clear(@blk_sectors); clear(@blk_us); clear(@jbd2_n); clear(@jbd2_ns);
+}
