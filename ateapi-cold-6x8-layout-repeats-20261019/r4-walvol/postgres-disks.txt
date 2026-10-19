@@ -1,0 +1,7 @@
+node gke-nh-prow-parity-default-pool-ca559d59-4d75
+persistentvolumeclaim/data-postgres-0 pvc-3503aa4f-48c3-40f5-a115-50dc1ee98611	pd-balanced	500
+persistentvolumeclaim/wal-postgres-0 pvc-1dfa6857-f8cc-4402-935c-23b68800aafb	pd-balanced	500
+lrwxrwxrwx    1 postgres postgres        30 Oct 19 17:03 /var/lib/postgresql/data/pgdata/pg_wal -> /var/lib/postgresql/wal/pg_wal
+Filesystem           1K-blocks      Used Available Use% Mounted on
+/dev/nvme0n3         514937088     31328 514889376   0% /var/lib/postgresql/data
+/dev/nvme0n2         514937088     16424 514904280   0% /var/lib/postgresql/wal

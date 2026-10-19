@@ -20,6 +20,8 @@
 
 **Why this does not yet credit the layout:** shared-volume runs have already ranged from 0.53 to 0.72 ms per fdatasync. The 5 × 8 run of 2026-10-16 (`../ateapi-cold-5x8-size10-neighbors-20261016/summary.md`) had 0.53–0.57 ms with WAL and data on one volume, on the same node. The traced run (`../ateapi-cold-6x8-traced-20261018/summary.md`) also found that data-file writes do not slow the WAL write. So this result sits at the good end of what one shared volume can do. Alternating repeats of both layouts, run at the same code, would separate the two.
 
+**Repeats since:** five alternating runs later the same day (`../ateapi-cold-6x8-layout-repeats-20261019/summary.md`) found no layout gain on the same node. Three shared-volume runs on `…-9v65` reached 7,503–7,524 cycles/s at 0.61–0.63 ms per fdatasync, a faster flush than this run's 0.644 ms. Runs varied mainly with the node Postgres landed on, or the disk it got there.
+
 ## Comparison with the other 6 × 8 runs
 
 | Run | Postgres storage | Ceiling (cycles/s) | Mean fdatasync at the ceiling | Commits per fdatasync | Summary |

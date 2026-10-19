@@ -1,0 +1,12 @@
+target resume/s mean_ms p50/p99 commits/s fsyncs/s fsync_ms commits/fsync busy | WALdisk: writes/s MiB/s mean_write flush/s flush_ms busy | DATAdisk: writes/s MiB/s busy
+5000 5000 174 156/598 120097 1667 0.557 72 93% | shared: 1807 73.5 - 1672 0.033 87% {'ResumeActorCold': 0.0}
+5500 5500 182 157/684 132183 1606 0.573 82 92% | shared: 1768 79.4 - 1620 0.034 87% {'ResumeActorCold': 0.0}
+6000 6001 190 159/769 144120 1545 0.596 93 92% | shared: 1712 84.7 - 1549 0.034 86% {'ResumeActorCold': 0.0}
+6500 6467 199 160/809 156130 1533 0.609 102 93% | shared: 1578 55.5 - 1542 0.034 88% {'ResumeActorCold': 0.0}
+7000 7000 277 178/1217 168209 1530 0.606 110 93% | shared: 1570 58.4 - 1538 0.034 86% {'ResumeActorCold': 0.0}
+7500 7478 691 658/2747 179140 1509 0.616 119 93% | shared: 1553 61.7 - 1519 0.034 86% {'ResumeActorCold': 0.0}
+8000 7495 993 830/3252 179599 1477 0.627 121 93% | shared: 1526 62.1 - 1488 0.034 86% {'ResumeActorCold': 0.0}
+8500 7480 999 348/5620 180293 1488 0.627 122 93% | shared: 1529 62.4 - 1492 0.035 86% {'ResumeActorCold': 0.0}
+9000 7487 997 337/3855 180168 1500 0.621 120 93% | shared: 1532 61.0 - 1501 0.035 86% {'ResumeActorCold': 0.0}
+9500 7555 988 329/3323 181323 1494 0.623 122 93% | shared: 1528 61.2 - 1493 0.035 87% {'ResumeActorCold': 0.0}
+10000 7603 984 310/3252 182260 1543 0.601 118 93% | shared: 1582 61.7 - 1548 0.035 86% {'ResumeActorCold': 0.0}

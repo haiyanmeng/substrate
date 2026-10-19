@@ -1,0 +1,6 @@
+node gke-nh-prow-parity-default-pool-ca559d59-9v65
+persistentvolumeclaim/data-postgres-0 pvc-f9f7e4ec-b163-4e9c-8952-8ad60e2d55e6	pd-balanced	500
+drwx------    4 postgres postgres      4096 Oct 19 14:44 /var/lib/postgresql/data/pgdata/pg_wal
+Filesystem           1K-blocks      Used Available Use% Mounted on
+/dev/nvme0n2         514937088     47652 514873052   0% /var/lib/postgresql/data
+command terminated with exit code 1
