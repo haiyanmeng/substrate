@@ -1,0 +1,95 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
+// Block requests inside fdatasync calls from postgres and dd on one device.
+// $1 = kernel dev_t of the volume ((major << 20) | minor).
+// Every 50th fdatasync is sampled; for it, prints one line per event, times in us:
+//   S  fdatasync start, with the caller's last pwrite offset and length
+//   WP / WPR  ext4 writeback range and pages written
+//   Q  bio queued, before merging or splitting
+//   SPLIT  bio split
+//   I  request issued (+us since the fdatasync started)
+//   C  request completed, with issue-to-complete latency
+//   E  fdatasync end, with duration
+// Every 10 s prints aggregates and clears them:
+//   @ws_fast_kib / @ws_slow_kib  WS request size, split at 128 us latency
+//   @reqs_per_fdatasync  requests issued from the caller's context per fdatasync
+//   @fdatasync_us, @splits, @merges
+// Flushes issue at sector 0 and complete at sector 2^64-1; both are keyed as 0.
+tracepoint:syscalls:sys_enter_pwrite64 /comm == "postgres"/ { @pw_off[tid] = args.pos; @pw_len[tid] = args.count; }
+tracepoint:syscalls:sys_enter_fdatasync /comm == "postgres" || comm == "dd"/ {
+  @n++;
+  @t0[tid] = nsecs;
+  @reqs[tid] = 0;
+  if (@n % 50 == 0) {
+    @samp[tid] = nsecs;
+    printf("S %llu tid=%d pw_off=%lld pw_len=%lld\n", nsecs / 1000, tid, @pw_off[tid], @pw_len[tid]);
+  }
+}
+tracepoint:ext4:ext4_writepages /@samp[tid]/ {
+  printf("WP %llu ino=%llu start=%lld end=%lld\n", nsecs / 1000, args.ino, args.range_start, args.range_end);
+}
+tracepoint:ext4:ext4_writepages_result /@samp[tid]/ {
+  printf("WPR %llu ino=%llu pages=%d\n", nsecs / 1000, args.ino, args.pages_written);
+}
+tracepoint:block:block_bio_queue /args.dev == $1 && @samp[tid]/ {
+  printf("Q %llu rwbs=%s sec=%llu n=%u\n", nsecs / 1000, args.rwbs, args.sector, args.nr_sector);
+}
+tracepoint:block:block_split /args.dev == $1/ {
+  @splits = count();
+  if (@samp[tid]) { printf("SPLIT %llu sec=%llu new=%llu\n", nsecs / 1000, args.sector, args.new_sector); }
+}
+tracepoint:block:block_bio_backmerge, tracepoint:block:block_bio_frontmerge /args.dev == $1/ { @merges = count(); }
+tracepoint:block:block_rq_issue /args.dev == $1/ {
+  @iss[args.sector] = nsecs;
+  @isz[args.sector] = args.nr_sector;
+  if (@t0[tid]) { @reqs[tid]++; }
+  if (@samp[tid]) {
+    @trk[args.sector] = 1;
+    printf("I %llu +%llu rwbs=%s sec=%llu n=%u\n", nsecs / 1000, (nsecs - @samp[tid]) / 1000, args.rwbs, args.sector, args.nr_sector);
+  }
+}
+tracepoint:block:block_rq_complete /args.dev == $1/ {
+  $k = args.sector;
+  if ($k > 1000000000000000000) { $k = 0; }
+  if (@iss[$k]) {
+    $d = nsecs - @iss[$k];
+    if (strncmp(args.rwbs, "WS", 3) == 0) {
+      if ($d < 128000) { @ws_fast_kib = hist(@isz[$k] / 2); } else { @ws_slow_kib = hist(@isz[$k] / 2); }
+    }
+    if (@trk[$k]) {
+      printf("C %llu lat=%llu rwbs=%s sec=%llu n=%u\n", nsecs / 1000, $d / 1000, args.rwbs, $k, @isz[$k]);
+      delete(@trk[$k]);
+    }
+    delete(@iss[$k]);
+    delete(@isz[$k]);
+  }
+}
+tracepoint:syscalls:sys_exit_fdatasync /@t0[tid]/ {
+  $d = nsecs - @t0[tid];
+  @fdatasync_us = hist($d / 1000);
+  @reqs_per_fdatasync = lhist(@reqs[tid], 0, 10, 1);
+  if (@samp[tid]) { printf("E %llu dur=%llu reqs=%d\n", nsecs / 1000, $d / 1000, @reqs[tid]); delete(@samp[tid]); }
+  delete(@t0[tid]);
+  delete(@reqs[tid]);
+}
+interval:s:10 {
+  time("=== %Y-%m-%dT%H:%M:%SZ\n");
+  print(@fdatasync_us); print(@reqs_per_fdatasync); print(@ws_fast_kib); print(@ws_slow_kib); print(@splits); print(@merges);
+  clear(@fdatasync_us); clear(@reqs_per_fdatasync); clear(@ws_fast_kib); clear(@ws_slow_kib); clear(@splits); clear(@merges);
+}
+END {
+  clear(@pw_off); clear(@pw_len); clear(@t0); clear(@reqs); clear(@samp); clear(@iss); clear(@isz); clear(@trk); clear(@n);
+}

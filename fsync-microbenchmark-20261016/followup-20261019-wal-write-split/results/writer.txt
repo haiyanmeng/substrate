@@ -1,0 +1,35 @@
+sh: locale: not found
+2026-10-19 12:03:10.105 UTC [33] WARNING:  no usable system locales were found
+initdb: warning: enabling "trust" authentication for local connections
+initdb: hint: You can change this by editing pg_hba.conf or using the option -A, or --auth-local and --auth-host, the next time you run initdb.
+waiting for server to start.... done
+server started
+2026-10-19T12:03:19Z pgbench-c64 start
+scaling factor: 50
+query mode: simple
+number of clients: 64
+number of threads: 8
+maximum number of tries: 1
+duration: 60 s
+number of transactions actually processed: 2449431
+number of failed transactions: 0 (0.000%)
+latency average = 1.541 ms
+latency stddev = 1.228 ms
+initial connection time = 44.846 ms
+tps = 40853.185311 (without initial connection time)
+2026-10-19T12:04:19Z pgbench-c8 start
+number of clients: 8
+number of threads: 4
+maximum number of tries: 1
+duration: 30 s
+number of transactions actually processed: 256709
+number of failed transactions: 0 (0.000%)
+latency average = 0.933 ms
+latency stddev = 0.217 ms
+initial connection time = 9.387 ms
+tps = 8559.350731 (without initial connection time)
+2026-10-19T12:04:49Z pgbench end
+2026-10-19T12:04:52Z dd-aligned-32k start
+2026-10-19T12:04:56Z dd-pg-like start
+2026-10-19T12:04:59Z dd-8k-same start
+2026-10-19T12:05:02Z done

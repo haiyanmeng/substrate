@@ -1,0 +1,50 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# Prints every issue and completion with sector 0 or 2^64-1 on the volume
+# while dd rewrites 8 KiB with fdatasync, to show how a flush appears in the
+# block tracepoints. Run: kubectl apply -f flush-events.yaml (needs pvc.yaml).
+apiVersion: v1
+kind: Pod
+metadata: {name: flush-events, namespace: fsync-bench}
+spec:
+  nodeSelector: {kubernetes.io/hostname: gke-nh-prow-parity-default-pool-ca559d59-9v65}
+  restartPolicy: Never
+  containers:
+  - name: bt
+    image: quay.io/iovisor/bpftrace:latest
+    securityContext: {privileged: true}
+    command:
+    - sh
+    - -c
+    - |
+      mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null
+      dev=$(awk '$5=="/data"{print $3}' /proc/self/mountinfo); devt=$(( ${dev%:*} << 20 | ${dev#*:} ))
+      dd if=/dev/zero of=/data/f bs=8k count=1 conv=fsync 2>/dev/null
+      (sleep 3; for i in 1 2 3 4 5; do dd if=/dev/zero of=/data/f bs=8k count=1 conv=notrunc,fdatasync 2>/dev/null; done) &
+      timeout 6 bpftrace -e '
+        tracepoint:syscalls:sys_enter_fdatasync /comm == "dd"/ { printf("fdatasync enter %llu\n", nsecs / 1000); }
+        tracepoint:syscalls:sys_exit_fdatasync /comm == "dd"/ { printf("fdatasync exit  %llu\n", nsecs / 1000); }
+        tracepoint:block:block_rq_issue /args.dev == '$devt'/ { printf("issue    %llu rwbs=%s sec=%llu n=%u\n", nsecs / 1000, args.rwbs, args.sector, args.nr_sector); }
+        tracepoint:block:block_rq_complete /args.dev == '$devt'/ { printf("complete %llu rwbs=%s sec=%llu n=%u\n", nsecs / 1000, args.rwbs, args.sector, args.nr_sector); }'
+      rm -f /data/f
+    volumeMounts:
+    - {name: data, mountPath: /data}
+    - {name: sys, mountPath: /sys}
+    - {name: modules, mountPath: /lib/modules, readOnly: true}
+  volumes:
+  - {name: data, persistentVolumeClaim: {claimName: pdb-split}}
+  - {name: sys, hostPath: {path: /sys}}
+  - {name: modules, hostPath: {path: /lib/modules}}

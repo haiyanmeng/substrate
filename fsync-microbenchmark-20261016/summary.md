@@ -161,3 +161,83 @@ The pod's log keeps the results after the pod exits, as long as the pod is not d
 - Two volumes per type, one run each; Hyperdisk Extreme's two volumes disagree by 1.8×, so more volumes would be needed to say what a typical one does.
 - One node, one machine type, one zone (us-central1-a), at one time of day.
 
+
+## Follow-up: what block requests a WAL fdatasync issues, 2026-10-19
+
+The traced 6 × 8 cold resume run (`../ateapi-cold-6x8-traced-20261018/summary.md`) appeared to show two synchronous writes per WAL fdatasync, one completing in 16–64 µs and one in about 0.63 ms. This follow-up records every block request inside sampled fdatasyncs, under real Postgres group commit and fixed write patterns, to find what the two are. Files are in `followup-20261019-wal-write-split/`.
+
+**Result: an fdatasync of WAL issues one data write and one flush. The "fast write" was the flush, misread by the earlier tracer.**
+
+- **Exactly one data write per fdatasync** in every pattern, carrying all the bytes written since the last flush. Across 3,373 sampled fdatasyncs no write was split, and none completed in under 128 µs.
+- **A flush appears in the block tracepoints as three events.** The flush request is issued as `FF` at sector 0 and completes as `FF` at sector 2^64−1. Then the fdatasync's original empty request completes as **`WS` at sector 0 with no sectors** (`results/flush-events.txt`). The 6 × 8 tracer keyed requests by sector, so it paired that `WS` completion with the flush's issue at sector 0. That produced one phantom write per fdatasync, lasting as long as the flush and carrying no data. It also halved the apparent size of each write, from 37 to about 19 KiB.
+- **On this volume the data write takes 0.37–0.45 ms and the whole fdatasync 0.46–0.52 ms.** The difference, about 0.07 ms, is the flush plus kernel overhead. That is the same split as in the 6 × 8 run (0.63 ms write, 0.70 ms fdatasync), where the write itself was 0.2 ms slower.
+
+### Setup
+
+- One pod on node `…-9v65` with a new 500 GiB pd-balanced volume (`standard-rwo`), ext4, attached as NVMe `259:13`. Queue limits: 256 KiB maximum request, no chunk boundary, write-back cache with FUA, no I/O scheduler (`results/trace.txt`, first lines).
+- Container `writer` (`postgres:18-alpine`, `writer.sh`) runs these phases, logged with start times:
+  - Postgres 18 with `shared_buffers=2GB`, initialized with `pgbench -i -s 50`;
+  - `pgbench -N -c 64 -j 8 -T 60`, group commit as under ate-api-server;
+  - `pgbench -N -c 8 -j 4 -T 30`;
+  - then 2,000 `dd conv=notrunc,fdatasync` calls in each of three patterns on a preallocated, flushed 16 MiB file: 32 KiB at aligned offsets; Postgres-like (rewrite the last partial 8 KiB page and append 29 KiB); and 8 KiB at one offset, as `pg_test_fsync` does.
+- Container `tracer` (privileged, `quay.io/iovisor/bpftrace`, `tracer.sh`) runs `trace.bt` on the volume's device. For every 50th fdatasync from `postgres` or `dd` it prints each step with its time: the ext4 writeback range, bios queued, splits, requests issued and completed, and the fdatasync's end. Every 10 s it prints whole-device aggregates: requests per fdatasync, write sizes split at 128 µs latency, splits and merges.
+- `flush-events.yaml` prints every block event on the volume around five 8 KiB `dd` fdatasyncs.
+- Run 2026-10-19, 12:02–12:06 UTC; flush-events at about 12:12.
+
+### Reproducing it
+
+From `fsync-microbenchmark-20261016/followup-20261019-wal-write-split/`; edit the node name in `pod.yaml` and `flush-events.yaml` first:
+
+```bash
+kubectl apply -f pvc.yaml                           # namespace fsync-bench and one 500 GiB PVC
+kubectl -n fsync-bench create configmap split --from-file=writer.sh --from-file=tracer.sh --from-file=trace.bt
+kubectl apply -f pod.yaml
+# About 4 minutes; the tracer's log ends with "### END".
+kubectl -n fsync-bench logs split -c tracer > results/trace.txt
+kubectl -n fsync-bench logs split -c writer > results/writer.txt
+python3 analyze.py results/trace.txt > results/phases.txt
+
+kubectl -n fsync-bench delete pod split
+kubectl apply -f flush-events.yaml                  # reuses the PVC; about 10 s of tracing
+kubectl -n fsync-bench logs flush-events > results/flush-events.txt
+
+kubectl delete namespace fsync-bench                # deletes the PVC and its disk
+```
+
+### Results
+
+Sampled fdatasyncs (`results/phases.txt`). The dd phases are shorter than the 10 s aggregation interval, so `analyze.py` tells them apart by write size.
+
+| Phase | Sampled fdatasyncs | Data writes per fdatasync | KiB per write | Write latency mean / p50 / p90 | fdatasync mean / p50 | Splits |
+|---|---|---|---|---|---|---|
+| pgbench, 64 clients (40,853 tps) | 2,195 | 1.00 | 14.6 | 446 / 436 / 509 µs | 520 / 510 µs | 0 |
+| pgbench, 8 clients (8,559 tps) | 1,087 | 1.00 | 9.8 | 398 / 387 / 440 µs | 462 / 450 µs | 0 |
+| dd, 32 KiB aligned | 31 | 1.00 | 32.0 | 426 / 424 / 466 µs | 513 / 514 µs | 0 |
+| dd, Postgres-like | 20 | 1.00 | 36.0 | 393 / 392 / 414 µs | 480 / 482 µs | 0 |
+| dd, 8 KiB at one offset | 40 | 1.00 | 8.0 | 373 / 357 / 454 µs | 458 / 445 µs | 0 |
+
+A sampled fdatasync under pgbench, times in µs:
+
+```
+S   0        fdatasync starts
+WP  +4       ext4 writepages over the whole file
+Q   +9       WS bio, 32 sectors
+I   +14      WS request issued
+WPR +18      4 pages written
+C   +420     WS completes (lat 407)
+Q   +429     FWS empty bio: the flush
+E   +460     fdatasync returns (dur 460)
+```
+
+### What it shows
+
+- **The WAL write is a single request, and its latency is the fdatasync's cost.** The flush and kernel overhead add about 0.07 ms on top of it.
+- **Write size matters little in this range.** 8 to 36 KiB writes took 0.37–0.45 ms. A Postgres-like rewrite of the last partial page is no slower than an aligned append.
+- **The 6 × 8 run's write was slower: 0.63 ms against 0.45 ms here, at a lower flush rate.** This test does not say why. Differences include a different volume, the 6 × 8 run's larger writes (37 KiB), and its concurrent data-file writeback. The first follow-up found volume-to-volume differences of up to 1.8× on Hyperdisk Extreme, though not on pd-balanced.
+
+### Limits
+
+- One volume, one node, about four minutes of load.
+- The sample is every 50th fdatasync. The whole-device aggregates in `results/trace.txt`, which cover every request, agree: one request per fdatasync and no write under 128 µs.
+- `trace.bt` maps a flush's completion at sector 2^64−1 back to sector 0. If the empty `WS` completion arrived before the `FF` one, it would be miscounted as a fast write. It never did here: the whole-device aggregates show no write under 128 µs.
+- The `pw_off` and `pw_len` fields on `S` lines are always 0. `trace.bt` hooks `pwrite64`, and Postgres 18's WAL writes did not show up there, probably because they go through another write call such as `pwritev`. Nothing above depends on these fields.

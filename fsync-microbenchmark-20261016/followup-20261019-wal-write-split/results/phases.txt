@@ -1,0 +1,6 @@
+phase | sampled fdatasyncs | data writes per fdatasync | KiB per write | write latency mean / p50 / p90 us | fdatasync mean / p50 us | splits
+pgbench-c64 | 2195 | 1.00 | 14.6 | 446 / 436 / 509 | 520 / 510 | 0
+pgbench-c8 | 1087 | 1.00 | 9.8 | 398 / 387 / 440 | 462 / 450 | 0
+dd-aligned-32k | 31 | 1.00 | 32.0 | 426 / 424 / 466 | 513 / 514 | 0
+dd-pg-like | 20 | 1.00 | 36.0 | 393 / 392 / 414 | 480 / 482 | 0
+dd-8k-same | 40 | 1.00 | 8.0 | 373 / 357 / 454 | 458 / 445 | 0

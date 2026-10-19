@@ -7,19 +7,17 @@
 **Result: the WAL fdatasync's time is almost all one block write. The flush, the ext4 journal, Postgres's write path and the data-file writes on the same volume add little or nothing.**
 
 - **The ceiling is about 6,690 cycles/s** (6,631–6,748 over steps 5–11), set as before by Postgres's WAL flush: about 1,300 fdatasyncs/s of 0.70 ms, busy about 91% of each second, carrying about 123 commits each, so about 160,000 commits/s.
-- **Each fdatasync is one fast block write, one slow block write and one cache flush.** At every step from 6500/s on, the trace counts exactly one write completing in 16–64 µs and one completing in 256 µs–2 ms (mean about 0.63 ms) for each fdatasync, about 37 KiB between them, plus one flush in `/proc/diskstats`. 98% of fdatasyncs take 0.5–1 ms.
-- **The flush costs 0.042 ms.** The volume reports a write-back cache, but flushing it is cheap; the durable round trip is in the slow write.
+- **Each fdatasync is one block write of the WAL, about 37 KiB taking about 0.63 ms, then one cache flush.** At every step from 6500/s on, the trace counts one write completing in 256 µs–2 ms for each fdatasync, and `/proc/diskstats` one flush. 98% of fdatasyncs take 0.5–1 ms. The trace also shows a "fast write" of 16–64 µs per fdatasync, but that is the flush, miscounted (see [How it was run](#how-it-was-run)). A follow-up confirmed one data write per fdatasync (`../fsync-microbenchmark-20261016/summary.md`, follow-up of 2026-10-19).
+- **The flush costs 0.042 ms.** The volume reports a write-back cache, but flushing it is cheap; the durable round trip is in the write.
 - **ext4's journal is rarely involved:** 0.2–10 jbd2 commits a second against 1,300 fdatasyncs, because Postgres preallocates WAL segments and so overwrites blocks in place.
 - **Postgres's own write is 0.03 ms** (`pg_stat_io` WAL `write_time` per write): the pwrite into the page cache.
 - **Data-file writes do not slow the flush in this run.** Data-file writeback fell from 617 to about 90 writes/s across the ladder while the fdatasync stayed at 0.67–0.72 ms; the step with the most data-file writes, 5500/s at 812/s, had the fastest fdatasync, 0.67 ms. Each data-file block write is large and slow (160–230 KiB, 23–48 ms), but it does not show in the WAL write's latency. This rules out contention from the same volume as the cause of the fsync rising from 0.52 ms at 4 × 8 to 0.70–0.76 ms at 7 and 8 × 8.
 
 **Not established:**
 
-- **Why the slow write takes about 0.63 ms.** The microbenchmark (`../fsync-microbenchmark-20261016/summary.md`) measured 0.40 ms (pg_test_fsync) and 0.49 ms (raw block write + fdatasync) for idle 8 KiB writes on pd-balanced. Candidates: the larger write, and the slow write waiting on the fast one; the trace does not record the order of the two within an fdatasync.
-- **Why each fdatasync issues two writes.** The trace aggregates per request type, not per request, so it cannot tell which pages each covers.
+- **Why the WAL write takes about 0.63 ms.** On another new pd-balanced volume, the 2026-10-19 follow-up measured 0.37–0.45 ms for 8–36 KiB writes, including Postgres under 64-client pgbench at about 1,800 fdatasyncs/s. Differences from this run include the volume, the larger writes here, and the concurrent data-file writeback.
 - **What makes the fsync slower with more replicas.** Each install creates a new Postgres volume, so volume-to-volume variation is a live candidate: the 5 × 8 run of 2026-10-16 (`../ateapi-cold-5x8-size10-neighbors-20261016/summary.md`), with Postgres on another node and another new volume, had 0.53–0.57 ms fsyncs, against 0.70 ms here at similar commits per fsync. The microbenchmark also measured two Hyperdisk Extreme volumes at 0.39 and 0.69 ms.
 
-A short follow-up would settle the first two: trace the sequence of block requests inside each fdatasync (issue time, completion time, sector, size) for a minute under load.
 
 ## Per step
 
@@ -41,7 +39,7 @@ Postgres's view (`data/wal-io.csv`, `data/steps.jsonl`):
 
 The 5000/s step fell short, probably because the warm-up of the 14,000 actors overlapped its start; its latency and CPU are not comparable with the others.
 
-The kernel's view (`data/trace-table.txt`, from `analyze_trace.py`). fdatasync is the syscall from processes named `postgres`. WS fast and slow split the synchronous block writes at 256 µs; the slow mean covers 256 µs–2 ms. The flush and the busy share come from `/proc/diskstats`; data-file writes from `pg_stat_io`.
+The kernel's view (`data/trace-table.txt`, from `analyze_trace.py`). fdatasync is the syscall from processes named `postgres`. WS fast and slow split the synchronous block completions at 256 µs; the slow mean covers 256 µs–2 ms. WS slow is the WAL write. WS fast is not a write: it is each flush's empty request, paired with the flush's issue, so it duplicates the flush count. The flush and the busy share come from `/proc/diskstats`; data-file writes from `pg_stat_io`.
 
 | Target | fdatasyncs/s | Mean fdatasync | WS fast/s | WS slow/s | Slow WS mean | Flushes/s | Mean flush | Async writes/s (W) | W mean | jbd2 commits/s | Disk MiB/s | Disk busy | Data-file writes/s |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -77,7 +75,7 @@ The slow-write mean is from the histogram's bucket midpoints, so it is approxima
 
 It keys each block request's issue time by sector. Two things about that on these NVMe volumes:
 
-- **Flushes are not in the trace.** `rwbs-test.yaml` runs `dd oflag=dsync` on a node and prints raw block events. It shows a flush issuing at sector 0 and completing at sector 2^64−1, so the pairing never matches it. Flush counts and time come from `/proc/diskstats` (fields 16 and 17 after the device name) instead.
+- **Flushes are miscounted as fast synchronous writes.** `rwbs-test.yaml` runs `dd oflag=dsync` on a node and prints raw block events. It shows a flush issuing as `FF` at sector 0 and completing as `FF` at sector 2^64−1, which the pairing never matches. The 2026-10-19 follow-up (`../fsync-microbenchmark-20261016/followup-20261019-wal-write-split/results/flush-events.txt`) shows a third event: the fdatasync's original empty request completes as `WS` at sector 0 with no sectors. `pgio.bt` pairs that completion with the flush's issue, so each flush appears as a `WS` of 16–64 µs with no data. That doubles the `WS` count and halves its mean size. Flush counts and time come from `/proc/diskstats` (fields 16 and 17 after the device name) instead.
 - **Summed block times are unusable for some types.** A few mismatched pairs produce huge values, so `analyze_trace.py` takes latencies from the histograms and drops buckets of 1 s and above.
 
 The `rwbs` field is a `char[8]` with stale bytes after the terminating NUL, so `pgio.bt` maps it to a numeric code (legend at the top of `data/trace.txt`): 2 = WFSM (journal commit block), 3 = WSM (journal metadata), 4 = WS (synchronous write), 5 = WM, 6 = W (asynchronous writeback), 12 = RA.
