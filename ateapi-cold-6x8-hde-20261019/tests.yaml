@@ -1,0 +1,44 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+tests:
+- name: ateapi_cold_resume_pause_fake_6x8cpu_size10_hde
+  type: locust
+  description: 'ate-api-server cold resume on the fake data plane, 6 ate-api-server
+    replicas at 8 CPUs, size10 Postgres on Hyperdisk Extreme: rate ladder 5000-10000 cold resumes/s'
+  targetCluster: dev
+  file: /app/tests/resumepaused.py,/app/shapes/ladder_shape.py
+  duration: 35m
+  users: 14000
+  workerCount: 200
+  runnerCpu: '16'
+  runnerMemory: 6Gi
+  ateArgs:
+  - --cluster-size=size10
+  isolate:
+    delay: 150ms
+  ateapi:
+    cpu: 8
+    replicas: 6
+    memory: 4Gi
+    poolMaxConns: 40
+    postgresArgs:
+    - track_wal_io_timing=on
+    - track_io_timing=on
+  flags:
+  - --ladder-spawn-rate
+  - '14000'
+  - --ladder
+  - 14000:3m@5000,14000:3m@5500,14000:3m@6000,14000:3m@6500,14000:3m@7000,14000:3m@7500,14000:3m@8000,14000:3m@8500,14000:3m@9000,14000:3m@9500,14000:3m@10000
