@@ -44,21 +44,21 @@ From `data/steps.jsonl` and `data/wal-io.csv`. Flush busy is fsync time per seco
 
 The volume's `/proc/diskstats` (`data/io.jsonl`), over the same windows:
 
-| Target | Writes/s | MiB/s | Mean write | Flushes/s | Mean flush | Busy |
-|---|---|---|---|---|---|---|
-| 5000 | 1,992 | 69.1 | 0.91 ms | 924 | 0.047 ms | 91% |
-| 5500 | 1,884 | 73.0 | 0.90 ms | 868 | 0.043 ms | 91% |
-| 6000 | 2,588 | 82.2 | 0.63 ms | 1,212 | 0.038 ms | 88% |
-| 6500 | 2,755 | 63.7 | 0.54 ms | 1,342 | 0.037 ms | 88% |
-| 7000 | 2,386 | 53.1 | 0.60 ms | 1,178 | 0.039 ms | 90% |
-| 7500 | 2,305 | 52.3 | 0.63 ms | 1,136 | 0.041 ms | 90% |
-| 8000 | 2,478 | 55.6 | 0.58 ms | 1,220 | 0.044 ms | 89% |
-| 8500 | 2,475 | 55.4 | 0.56 ms | 1,222 | 0.044 ms | 89% |
-| 9000 | 2,388 | 54.1 | 0.60 ms | 1,179 | 0.045 ms | 88% |
-| 9500 | 2,637 | 57.5 | 0.50 ms | 1,305 | 0.038 ms | 87% |
-| 10000 | 2,647 | 57.5 | 0.55 ms | 1,308 | 0.041 ms | 89% |
+| Target | Writes/s, flushes excluded | MiB/s | Flushes/s | Mean flush | Busy |
+|---|---|---|---|---|---|
+| 5000 | 1,067 | 69.1 | 924 | 0.047 ms | 91% |
+| 5500 | 1,016 | 73.0 | 868 | 0.043 ms | 91% |
+| 6000 | 1,376 | 82.2 | 1,212 | 0.038 ms | 88% |
+| 6500 | 1,413 | 63.7 | 1,342 | 0.037 ms | 88% |
+| 7000 | 1,208 | 53.1 | 1,178 | 0.039 ms | 90% |
+| 7500 | 1,169 | 52.3 | 1,136 | 0.041 ms | 90% |
+| 8000 | 1,257 | 55.6 | 1,220 | 0.044 ms | 89% |
+| 8500 | 1,253 | 55.4 | 1,222 | 0.044 ms | 89% |
+| 9000 | 1,209 | 54.1 | 1,179 | 0.045 ms | 88% |
+| 9500 | 1,332 | 57.5 | 1,305 | 0.038 ms | 87% |
+| 10000 | 1,339 | 57.5 | 1,308 | 0.041 ms | 89% |
 
-Mean write covers every write on the volume: the WAL writes and the data-file writeback.
+`/proc/diskstats` counts each flush's empty request as a write; Writes/s here subtracts them (writes minus flushes), leaving the WAL writes and the data-file writeback. The table gives no mean write latency. On a volume shared with the data files, diskstats' write time is dominated by the data-file writeback, whose requests take tens of milliseconds each (see `../ateapi-cold-6x8-traced-20261018/summary.md`), so it does not measure the WAL write.
 
 ## How it was run
 
