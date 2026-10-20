@@ -1,0 +1,182 @@
+=== ateapi_cold_resume_pause_fake_6x8cpu_size10 at a981433922843d534bfa9178958ccf5fe09ca4cc -> gs://snapshot-substrate-test-haiyanmeng-gke-dev/benchmark-results
+$ gcloud auth configure-docker gcr.io --quiet
+WARNING: Your config file at [/home/haiyanmeng/.docker/config.json] contains these credential helper entries:
+
+{
+  "credHelpers": {
+    "gcr.io": "gcloud",
+    "us.gcr.io": "gcloud",
+    "eu.gcr.io": "gcloud",
+    "asia.gcr.io": "gcloud",
+    "staging-k8s.gcr.io": "gcloud",
+    "marketplace.gcr.io": "gcloud"
+  }
+}
+Adding credentials for: gcr.io
+gcloud credential helpers already registered correctly.
+  (took 1.0s)
+$ docker build --platform linux/amd64 -t gcr.io/haiyanmeng-gke-dev/ate-images/locust-test:a981433922843d534bfa9178958ccf5fe09ca4cc -f benchmarking/locust/Dockerfile .
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 2.87kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/python:3.11-slim
+#2 ...
+
+#3 [internal] load metadata for gcr.io/distroless/python3-debian12:latest
+#3 DONE 0.5s
+
+#4 [internal] load metadata for docker.io/library/python:3.12-slim
+#4 ...
+
+#2 [internal] load metadata for docker.io/library/python:3.11-slim
+#2 DONE 1.3s
+
+#4 [internal] load metadata for docker.io/library/python:3.12-slim
+#4 DONE 1.3s
+
+#5 [internal] load metadata for docker.io/library/golang:1.26-bookworm
+#5 DONE 3.5s
+
+#6 [internal] load .dockerignore
+#6 transferring context: 2B done
+#6 DONE 0.0s
+
+#7 [stage-3  1/14] FROM gcr.io/distroless/python3-debian12:latest@sha256:2fdb05402a2cf21cf78fdb3ba4c5db167241e9e498140f5bf689d7efb773731f
+#7 DONE 0.0s
+
+#8 [goboomer 1/8] FROM docker.io/library/golang:1.26-bookworm@sha256:ee3901c61e423732605a51f1b8157c849ec01194ea0a274213b5202b2c11e7bf
+#8 DONE 0.0s
+
+#9 [pydeps 1/4] FROM docker.io/library/python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce
+#9 resolve docker.io/library/python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce 0.0s done
+#9 DONE 0.0s
+
+#10 [pyprotos 1/8] FROM docker.io/library/python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+#10 resolve docker.io/library/python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 0.0s done
+#10 DONE 0.0s
+
+#11 [internal] load build context
+#11 transferring context: 1.24MB 0.7s done
+#11 DONE 0.8s
+
+#12 [goboomer 6/8] COPY internal ./internal
+#12 CACHED
+
+#13 [pyprotos 7/8] COPY internal/proto internal/proto
+#13 CACHED
+
+#14 [stage-3 13/14] COPY benchmarking/locust/ladder_steps.py /app/ladder_steps.py
+#14 CACHED
+
+#15 [goboomer 4/8] COPY vendor ./vendor
+#15 CACHED
+
+#16 [pydeps 2/4] WORKDIR /app
+#16 CACHED
+
+#17 [stage-3  3/14] COPY --from=pydeps /app/deps /app/deps
+#17 CACHED
+
+#18 [goboomer 3/8] COPY go.mod go.sum ./
+#18 CACHED
+
+#19 [stage-3  4/14] COPY --from=goboomer /out/boomer-worker /app/boomer-worker
+#19 CACHED
+
+#20 [stage-3  8/14] COPY benchmarking/locust/tests/ /app/tests/
+#20 CACHED
+
+#21 [stage-3  2/14] WORKDIR /app
+#21 CACHED
+
+#22 [stage-3  5/14] COPY benchmarking/locust/common/ /app/common/
+#22 CACHED
+
+#23 [stage-3  6/14] COPY --from=pyprotos /out/ /app/common/
+#23 CACHED
+
+#24 [pyprotos 4/8] RUN pip install --no-cache-dir -r benchmarking/locust/codegen/requirements.txt
+#24 CACHED
+
+#25 [goboomer 2/8] WORKDIR /src
+#25 CACHED
+
+#26 [pydeps 3/4] COPY benchmarking/locust/requirements.txt .
+#26 CACHED
+
+#27 [stage-3 12/14] COPY benchmarking/locust/phase_breakdown.py /app/phase_breakdown.py
+#27 CACHED
+
+#28 [pyprotos 8/8] RUN PYTHON=python3 OUT_DIR=/out benchmarking/locust/codegen/generate.sh
+#28 CACHED
+
+#29 [goboomer 5/8] COPY cmd ./cmd
+#29 CACHED
+
+#30 [pydeps 4/4] RUN pip install --no-cache-dir --target=/app/deps -r requirements.txt
+#30 CACHED
+
+#31 [goboomer 7/8] COPY pkg ./pkg
+#31 CACHED
+
+#32 [pyprotos 5/8] COPY benchmarking/locust/codegen/generate.sh benchmarking/locust/codegen/
+#32 CACHED
+
+#33 [pyprotos 3/8] COPY benchmarking/locust/codegen/requirements.txt benchmarking/locust/codegen/
+#33 CACHED
+
+#34 [stage-3 10/14] COPY benchmarking/locust/cluster_facts.py /app/cluster_facts.py
+#34 CACHED
+
+#35 [stage-3 11/14] COPY benchmarking/locust/server_telemetry.py /app/server_telemetry.py
+#35 CACHED
+
+#36 [pyprotos 6/8] COPY pkg/proto pkg/proto
+#36 CACHED
+
+#37 [goboomer 8/8] RUN CGO_ENABLED=0 GOFLAGS=-mod=vendor go build -o /out/boomer-worker ./cmd/benchmarking/boomer-worker
+#37 CACHED
+
+#38 [pyprotos 2/8] WORKDIR /src
+#38 CACHED
+
+#39 [stage-3  7/14] COPY benchmarking/locust/shapes/ /app/shapes/
+#39 CACHED
+
+#40 [stage-3  9/14] COPY benchmarking/locust/runner.py /app/runner.py
+#40 CACHED
+
+#41 [stage-3 14/14] COPY benchmarking/analysis/phase_report.py /app/phase_report.py
+#41 CACHED
+
+#42 exporting to image
+#42 exporting layers done
+#42 writing image sha256:f495a534d59a64fe3a5886d3015932b13eb126b2e6ae5a57c13c1c87fae2c74a done
+#42 naming to gcr.io/haiyanmeng-gke-dev/ate-images/locust-test:a981433922843d534bfa9178958ccf5fe09ca4cc done
+#42 DONE 0.0s
+  (took 4.7s)
+$ docker push gcr.io/haiyanmeng-gke-dev/ate-images/locust-test:a981433922843d534bfa9178958ccf5fe09ca4cc
+The push refers to repository [gcr.io/haiyanmeng-gke-dev/ate-images/locust-test]
+Get "https://gcr.io/v2/": dial tcp 74.125.197.82:443: connect: no route to host
+  (took 4.7s)
+Traceback (most recent call last):
+  File "/tmp/prow-run/driver.py", line 46, in <module>
+    image = TYPES[ttype].build_image(commit)
+  File "/home/haiyanmeng/gihub/substrate-prow/benchmarking/automation/testtypes/locust.py", line 57, in build_image
+    return build_and_push(
+        f"{os.environ['KO_DOCKER_REPO']}/locust-test:{commit}",
+        "benchmarking/locust/Dockerfile",
+    )
+  File "/home/haiyanmeng/gihub/substrate-prow/benchmarking/automation/util.py", line 57, in build_and_push
+    run(["docker", "push", image])
+    ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/haiyanmeng/gihub/substrate-prow/benchmarking/automation/util.py", line 27, in run
+    return subprocess.run(cmd, check=True, **kwargs)
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 577, in run
+    raise CalledProcessError(retcode, process.args,
+                             output=stdout, stderr=stderr)
+subprocess.CalledProcessError: Command '['docker', 'push', 'gcr.io/haiyanmeng-gke-dev/ate-images/locust-test:a981433922843d534bfa9178958ccf5fe09ca4cc']' returned non-zero exit status 1.

@@ -1,0 +1,197 @@
+{
+  "metadata": {
+    "test_name": "ateapi_cold_resume_pause_fake_8cpu",
+    "tag": "a981433922843d534bfa9178958ccf5fe09ca4cc",
+    "data_timestamp": "2026-10-20T02:37:22Z",
+    "prom_url": "http://prometheus.benchmarking.svc.cluster.local:9090",
+    "start_ts": 1792463842,
+    "end_ts": 1792464959,
+    "steady_start_ts": 1792463845,
+    "steady_end_ts": 1792464925,
+    "atelet_lag_s": 70
+  },
+  "cluster_packing": {
+    "summary": {
+      "min": null,
+      "p50": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "max": null,
+      "avg": null
+    },
+    "timeseries": []
+  },
+  "node_psi": {
+    "cpu_stall_pct": {
+      "min": null,
+      "p50": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "max": null,
+      "avg": null
+    },
+    "mem_stall_pct": {
+      "min": null,
+      "p50": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "max": null,
+      "avg": null
+    },
+    "io_stall_pct": {
+      "min": null,
+      "p50": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "max": null,
+      "avg": null
+    },
+    "nodes": 0
+  },
+  "pod_psi": {
+    "cpu_stall_pct": {
+      "min": null,
+      "p50": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "max": null,
+      "avg": null
+    },
+    "mem_stall_pct": {
+      "min": null,
+      "p50": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "max": null,
+      "avg": null
+    },
+    "io_stall_pct": {
+      "min": null,
+      "p50": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "max": null,
+      "avg": null
+    },
+    "pods": 0
+  },
+  "snapshots": {
+    "size_p50_mb": null,
+    "size_p90_mb": null,
+    "size_p95_mb": null,
+    "size_p99_mb": null,
+    "size_avg_mb": null,
+    "checkpoints_in_window": null,
+    "checkpoints_cumulative": null,
+    "restore_p50_s": null,
+    "restore_p90_s": null,
+    "restore_p95_s": null,
+    "restore_p99_s": null,
+    "restore_mean_s": null,
+    "checkpoint_p50_s": null,
+    "checkpoint_p90_s": null,
+    "checkpoint_p95_s": null,
+    "checkpoint_p99_s": null,
+    "checkpoint_mean_s": null,
+    "checkpoint_mb_s": null
+  },
+  "active_actors": {
+    "summary": {
+      "min": null,
+      "p50": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "max": null,
+      "avg": null
+    },
+    "atelets": null,
+    "timeseries": []
+  },
+  "working_set": {
+    "node": {
+      "summary": {
+        "min": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null,
+        "avg": null
+      },
+      "count": null,
+      "timeseries": []
+    },
+    "worker": {
+      "summary": {
+        "min": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null,
+        "avg": null
+      },
+      "count": null,
+      "timeseries": []
+    },
+    "atelet": {
+      "summary": {
+        "min": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null,
+        "avg": null
+      },
+      "count": null,
+      "timeseries": []
+    },
+    "actor": {
+      "summary": {
+        "min": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null,
+        "avg": null
+      },
+      "count": null,
+      "timeseries": []
+    },
+    "per_actor": {
+      "summary": {
+        "min": null,
+        "p50": null,
+        "p90": null,
+        "p95": null,
+        "p99": null,
+        "max": null,
+        "avg": null
+      },
+      "count": null,
+      "timeseries": []
+    }
+  },
+  "oom_events": {
+    "node": null,
+    "pod": null,
+    "window": {
+      "start_ts": 1792463842,
+      "end_ts": 1792464959
+    },
+    "worker_restarts": 0,
+    "worker_oomkilled_pods": 0,
+    "evicted": 0,
+    "worker_pods_lost": 0
+  }
+}
