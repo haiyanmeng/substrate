@@ -33,7 +33,6 @@ import (
 	"go.ate.dev/substrate/internal/volume"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/protobuf/proto"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 )
@@ -122,7 +121,20 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	actor = created
 	var worker *ateapipb.Worker
 	var assigned *ateapipb.Actor
-	if assigned, worker, err = w.ensureWorkerAssigned(leaseCtx, actorRef, actor, actorTemplate); err != nil {
+	assigned, worker, err = w.ensureWorkerAssigned(leaseCtx, actorRef, actor, actorTemplate)
+	if err != nil && shouldDetachFromNode(actor, err) {
+		var detached *ateapipb.Actor
+		if detached, err = w.detachFromFullNode(leaseCtx, actorRef, actor, actorTemplate, err); err != nil {
+			return nil, false, err
+		}
+		actor = detached
+		// Resolve the restore source again, from the uploaded snapshot.
+		if src, err = resolveResumeSource(actorRef, actor, actorTemplate); err != nil {
+			return nil, false, err
+		}
+		assigned, worker, err = w.ensureWorkerAssigned(leaseCtx, actorRef, actor, actorTemplate)
+	}
+	if err != nil {
 		return nil, false, err
 	}
 	actor = assigned
@@ -167,27 +179,42 @@ func (w *ActorWorkflow) loadActorForResume(ctx context.Context, actorRef resourc
 	if err != nil {
 		return nil, nil, src, err
 	}
+	if src, err = resolveResumeSource(actorRef, actor, actorTemplate); err != nil {
+		return nil, nil, src, err
+	}
+	return actor, actorTemplate, src, nil
+}
+
+// resolveResumeSource resolves the boot source for the actor's pending restore.
+func resolveResumeSource(actorRef resources.ActorRef, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate) (resumeSnapshotSource, error) {
+	var src resumeSnapshotSource
+	var err error
 	src.RequiredRuntime = requiredSnapshotRuntime(actor, actorTemplate)
 	if snap := findLatestDurableSnapshot(actor.GetStatus(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED); snap != nil {
 		st := snap.GetDurableSnapshot()
 		if src.SnapshotURI, err = resources.ParseSnapshotURI(st.GetObject().GetSnapshotUri()); err != nil {
-			return nil, nil, src, apierror.DataLoss("Actor %s external snapshot: %v", actorRef, err)
+			return src, apierror.DataLoss("Actor %s external snapshot: %v", actorRef, err)
 		}
 		src.SnapshotUUID = snap.GetUuid()
 		src.Generation = snap.GetGeneration()
 		src.Fidelity = snap.GetFidelity()
-		capturedUnder := snap.GetActorTemplateUid()
-		src.TemplateReplaced = capturedUnder != "" && capturedUnder != actorTemplate.GetMetadata().GetUid()
+		src.TemplateReplaced = templateReplaced(snap, actorTemplate)
 	}
 	// A local restore also names the local snapshot's upload, so a URI that
 	// does not parse fails here too, before a worker is claimed.
 	if local := findLatestLocalSnapshot(actor.GetStatus()); local != nil {
 		if _, err = resources.ParseSnapshotURI(local.GetDurableSnapshot().GetObject().GetSnapshotUri()); err != nil {
-			return nil, nil, src, apierror.DataLoss("Actor %s local snapshot: %v", actorRef, err)
+			return src, apierror.DataLoss("Actor %s local snapshot: %v", actorRef, err)
 		}
 	}
+	return src, nil
+}
 
-	return actor, actorTemplate, src, nil
+// templateReplaced reports whether snap was captured under a different
+// ActorTemplate than tmpl. An unstamped snapshot is treated as matching.
+func templateReplaced(snap *ateapipb.Snapshot, tmpl *ateapipb.ActorTemplate) bool {
+	capturedUnder := snap.GetActorTemplateUid()
+	return capturedUnder != "" && capturedUnder != tmpl.GetMetadata().GetUid()
 }
 
 // ensureVolumesCreated provisions any actor volumes that have no storage
@@ -397,10 +424,7 @@ func (w *ActorWorkflow) validateAssignedWorker(ctx context.Context, actorRef res
 		}
 		return nil, apierror.Aborted("actor %s crashed", actorRef)
 	}
-	constraints, err := schedulingConstraints(actor, actorTemplate)
-	if err != nil {
-		return nil, err
-	}
+	constraints := schedulingConstraints(actor, actorTemplate)
 	if !w.appliesWithFallback(worker, constraints, canRelaxRuntime(actor, constraints)) {
 		slog.ErrorContext(ctx, "crashing actor because previously assigned worker is not eligible anymore")
 		// If that worker's pool is no longer eligible (e.g. the actor's
@@ -480,10 +504,7 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 		}
 	}()
 
-	constraints, err := schedulingConstraints(actor, actorTemplate)
-	if err != nil {
-		return nil, nil, err
-	}
+	constraints := schedulingConstraints(actor, actorTemplate)
 	snapRuntime := constraints.RequiredRuntime
 	class = constraints.SandboxClass
 	relaxable := canRelaxRuntime(actor, constraints)
@@ -501,7 +522,7 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 		if err != nil {
 			if errors.Is(err, scheduling.ErrNoCapacity) {
 				outcome = ateattr.SchedulerOutcomeNoCapacity
-				return nil, nil, apierror.ResourceExhausted("no worker has room for the actor")
+				return nil, nil, apierror.ResourceExhausted("%w", errNoWorkerRoom)
 			}
 			return nil, nil, err
 		}
@@ -584,6 +605,10 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 	return storedActor, bound, nil
 }
 
+// errNoWorkerRoom reports that no worker has room for the Actor under its
+// constraints.
+var errNoWorkerRoom = errors.New("no worker has room for the actor")
+
 // errWorkerFilledUp reports that the Worker the scheduler picked would not take
 // the Actor once the store asked under its row lock. Retryable: the next
 // attempt re-runs scheduling.
@@ -622,38 +647,10 @@ func toAteletSandboxRuntime(in *ateapipb.SandboxRuntime) *ateletpb.SandboxRuntim
 	return out
 }
 
-// actorResourceLimits returns the actor's declared CPU (millicores) and memory
-// (bytes) limits from its ActorTemplate, or 0 for a dimension the template did
-// not set. These size the sandbox, which takes the two scalars the runtimes
-// understand rather than the named set placement accounts in.
-func actorResourceLimits(tmpl *ateapipb.ActorTemplate) (cpuMilli, memBytes int64, err error) {
-	for _, limit := range tmpl.GetResources().GetLimits() {
-		q, perr := resource.ParseQuantity(limit.GetQuantity())
-		if perr != nil {
-			return 0, 0, fmt.Errorf("invalid template resource limit %s=%q: %w", limit.GetName(), limit.GetQuantity(), perr)
-		}
-		switch limit.GetName() {
-		case "cpu":
-			cpuMilli = q.MilliValue()
-		case "memory":
-			memBytes = q.Value()
-		}
-	}
-	return cpuMilli, memBytes, nil
-}
-
-func schedulingConstraints(actor *ateapipb.Actor, tmpl *ateapipb.ActorTemplate) (scheduling.Constraints, error) {
-	// Canonicalized here, the one place an assignment's booked resources are
-	// decided, so what is recorded is sorted however the template was authored.
-	limits, err := resources.ParseQuantities(tmpl.GetResources())
-	if err != nil {
-		return scheduling.Constraints{}, fmt.Errorf("invalid template resource limits: %w", err)
-	}
+func schedulingConstraints(actor *ateapipb.Actor, tmpl *ateapipb.ActorTemplate) scheduling.Constraints {
 	var requiredNodes []string
-	// A paused Actor stays pinned to its node until atelet detaches the local
-	// snapshot, so it cannot resume while that node is full.
-	// TODO: when the node has no room, detach the Actor there and resume it on
-	// another node from the durable snapshot.
+	// A suspended Actor with a local snapshot stays pinned to its node until
+	// atelet detaches it. When the node is full, ResumeActor detaches it.
 	if node := actor.GetStatus().GetAssignedNode(); node != "" {
 		requiredNodes = []string{node}
 	}
@@ -662,12 +659,12 @@ func schedulingConstraints(actor *ateapipb.Actor, tmpl *ateapipb.ActorTemplate) 
 		RequiredRuntime: hardware.NewRequirement(requiredSnapshotRuntime(actor, tmpl)),
 		ActorSelector:   labels.SelectorFromSet(labels.Set(actor.GetWorkerSelector().GetMatchLabels())),
 		RequiredNodes:   requiredNodes,
-		Limits:          limits.Proto(),
+		Limits:          tmpl.GetResources().GetLimits(),
 	}
 	if sel := tmpl.GetWorkerSelector(); sel != nil {
 		c.TemplateSelector = labels.SelectorFromSet(labels.Set(sel.GetMatchLabels()))
 	}
-	return c, nil
+	return c
 }
 
 // snapshotSandboxClass returns the sandbox class of the snapshot ResumeActor
@@ -695,14 +692,16 @@ func requiredSnapshotRuntime(actor *ateapipb.Actor, tmpl *ateapipb.ActorTemplate
 		if localSnap.GetFidelity() != ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
 			return nil
 		}
+		if templateReplaced(localSnap, tmpl) {
+			return nil
+		}
 		return localSnap.GetSandboxRuntime()
 	}
 	if snap := findLatestDurableSnapshot(actor.GetStatus(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED); snap != nil {
 		if snap.GetFidelity() != ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
 			return nil
 		}
-		capturedUnder := snap.GetActorTemplateUid()
-		if capturedUnder != "" && capturedUnder != tmpl.GetMetadata().GetUid() {
+		if templateReplaced(snap, tmpl) {
 			return nil
 		}
 		return snap.GetSandboxRuntime()
@@ -798,10 +797,7 @@ func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resou
 
 	// The actor's declared limits ride the RPC down to the sandbox so it is sized
 	// to the actor (replacing the worker-pod downward-API approach).
-	cpuMilli, memBytes, err := actorResourceLimits(actorTemplate)
-	if err != nil {
-		return tele, err
-	}
+	actorResources := toAteletResources(actorTemplate.GetResources())
 
 	// The assignment is what the next checkpoint is stamped from, so it is also
 	// what decides how this restore runs.
@@ -812,6 +808,9 @@ func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resou
 		tele.SnapshotKind = ateattr.SnapshotKindLocal
 
 		fidelity := fidelityToAtelet(localSnap.GetFidelity())
+		if templateReplaced(localSnap, actorTemplate) {
+			fidelity = ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES
+		}
 		req := &ateletpb.RestoreRequest{
 			WorkerPodUid:          assignment.GetWorkerPodUid(),
 			Atespace:              actor.GetMetadata().GetAtespace(),
@@ -833,8 +832,7 @@ func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resou
 			SandboxRuntime: sandboxRuntime,
 			ActorUid:       actor.GetMetadata().Uid,
 			EgressGateway:  egressGateway,
-			CpuMilli:       cpuMilli,
-			MemoryBytes:    memBytes,
+			Resources:      actorResources,
 		}
 		tele.WireFidelity = ateattr.SnapshotFidelityValue(fidelity)
 
@@ -875,8 +873,7 @@ func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resou
 			SandboxRuntime: sandboxRuntime,
 			ActorUid:       actor.GetMetadata().Uid,
 			EgressGateway:  egressGateway,
-			CpuMilli:       cpuMilli,
-			MemoryBytes:    memBytes,
+			Resources:      actorResources,
 		}
 		if _, err = client.Restore(ctx, req); err != nil {
 			return tele, handleAteletError(ctx, w.store, actorRef, ateattr.OperationResume, "Restore", false, err)
@@ -896,8 +893,7 @@ func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resou
 			Spec:                  workloadSpec,
 			ActorUid:              actor.GetMetadata().Uid,
 			EgressGateway:         egressGateway,
-			CpuMilli:              cpuMilli,
-			MemoryBytes:           memBytes,
+			Resources:             actorResources,
 		}
 		if _, err = client.Run(ctx, req); err != nil {
 			return tele, handleAteletError(ctx, w.store, actorRef, ateattr.OperationResume, "Run", false, err)

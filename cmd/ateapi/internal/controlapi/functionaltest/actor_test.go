@@ -123,7 +123,7 @@ func TestCreateActor_WithExternalVolumes(t *testing.T) {
 			Name: "ext-vol-1",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "standard",
-				Capacity:         "10Gi",
+				CapacityBytes:    10 << 30,
 			}},
 		},
 	}
@@ -184,7 +184,7 @@ func TestCreateActor_ExternalVolumesWithoutOptIn(t *testing.T) {
 	createTemplateWithVolumes(t, tc, ns,
 		[]*ateapipb.Volume{{
 			Name:     "ext-vol-1",
-			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{StorageClassName: "standard", Capacity: "10Gi"}},
+			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{StorageClassName: "standard", CapacityBytes: 10 << 30}},
 		}},
 		[]*ateapipb.VolumeMount{{Name: "ext-vol-1", MountPath: "/data"}})
 
@@ -216,7 +216,7 @@ func TestActorLifecycle_ExternalVolumesWithoutOptIn(t *testing.T) {
 	createTemplateWithVolumes(t, tc, ns,
 		[]*ateapipb.Volume{{
 			Name:     "data-vol",
-			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{StorageClassName: "fast", Capacity: "20Gi"}},
+			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{StorageClassName: "fast", CapacityBytes: 20 << 30}},
 		}},
 		[]*ateapipb.VolumeMount{{Name: "data-vol", MountPath: "/mnt/data"}})
 	createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
@@ -278,7 +278,7 @@ func TestCreateActor_SubstrateTemplateRef(t *testing.T) {
 			Metadata:       &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: "sub-tmpl"},
 			Containers:     []*ateapipb.Container{{Name: "main", Image: "example.com/app:v1@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}},
 			SnapshotConfig: &ateapipb.SnapshotConfig{StorageLocation: "gs://my-bucket/snapshots"},
-			Resources:      resources.CPUMemory(1000, 512<<20),
+			Resources:      &ateapipb.ResourceRequirements{Limits: resources.CPUMemory(1000, 512<<20)},
 		},
 	}); err != nil {
 		t.Fatalf("CreateActorTemplate failed: %v", err)
@@ -407,10 +407,10 @@ func TestCreateActor_RejectsSnapshotWithExternalVolumes(t *testing.T) {
 			Volumes: []*ateapipb.Volume{{
 				Name: "data",
 				External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
-					Capacity: "1Gi", StorageClassName: "standard",
+					CapacityBytes: 1 << 30, StorageClassName: "standard",
 				}},
 			}},
-			Resources: resources.CPUMemory(1000, 512<<20),
+			Resources: &ateapipb.ResourceRequirements{Limits: resources.CPUMemory(1000, 512<<20)},
 		},
 	})
 	if err != nil {
@@ -840,7 +840,7 @@ func TestUpdateActor_RepointTemplate(t *testing.T) {
 						}},
 						Volumes:        tmpl.volumes,
 						SnapshotConfig: &ateapipb.SnapshotConfig{StorageLocation: "gs://my-bucket/snapshots"},
-						Resources:      resources.CPUMemory(1000, 512<<20),
+						Resources:      &ateapipb.ResourceRequirements{Limits: resources.CPUMemory(1000, 512<<20)},
 					},
 				}); err != nil {
 					t.Fatalf("CreateActorTemplate %s failed: %v", name, err)
@@ -1246,7 +1246,7 @@ func TestDeleteActor_Running(t *testing.T) {
 			Name: "vol1",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "standard",
-				Capacity:         "10Gi",
+				CapacityBytes:    10 << 30,
 			}},
 		},
 	}, []*ateapipb.VolumeMount{
@@ -1734,7 +1734,7 @@ func TestActorLifecycle_WithExternalVolumes(t *testing.T) {
 			Name: "data-vol",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "fast",
-				Capacity:         "20Gi",
+				CapacityBytes:    20 << 30,
 			}},
 		},
 	}
@@ -1884,14 +1884,14 @@ func TestResumeActor_VolumeCreationFailure(t *testing.T) {
 			Name: "succ-vol1",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "standard",
-				Capacity:         "10Gi",
+				CapacityBytes:    10 << 30,
 			}},
 		},
 		{
 			Name: "fail-vol2",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "standard",
-				Capacity:         "10Gi",
+				CapacityBytes:    10 << 30,
 			}},
 		},
 	}
@@ -2028,14 +2028,14 @@ func TestResumeActor_VolumeCreationRetrySuccess(t *testing.T) {
 			Name: "succ-vol1",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "standard",
-				Capacity:         "10Gi",
+				CapacityBytes:    10 << 30,
 			}},
 		},
 		{
 			Name: "retry-vol2",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "standard",
-				Capacity:         "10Gi",
+				CapacityBytes:    10 << 30,
 			}},
 		},
 	}
@@ -2189,7 +2189,7 @@ func TestResumeActor_VolumeAttachFailureAndRetry(t *testing.T) {
 			Name: "vol1",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "standard",
-				Capacity:         "10Gi",
+				CapacityBytes:    10 << 30,
 			}},
 		},
 	}
@@ -2292,7 +2292,7 @@ func TestResumeActor_VolumeAttachFailure_DeleteActor(t *testing.T) {
 			Name: "vol1",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "standard",
-				Capacity:         "10Gi",
+				CapacityBytes:    10 << 30,
 			}},
 		},
 	}
@@ -2442,14 +2442,14 @@ func TestResumeActor_MultiVolumePartialAttachFailure_Retry(t *testing.T) {
 			Name: "vol1",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "standard",
-				Capacity:         "10Gi",
+				CapacityBytes:    10 << 30,
 			}},
 		},
 		{
 			Name: "vol2",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "standard",
-				Capacity:         "10Gi",
+				CapacityBytes:    10 << 30,
 			}},
 		},
 	}
@@ -2614,7 +2614,7 @@ func TestSuspendActor_VolumeDetachFailure_RetrySuccess(t *testing.T) {
 			Name: "vol1",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "standard",
-				Capacity:         "10Gi",
+				CapacityBytes:    10 << 30,
 			}},
 		},
 	}
@@ -2724,7 +2724,7 @@ func TestSuspendActor_VolumeDetachFailure_DeleteActor(t *testing.T) {
 			Name: "vol1",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "standard",
-				Capacity:         "10Gi",
+				CapacityBytes:    10 << 30,
 			}},
 		},
 	}
@@ -2815,7 +2815,7 @@ func TestSuspendActorAsync_VolumeLifecycle_DetachResumeAndMigrate(t *testing.T) 
 			Name: "vol1",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "standard",
-				Capacity:         "10Gi",
+				CapacityBytes:    10 << 30,
 			}},
 		},
 	}
@@ -3005,7 +3005,7 @@ func TestSuspendActorAsync_VolumeDetachFailure_RetrySuccess(t *testing.T) {
 			Name: "vol1",
 			External: &ateapipb.ExternalVolumeSource{Template: &ateapipb.ExternalVolumeTemplate{
 				StorageClassName: "standard",
-				Capacity:         "10Gi",
+				CapacityBytes:    10 << 30,
 			}},
 		},
 	}
@@ -3187,10 +3187,10 @@ func TestResumeActor(t *testing.T) {
 		Status: &ateapipb.WorkerStatus{
 			State: ateapipb.WorkerState_WORKER_STATE_ACTIVE,
 			// Only the ceiling the worker reported.
-			Capacity: &ateapipb.WorkerResources{Actors: 1, Resources: resources.CPUMemory(1000, 512<<20)},
+			Capacity: &ateapipb.WorkerResources{Actors: 1, CpuMillicores: 1000, MemoryBytes: 512 << 20},
 			// All a listing reports of the assignments: one actor and the
 			// compute its template declares.
-			Allocated:      &ateapipb.WorkerResources{Actors: 1, Resources: resources.CPUMemory(1000, 512<<20)},
+			Allocated:      &ateapipb.WorkerResources{Actors: 1, CpuMillicores: 1000, MemoryBytes: 512 << 20},
 			DefaultRuntime: defaultWorkerRuntime("gvisor"),
 		},
 	}
@@ -3279,7 +3279,7 @@ func createDataFidelityTemplate(t *testing.T, tc *testContext, ns string) *ateap
 			WorkerSelector: &ateapipb.Selector{
 				MatchLabels: map[string]string{poolLabelKey: ns},
 			},
-			Resources: resources.CPUMemory(1000, 512<<20),
+			Resources: &ateapipb.ResourceRequirements{Limits: resources.CPUMemory(1000, 512<<20)},
 		},
 	})
 	if err != nil {
@@ -5337,14 +5337,13 @@ func TestResumeActor_RelocatesAfterDetach(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("ResumeActor(%s) failed: %v", relocated, err)
 	}
-	createWorkerPod(t, tc, ns, "worker-2", "node2", "pool1")
-	setupAteletOnNode(t, tc, "atelet-node2", "node2")
-
-	// Capacity exhaustion is ResourceExhausted.
+	// With no room on any node, the resume fails with ResourceExhausted.
 	_, err = tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{
 		Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: pinned},
 	})
 	assertGrpcError(t, err, codes.ResourceExhausted, "no worker has room for the actor")
+	createWorkerPod(t, tc, ns, "worker-2", "node2", "pool1")
+	setupAteletOnNode(t, tc, "atelet-node2", "node2")
 
 	// node1's atelet reports the paused snapshot uploaded and detached: a report
 	// with only latest_durable.
@@ -5388,6 +5387,79 @@ func TestResumeActor_RelocatesAfterDetach(t *testing.T) {
 	}
 	if got := worker.GetNodeName(); got != "node2" {
 		t.Errorf("worker-2 node = %q, want node2", got)
+	}
+}
+
+// TestResumeActor_DetachesFromFullNode resumes a paused actor whose node is
+// full while another has room: it is detached and restored on the other node.
+func TestResumeActor_DetachesFromFullNode(t *testing.T) {
+	ns := namespaceForTest("ns-resume-detach")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	workerName := createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
+
+	const pinned, squatter = "actor-pinned", "actor-squatter"
+	for _, name := range []string{pinned, squatter} {
+		if _, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+			Metadata:      &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: name},
+			ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl1"},
+		}}); err != nil {
+			t.Fatalf("CreateActor(%s) failed: %v", name, err)
+		}
+	}
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: pinned},
+	}); err != nil {
+		t.Fatalf("ResumeActor(%s) failed: %v", pinned, err)
+	}
+	if _, err := tc.client.SuspendActor(context.Background(), &ateapipb.SuspendActorRequest{
+		Actor:   &ateapipb.ObjectRef{Atespace: testAtespace, Name: pinned},
+		Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS},
+	}); err != nil {
+		t.Fatalf("SuspendActor(%s) failed: %v", pinned, err)
+	}
+	paused, err := tc.client.GetActor(context.Background(), &ateapipb.GetActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: pinned},
+	})
+	if err != nil {
+		t.Fatalf("GetActor(%s) failed: %v", pinned, err)
+	}
+	ls := localSnapshot(paused.GetStatus())
+	if ls == nil || paused.GetStatus().GetAssignedNode() != "node1" {
+		t.Fatalf("paused actor = %v, want a local snapshot on node1", paused.GetStatus())
+	}
+	waitForWorkerAvailable(t, tc, workerName)
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: squatter},
+	}); err != nil {
+		t.Fatalf("ResumeActor(%s) failed: %v", squatter, err)
+	}
+	createWorkerPod(t, tc, ns, "worker-2", "node2", "pool1")
+	setupAteletOnNode(t, tc, "atelet-node2", "node2")
+
+	resumed, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: pinned},
+	})
+	if err != nil {
+		t.Fatalf("ResumeActor(%s) on a full node failed: %v", pinned, err)
+	}
+	if got := resumed.GetActor().GetStatus().GetWorkerAssignment().GetWorkerPod(); got != "worker-2" {
+		t.Errorf("resumed onto worker %q, want worker-2 (the worker on node2)", got)
+	}
+	tc.fakeAtelet.Lock.Lock()
+	detach := proto.CloneOf(tc.fakeAtelet.DetachRequest)
+	tc.fakeAtelet.Lock.Unlock()
+	if got := detach.GetActorUid(); got != paused.GetMetadata().GetUid() {
+		t.Errorf("DetachActor actor_uid = %q, want %q", got, paused.GetMetadata().GetUid())
+	}
+	restore := tc.fakeAtelet.lastRestoreRequest()
+	if got := restore.GetSnapshot().GetSnapshotUuid(); got != ls.GetUuid() {
+		t.Errorf("Restore snapshot = %q, want the detached snapshot %q", got, ls.GetUuid())
+	}
+	if got := restore.GetSnapshot().GetObject().GetSnapshotUri(); got != ls.GetDurableSnapshot().GetObject().GetSnapshotUri() {
+		t.Errorf("Restore snapshot URI = %q, want %q", got, ls.GetDurableSnapshot().GetObject().GetSnapshotUri())
 	}
 }
 
