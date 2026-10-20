@@ -688,7 +688,7 @@ tests:
   # and checkpoint alike, after 150 ms on every atelet node, so a cycle
   # spends 300 ms in the data plane, after minting the actor's certificate
   # on each restore as ateom does. The 200 fake Workers hold 1000 actors
-  # each, and at 10m CPU an actor books next to nothing of a Worker's CPU,
+  # each, and at 5m CPU an actor books next to nothing of a Worker's CPU,
   # which a fake Worker reports as its node's allocatable, so placement
   # never binds on any node size. resumepaused sends the actors no
   # requests, which the fake data plane needs.
@@ -700,7 +700,7 @@ tests:
     duration: 23m
     users: 1000
     workerCount: 200
-    actorCPU: "10m"
+    actorCPU: "5m"
     runnerCpu: "8"
     runnerMemory: "2Gi"
     isolate:
@@ -729,7 +729,7 @@ tests:
     duration: 6m
     users: 50
     workerCount: 2
-    actorCPU: "10m"
+    actorCPU: "5m"
     isolate:
       delay: 150ms
     ateArgs:
@@ -744,3 +744,257 @@ tests:
       - "50"
       - "--ladder"
       - "50:2m@20,50:2m@50"
+  - name: ateapi_cold_resume_pause_fake_4cpu
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, ate-api-server at 4 CPUs: rate ladder 250-2500 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumepaused.py,/app/shapes/ladder_shape.py
+    duration: 23m
+    users: 2000
+    workerCount: 200
+    actorCPU: "5m"
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    isolate:
+      delay: 150ms
+    ateArgs:
+      - "--cordon-control-plane"
+    controlPlane:
+      apiServer:
+        cpu: 4
+        memory: 4Gi
+        poolMaxConns: 64
+    flags:
+      - "--ladder-spawn-rate"
+      - "2000"
+      - "--ladder"
+      - "2000:3m@250,2000:3m@500,2000:3m@1000,2000:3m@1500,2000:3m@1750,2000:3m@2000,2000:3m@2500"
+  # Steps through the 8 CPU ceiling, between 2500 and 2700/s, in 100s.
+  # 3000 users keep a step from running out of users before ate-api-server
+  # or Postgres saturates.
+  - name: ateapi_cold_resume_pause_fake_8cpu
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, ate-api-server at 8 CPUs: rate ladder 2400-2900 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumepaused.py,/app/shapes/ladder_shape.py
+    duration: 20m
+    users: 3000
+    workerCount: 200
+    actorCPU: "5m"
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    isolate:
+      delay: 150ms
+    ateArgs:
+      - "--cordon-control-plane"
+    controlPlane:
+      apiServer:
+        cpu: 8
+        memory: 4Gi
+        poolMaxConns: 64
+    flags:
+      - "--ladder-spawn-rate"
+      - "3000"
+      - "--ladder"
+      - "3000:3m@2400,3000:3m@2500,3000:3m@2600,3000:3m@2700,3000:3m@2800,3000:3m@2900"
+  - name: ateapi_cold_resume_pause_fake_2x8cpu
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 2 ate-api-server replicas at 8 CPUs: rate ladder 2500-5000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumepaused.py,/app/shapes/ladder_shape.py
+    duration: 20m
+    users: 6000
+    workerCount: 200
+    actorCPU: "5m"
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    isolate:
+      delay: 150ms
+    ateArgs:
+      - "--cordon-control-plane"
+    controlPlane:
+      apiServer:
+        cpu: 8
+        replicas: 2
+        memory: 4Gi
+        poolMaxConns: 40
+      postgres:
+        args:
+          - track_wal_io_timing=on
+    flags:
+      - "--ladder-spawn-rate"
+      - "6000"
+      - "--ladder"
+      - "6000:3m@2500,6000:3m@3000,6000:3m@3500,6000:3m@4000,6000:3m@4500,6000:3m@5000"
+  # The 2 x 8 CPU test against three Postgres setups, to lift the commit
+  # path that stops it at about 3670/s: size10 Postgres; size0 with size10's
+  # WAL and checkpoint settings; and those plus group commit. Each times its
+  # WAL I/O, so pg_stat_io shows the fsync rate and latency.
+  - name: ateapi_cold_resume_pause_fake_2x8cpu_size10
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 2 ate-api-server replicas at 8 CPUs, size10 Postgres: rate ladder 2500-5000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumepaused.py,/app/shapes/ladder_shape.py
+    duration: 20m
+    users: 6000
+    workerCount: 200
+    actorCPU: "5m"
+    runnerCpu: "8"
+    runnerMemory: "2Gi"
+    isolate:
+      delay: 150ms
+    ateArgs:
+      - "--cluster-size=size10"
+      - "--cordon-control-plane"
+    controlPlane:
+      apiServer:
+        cpu: 8
+        replicas: 2
+        memory: 4Gi
+        poolMaxConns: 40
+      postgres:
+        args:
+          - track_wal_io_timing=on
+    flags:
+      - "--ladder-spawn-rate"
+      - "6000"
+      - "--ladder"
+      - "6000:3m@2500,6000:3m@3000,6000:3m@3500,6000:3m@4000,6000:3m@4500,6000:3m@5000"
+  # Three 8 CPU replicas, 24 CPUs in all, against size10 Postgres. On size10
+  # the 2 x 8 test stopped at about 3680/s with ate-api-server at 85% of its
+  # CPU and each WAL fsync carrying about 50 commits; a third replica puts
+  # more commits in flight. If the ceiling scales with ate-api-server's CPU it
+  # lands near 5500/s, inside the ladder. The pools stay at 40, 3 x (40 + 5)
+  # = 135 of size10's 300 connections, and the runner gets more CPU for the
+  # higher rate.
+  - name: ateapi_cold_resume_pause_fake_3x8cpu_size10
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 3 ate-api-server replicas at 8 CPUs, size10 Postgres: rate ladder 3000-6500 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumepaused.py,/app/shapes/ladder_shape.py
+    duration: 26m
+    users: 8000
+    workerCount: 200
+    actorCPU: "5m"
+    runnerCpu: "12"
+    runnerMemory: "3Gi"
+    isolate:
+      delay: 150ms
+    ateArgs:
+      - "--cluster-size=size10"
+      - "--cordon-control-plane"
+    controlPlane:
+      apiServer:
+        cpu: 8
+        replicas: 3
+        memory: 4Gi
+        poolMaxConns: 40
+      postgres:
+        args:
+          - track_wal_io_timing=on
+    flags:
+      - "--ladder-spawn-rate"
+      - "8000"
+      - "--ladder"
+      - "8000:3m@3000,8000:3m@3500,8000:3m@4000,8000:3m@4500,8000:3m@5000,8000:3m@5500,8000:3m@6000,8000:3m@6500"
+  # Four 8 CPU replicas, 32 CPUs in all, against size10 Postgres: the next
+  # point after 3 x 8 on whether the ceiling keeps rising with
+  # ate-api-server's CPU, toward about 7300/s if it doubles 2 x 8's. The pools
+  # stay at 40, 4 x (40 + 5) = 180 of size10's 300 connections, and the
+  # runner gets the 16 CPUs the 1M-actor runs used at about 7000/s.
+  - name: ateapi_cold_resume_pause_fake_4x8cpu_size10
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 4 ate-api-server replicas at 8 CPUs, size10 Postgres: rate ladder 4000-8000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumepaused.py,/app/shapes/ladder_shape.py
+    duration: 29m
+    users: 10000
+    workerCount: 200
+    actorCPU: "5m"
+    runnerCpu: "16"
+    runnerMemory: "4Gi"
+    isolate:
+      delay: 150ms
+    ateArgs:
+      - "--cluster-size=size10"
+      - "--cordon-control-plane"
+    controlPlane:
+      apiServer:
+        cpu: 8
+        replicas: 4
+        memory: 4Gi
+        poolMaxConns: 40
+      postgres:
+        args:
+          - track_wal_io_timing=on
+    flags:
+      - "--ladder-spawn-rate"
+      - "10000"
+      - "--ladder"
+      - "10000:3m@4000,10000:3m@4500,10000:3m@5000,10000:3m@5500,10000:3m@6000,10000:3m@6500,10000:3m@7000,10000:3m@7500,10000:3m@8000"
+  # Five and six 8 CPU replicas, 40 and 48 CPUs in all, against size10
+  # Postgres: where adding replicas stops paying. From 2 to 4 replicas each
+  # added about 1000-1250 cycles/s, as each WAL fsync carried more commits
+  # (about 50 at 2 x 8, 86 at 4 x 8). The pools stay at 40, 5 and 6 x (40 + 5)
+  # = 225 and 270 of size10's 300 connections; all replicas fit one 88 CPU
+  # node of the control-plane pool.
+  - name: ateapi_cold_resume_pause_fake_5x8cpu_size10
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 5 ate-api-server replicas at 8 CPUs, size10 Postgres: rate ladder 4500-9000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumepaused.py,/app/shapes/ladder_shape.py
+    duration: 32m
+    users: 12000
+    workerCount: 200
+    actorCPU: "5m"
+    runnerCpu: "16"
+    runnerMemory: "5Gi"
+    isolate:
+      delay: 150ms
+    ateArgs:
+      - "--cluster-size=size10"
+      - "--cordon-control-plane"
+    controlPlane:
+      apiServer:
+        cpu: 8
+        replicas: 5
+        memory: 4Gi
+        poolMaxConns: 40
+      postgres:
+        args:
+          - track_wal_io_timing=on
+    flags:
+      - "--ladder-spawn-rate"
+      - "12000"
+      - "--ladder"
+      - "12000:3m@4500,12000:3m@5000,12000:3m@5500,12000:3m@6000,12000:3m@6500,12000:3m@7000,12000:3m@7500,12000:3m@8000,12000:3m@8500,12000:3m@9000"
+  - name: ateapi_cold_resume_pause_fake_6x8cpu_size10
+    type: locust
+    description: "ate-api-server cold resume on the fake data plane, 6 ate-api-server replicas at 8 CPUs, size10 Postgres: rate ladder 5000-10000 cold resumes/s"
+    targetCluster: dev
+    file: /app/tests/resumepaused.py,/app/shapes/ladder_shape.py
+    duration: 35m
+    users: 14000
+    workerCount: 200
+    actorCPU: "5m"
+    runnerCpu: "16"
+    runnerMemory: "6Gi"
+    isolate:
+      delay: 150ms
+    ateArgs:
+      - "--cluster-size=size10"
+      - "--cordon-control-plane"
+    controlPlane:
+      apiServer:
+        cpu: 8
+        replicas: 6
+        memory: 4Gi
+        poolMaxConns: 40
+      postgres:
+        args:
+          - track_wal_io_timing=on
+    flags:
+      - "--ladder-spawn-rate"
+      - "14000"
+      - "--ladder"
+      - "14000:3m@5000,14000:3m@5500,14000:3m@6000,14000:3m@6500,14000:3m@7000,14000:3m@7500,14000:3m@8000,14000:3m@8500,14000:3m@9000,14000:3m@9500,14000:3m@10000"
