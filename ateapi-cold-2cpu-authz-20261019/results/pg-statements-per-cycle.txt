@@ -1,0 +1,46 @@
+Postgres statements per resume + pause cycle at the 400/s step (unsaturated in both runs),
+from pg_stat_statements_calls_total in the nh-prow-parity benchmarking Prometheus.
+'old doc' marks a queryid that ateapi-cold-2-4-8cpu-20261009/postgres-commits-per-cycle.md
+(branch ateapi-cold-resume-capacity) also lists; 'NEW' marks one it does not.
+
+== prow-authz-on: window [1792439137, 1792439283], 146s; total 49.1 statements/cycle
+    7.01   -3509896502602713351  NEW      OpenFGA: SELECT ... FROM tuple WHERE _user AND object_id AND object_type AND relation AND store AND user_type
+    6.00    2746378599054124034  old doc  
+    5.96   -4603026321853880210  NEW      OpenFGA: SELECT ... FROM tuple WHERE store AND object_type AND object_id AND relation
+    4.00   -4441328662304304489  old doc  
+    4.00   -6555171763657768259  old doc  
+    2.00    6097083398544187049  old doc  
+    2.00    4854991825702068830  old doc  
+    2.00   -7642016025207542908  old doc  
+    2.00   -7250248760999745136  old doc  
+    2.00   -3542883333257437982  old doc  
+    2.00   -3154300369275581113  old doc  
+    2.00   -8511877388419603168  old doc  
+    2.00   -3065665242670061812  old doc  
+    2.00   -7605597855520435171  old doc  
+    1.00   -6107092359095529422  old doc  
+    1.00    1815471240457602673  old doc  
+    1.00   -8081109363834187016  old doc  
+    1.00   -6545093977828135672  NEW      SELECT proto, worker_name FROM worker_assignments WHERE actor_uid = $1
+    0.05    7601299121316520603  old doc  
+    0.05    1397548843350673252  old doc  
+
+== prow-authz-off: window [1792443190, 1792443335], 145s; total 36.1 statements/cycle
+    6.00    2746378599054124034  old doc  
+    4.00   -6555171763657768259  old doc  
+    4.00   -4441328662304304489  old doc  
+    2.00    4854991825702068830  old doc  
+    2.00   -3065665242670061812  old doc  
+    2.00    6097083398544187049  old doc  
+    2.00   -8511877388419603168  old doc  
+    2.00   -7605597855520435171  old doc  
+    2.00   -7250248760999745136  old doc  
+    2.00   -3542883333257437982  old doc  
+    2.00   -3154300369275581113  old doc  
+    2.00   -7642016025207542908  old doc  
+    1.00   -8081109363834187016  old doc  
+    1.00   -6545093977828135672  NEW      SELECT proto, worker_name FROM worker_assignments WHERE actor_uid = $1
+    1.00    1815471240457602673  old doc  
+    1.00   -6107092359095529422  old doc  
+    0.05    7601299121316520603  old doc  
+    0.05    1397548843350673252  old doc  

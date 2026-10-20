@@ -1,0 +1,1364 @@
+=== ateapi_cold_resume_pause_fake_2cpu at 974379e0061543d1f36b5a86a0d92823869075c4 -> gs://snapshot-substrate-poc-haiyanmeng-gke-dev/benchmark-results
+$ gcloud auth configure-docker gcr.io --quiet
+WARNING: Your config file at [/home/haiyanmeng/.docker/config.json] contains these credential helper entries:
+
+{
+  "credHelpers": {
+    "gcr.io": "gcloud",
+    "us.gcr.io": "gcloud",
+    "eu.gcr.io": "gcloud",
+    "asia.gcr.io": "gcloud",
+    "staging-k8s.gcr.io": "gcloud",
+    "marketplace.gcr.io": "gcloud"
+  }
+}
+Adding credentials for: gcr.io
+gcloud credential helpers already registered correctly.
+  (took 1.5s)
+$ docker build --platform linux/amd64 -t gcr.io/haiyanmeng-gke-dev/ate-images/locust-test:974379e0061543d1f36b5a86a0d92823869075c4 -f benchmarking/locust/Dockerfile .
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 2.87kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/python:3.11-slim
+#2 ...
+
+#3 [internal] load metadata for gcr.io/distroless/python3-debian12:latest
+#3 DONE 0.3s
+
+#4 [internal] load metadata for docker.io/library/golang:1.26-bookworm
+#4 ...
+
+#2 [internal] load metadata for docker.io/library/python:3.11-slim
+#2 DONE 0.6s
+
+#4 [internal] load metadata for docker.io/library/golang:1.26-bookworm
+#4 DONE 0.6s
+
+#5 [internal] load metadata for docker.io/library/python:3.12-slim
+#5 DONE 0.6s
+
+#6 [internal] load .dockerignore
+#6 transferring context: 2B done
+#6 DONE 0.0s
+
+#7 [goboomer 1/8] FROM docker.io/library/golang:1.26-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c
+#7 DONE 0.0s
+
+#8 [stage-3  1/14] FROM gcr.io/distroless/python3-debian12:latest@sha256:2fdb05402a2cf21cf78fdb3ba4c5db167241e9e498140f5bf689d7efb773731f
+#8 DONE 0.0s
+
+#9 [pydeps 1/4] FROM docker.io/library/python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce
+#9 resolve docker.io/library/python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce 0.0s done
+#9 DONE 0.0s
+
+#10 [pyprotos 1/8] FROM docker.io/library/python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+#10 resolve docker.io/library/python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 0.0s done
+#10 DONE 0.0s
+
+#11 [internal] load build context
+#11 transferring context: 1.23MB 1.2s done
+#11 DONE 1.3s
+
+#12 [goboomer 4/8] COPY vendor ./vendor
+#12 CACHED
+
+#13 [stage-3  5/14] COPY benchmarking/locust/common/ /app/common/
+#13 CACHED
+
+#14 [stage-3 11/14] COPY benchmarking/locust/server_telemetry.py /app/server_telemetry.py
+#14 CACHED
+
+#15 [stage-3  9/14] COPY benchmarking/locust/runner.py /app/runner.py
+#15 CACHED
+
+#16 [goboomer 3/8] COPY go.mod go.sum ./
+#16 CACHED
+
+#17 [goboomer 5/8] COPY cmd ./cmd
+#17 CACHED
+
+#18 [stage-3 10/14] COPY benchmarking/locust/cluster_facts.py /app/cluster_facts.py
+#18 CACHED
+
+#19 [stage-3  7/14] COPY benchmarking/locust/shapes/ /app/shapes/
+#19 CACHED
+
+#20 [pyprotos 5/8] COPY benchmarking/locust/codegen/generate.sh benchmarking/locust/codegen/
+#20 CACHED
+
+#21 [goboomer 6/8] COPY internal ./internal
+#21 CACHED
+
+#22 [pydeps 2/4] WORKDIR /app
+#22 CACHED
+
+#23 [stage-3  3/14] COPY --from=pydeps /app/deps /app/deps
+#23 CACHED
+
+#24 [stage-3  4/14] COPY --from=goboomer /out/boomer-worker /app/boomer-worker
+#24 CACHED
+
+#25 [stage-3 13/14] COPY benchmarking/locust/ladder_steps.py /app/ladder_steps.py
+#25 CACHED
+
+#26 [goboomer 8/8] RUN CGO_ENABLED=0 GOFLAGS=-mod=vendor go build -o /out/boomer-worker ./cmd/benchmarking/boomer-worker
+#26 CACHED
+
+#27 [stage-3  8/14] COPY benchmarking/locust/tests/ /app/tests/
+#27 CACHED
+
+#28 [goboomer 7/8] COPY pkg ./pkg
+#28 CACHED
+
+#29 [goboomer 2/8] WORKDIR /src
+#29 CACHED
+
+#30 [pyprotos 8/8] RUN PYTHON=python3 OUT_DIR=/out benchmarking/locust/codegen/generate.sh
+#30 CACHED
+
+#31 [pyprotos 2/8] WORKDIR /src
+#31 CACHED
+
+#32 [pyprotos 4/8] RUN pip install --no-cache-dir -r benchmarking/locust/codegen/requirements.txt
+#32 CACHED
+
+#33 [stage-3  6/14] COPY --from=pyprotos /out/ /app/common/
+#33 CACHED
+
+#34 [pydeps 4/4] RUN pip install --no-cache-dir --target=/app/deps -r requirements.txt
+#34 CACHED
+
+#35 [stage-3  2/14] WORKDIR /app
+#35 CACHED
+
+#36 [pyprotos 3/8] COPY benchmarking/locust/codegen/requirements.txt benchmarking/locust/codegen/
+#36 CACHED
+
+#37 [stage-3 12/14] COPY benchmarking/locust/phase_breakdown.py /app/phase_breakdown.py
+#37 CACHED
+
+#38 [pyprotos 6/8] COPY pkg/proto pkg/proto
+#38 CACHED
+
+#39 [pyprotos 7/8] COPY internal/proto internal/proto
+#39 CACHED
+
+#40 [pydeps 3/4] COPY benchmarking/locust/requirements.txt .
+#40 CACHED
+
+#41 [stage-3 14/14] COPY benchmarking/analysis/phase_report.py /app/phase_report.py
+#41 CACHED
+
+#42 exporting to image
+#42 exporting layers done
+#42 writing image sha256:5597d7c486eccc88f9600f5a194b9351865ddc981848d8ea24baae9011faf931 done
+#42 naming to gcr.io/haiyanmeng-gke-dev/ate-images/locust-test:974379e0061543d1f36b5a86a0d92823869075c4 done
+#42 DONE 0.0s
+  (took 2.4s)
+$ docker push gcr.io/haiyanmeng-gke-dev/ate-images/locust-test:974379e0061543d1f36b5a86a0d92823869075c4
+The push refers to repository [gcr.io/haiyanmeng-gke-dev/ate-images/locust-test]
+74b21cb9ded8: Preparing
+ee93d1be71b3: Preparing
+a09d96b5f50f: Preparing
+b720c6366afc: Preparing
+121c80a5b7be: Preparing
+2cf02d48d24f: Preparing
+00be03098bf8: Preparing
+06fa5a3669d6: Preparing
+76219581a9b9: Preparing
+b0f9941a8642: Preparing
+f8a33b857624: Preparing
+ca27a8b37f63: Preparing
+ddc2f7c0a75d: Preparing
+f6b793f2e620: Preparing
+f0710678ba0b: Preparing
+073d3804e7d9: Preparing
+d85a281330c3: Preparing
+34029bd8646f: Preparing
+21df81c862b2: Preparing
+6d945ac65d26: Preparing
+af377b41bfba: Preparing
+b31f6057c6e5: Preparing
+4fcd8b117df4: Preparing
+b1c2c1dbf4c8: Preparing
+c93bbfda2587: Preparing
+e9a2ae4af403: Preparing
+1ca5d6162237: Preparing
+799042d6c30b: Preparing
+f8a33b857624: Waiting
+b47d9619ecfb: Preparing
+ca27a8b37f63: Waiting
+dd8bd834609c: Preparing
+6a5a95a9c158: Preparing
+ddc2f7c0a75d: Waiting
+00be03098bf8: Waiting
+f6b793f2e620: Waiting
+f3d99806ca40: Preparing
+1230ca28c337: Preparing
+b0f9941a8642: Waiting
+926d62780f67: Preparing
+5cad5c1bcb12: Preparing
+c3e70ac51b35: Preparing
+2a45b556222e: Preparing
+d20e351ed4b9: Preparing
+06fa5a3669d6: Waiting
+7095412417d2: Preparing
+c3abae442368: Preparing
+6819a1af097d: Preparing
+2401c5ea32a7: Preparing
+bab244f45e0f: Preparing
+bd29502adf19: Preparing
+33b37ab0b090: Preparing
+6e7fbcf090d0: Preparing
+ad51d0769d16: Preparing
+76219581a9b9: Waiting
+4cde6b0bb6f5: Preparing
+bd3cdfae1d3f: Preparing
+f0710678ba0b: Waiting
+6f1cdceb6a31: Preparing
+af5aa97ebe6c: Preparing
+073d3804e7d9: Waiting
+4d049f83d9cf: Preparing
+d85a281330c3: Waiting
+f3d99806ca40: Waiting
+114dde0fefeb: Preparing
+1230ca28c337: Waiting
+4840c7c54023: Preparing
+e9a2ae4af403: Waiting
+c93bbfda2587: Waiting
+926d62780f67: Waiting
+1ca5d6162237: Waiting
+8fa10c0194df: Preparing
+34029bd8646f: Waiting
+799042d6c30b: Waiting
+5cad5c1bcb12: Waiting
+b47d9619ecfb: Waiting
+a33ba213ad26: Preparing
+4fcd8b117df4: Waiting
+dd8bd834609c: Waiting
+b1c2c1dbf4c8: Waiting
+b31f6057c6e5: Waiting
+c3e70ac51b35: Waiting
+6a5a95a9c158: Waiting
+21df81c862b2: Waiting
+c3abae442368: Waiting
+7095412417d2: Waiting
+6d945ac65d26: Waiting
+6819a1af097d: Waiting
+af377b41bfba: Waiting
+4840c7c54023: Waiting
+2401c5ea32a7: Waiting
+6f1cdceb6a31: Waiting
+d20e351ed4b9: Waiting
+8fa10c0194df: Waiting
+af5aa97ebe6c: Waiting
+a33ba213ad26: Waiting
+bab244f45e0f: Waiting
+ad51d0769d16: Waiting
+4d049f83d9cf: Waiting
+bd29502adf19: Waiting
+114dde0fefeb: Waiting
+6e7fbcf090d0: Waiting
+4cde6b0bb6f5: Waiting
+33b37ab0b090: Waiting
+2cf02d48d24f: Waiting
+bd3cdfae1d3f: Waiting
+b720c6366afc: Layer already exists
+a09d96b5f50f: Layer already exists
+74b21cb9ded8: Layer already exists
+121c80a5b7be: Layer already exists
+00be03098bf8: Layer already exists
+06fa5a3669d6: Layer already exists
+2cf02d48d24f: Layer already exists
+76219581a9b9: Layer already exists
+ee93d1be71b3: Layer already exists
+f8a33b857624: Layer already exists
+b0f9941a8642: Layer already exists
+ca27a8b37f63: Layer already exists
+f6b793f2e620: Layer already exists
+ddc2f7c0a75d: Layer already exists
+073d3804e7d9: Layer already exists
+d85a281330c3: Layer already exists
+f0710678ba0b: Layer already exists
+21df81c862b2: Layer already exists
+34029bd8646f: Layer already exists
+af377b41bfba: Layer already exists
+b31f6057c6e5: Layer already exists
+6d945ac65d26: Layer already exists
+4fcd8b117df4: Layer already exists
+b1c2c1dbf4c8: Layer already exists
+e9a2ae4af403: Layer already exists
+1ca5d6162237: Layer already exists
+b47d9619ecfb: Layer already exists
+c93bbfda2587: Layer already exists
+799042d6c30b: Layer already exists
+dd8bd834609c: Layer already exists
+6a5a95a9c158: Layer already exists
+f3d99806ca40: Layer already exists
+1230ca28c337: Layer already exists
+926d62780f67: Layer already exists
+2a45b556222e: Layer already exists
+5cad5c1bcb12: Layer already exists
+c3e70ac51b35: Layer already exists
+7095412417d2: Layer already exists
+d20e351ed4b9: Layer already exists
+c3abae442368: Layer already exists
+6819a1af097d: Layer already exists
+bab244f45e0f: Layer already exists
+2401c5ea32a7: Layer already exists
+6e7fbcf090d0: Layer already exists
+4cde6b0bb6f5: Layer already exists
+33b37ab0b090: Layer already exists
+ad51d0769d16: Layer already exists
+6f1cdceb6a31: Layer already exists
+bd3cdfae1d3f: Layer already exists
+af5aa97ebe6c: Layer already exists
+4d049f83d9cf: Layer already exists
+114dde0fefeb: Layer already exists
+4840c7c54023: Layer already exists
+a33ba213ad26: Layer already exists
+8fa10c0194df: Layer already exists
+bd29502adf19: Layer already exists
+974379e0061543d1f36b5a86a0d92823869075c4: digest: sha256:c4a034afc9689dd3b9b5402914e505da05c03b51641503c86b6f5795dc593872 size: 12024
+  (took 6.0s)
+$ benchmarking/workloads/deploy.sh --delete
+Deleting workloads...
+atespace benchmark-workloads not deleted (may not exist or is not empty)
+  (took 13.8s)
+$ hack/install-ate.sh --delete-ate-system
+configuration: 9 set, 43 default
+  actorJWT.algorithm                          ES256                                      (from default)
+  actorJWT.issuer                             ""                                         (from default)
+  ateapi.authz.bootstrapOwners                ""                                         (from default)
+  ateapi.authz.enabled                        true                                       (from default)
+  ateapi.expectedJWTIssuer                    ""                                         (from default)
+  ateapi.logLevel                             ""                                         (from default)
+  ateapi.postgres.cloudsql.gsa                ""                                         (from default)
+  ateapi.postgres.cloudsql.iamAuth            ""                                         (from default)
+  ateapi.postgres.cloudsql.instance           ""                                         (from default)
+  ateapi.postgres.cloudsql.ipType             ""                                         (from default)
+  ateapi.postgres.owner.connectionString      ""                                         (from default)
+  ateapi.postgres.owner.role                  substrate_owner                            (from default)
+  ateapi.postgres.poolMaxConns                ""                                         (from default)
+  ateapi.postgres.readWrite.connectionString  ""                                         (from default)
+  ateapi.postgres.readWrite.role              substrate_readwrite                        (from default)
+  ateapi.postgres.schema                      ""                                         (from default)
+  ateapi.postgres.serverCAFile                ""                                         (from default)
+  ateapi.postgres.storageClass                ""                                         (from default)
+  atenet.dataplane                            envoy                                      (from default)
+  atenet.egress.additionalExtprocService      ""                                         (from default)
+  atenet.egress.credentialProvider            {"name":"k8s.io"}                          (from ATE_CREDENTIAL_PROVIDER)
+  benchmark.actorMemory                       ""                                         (from default)
+  benchmark.sandboxClass                      gvisor                                     (from default)
+  benchmark.workerCount                       1                                          (from default)
+  clusterSize                                 size0                                      (from default)
+  context                                     ""                                         (from KUBECTL_CONTEXT)
+  cordonControlPlane                          false                                      (from default)
+  csi.setup                                   none                                       (from default)
+  demo.anthropicAPIKey                        ""                                         (from default)
+  demo.counter.storageClass                   standard                                   (from default)
+  demo.counter.withExternalVolume             false                                      (from default)
+  docker.buildFlags                           ""                                         (from default)
+  e2e.envoyConcurrency                        0                                          (from default)
+  fakeDataPlane.enabled                       false                                      (from default)
+  gcp.clusterLocation                         us-west1-c                                 (from CLUSTER_LOCATION)
+  gcp.clusterName                             substrate-poc                              (from CLUSTER_NAME)
+  gcp.projectID                               haiyanmeng-gke-dev                         (from PROJECT_ID)
+  images.repo                                 ""                                         (from default)
+  images.tag                                  ""                                         (from default)
+  ingressAuthMode                             deprecated-insecure                        (from default)
+  kindCluster.enabled                         false                                      (from default)
+  kindCluster.name                            kind                                       (from default)
+  ko.defaultPlatforms                         linux/amd64                                (from KO_DEFAULTPLATFORMS)
+  ko.dockerRepo                               gcr.io/haiyanmeng-gke-dev/ate-images       (from KO_DOCKER_REPO)
+  kubeconfig                                  /tmp/smoke-run/kubeconfig                  (from KUBECONFIG)
+  namespace                                   ate-system                                 (from default)
+  otlpEndpoint                                ""                                         (from default)
+  podcert.workersPerSigner                    0                                          (from default)
+  preview                                     ""                                         (from default)
+  record.dir                                  ""                                         (from default)
+  rolloutTimeout                              1m0s                                       (from default)
+  storage.bucketName                          snapshot-substrate-poc-haiyanmeng-gke-dev  (from BUCKET_NAME)
+[1;36m[step]: gcloud container clusters get-credentials substrate-poc[0m
+Fetching cluster endpoint and auth data.
+kubeconfig entry generated for substrate-poc.
+  (gcloud get-credentials took 2.921s)
+[1;36m[step]: delete_ate_system[0m
+  (delete of 6 objects took 1.304s)
+  (delete of 54 objects took 9.215s)
+  (delete of 2 objects took 0.396s)
+  (delete of 8 objects took 1.602s)
+  (delete of 3 objects took 0.599s)
+  (delete of 5 objects took 0.993s)
+  (took 20.9s)
+$ hack/install-ate.sh --deploy-ate-system --cordon-control-plane --fake-data-plane
+configuration: 13 set, 39 default
+  actorJWT.algorithm                          ES256                                                                                                   (from default)
+  actorJWT.issuer                             ""                                                                                                      (from default)
+  ateapi.authz.bootstrapOwners                system:serviceaccount:ate-system:ate-client,spiffe://cluster.local/ns/benchmarking/sa/benchmark-runner  (from ATE_API_AUTHZ_BOOTSTRAP_OWNERS)
+  ateapi.authz.enabled                        true                                                                                                    (from default)
+  ateapi.expectedJWTIssuer                    ""                                                                                                      (from default)
+  ateapi.logLevel                             ""                                                                                                      (from default)
+  ateapi.postgres.cloudsql.gsa                ""                                                                                                      (from default)
+  ateapi.postgres.cloudsql.iamAuth            ""                                                                                                      (from default)
+  ateapi.postgres.cloudsql.instance           ""                                                                                                      (from default)
+  ateapi.postgres.cloudsql.ipType             ""                                                                                                      (from default)
+  ateapi.postgres.owner.connectionString      ""                                                                                                      (from default)
+  ateapi.postgres.owner.role                  substrate_owner                                                                                         (from default)
+  ateapi.postgres.poolMaxConns                ""                                                                                                      (from default)
+  ateapi.postgres.readWrite.connectionString  ""                                                                                                      (from default)
+  ateapi.postgres.readWrite.role              substrate_readwrite                                                                                     (from default)
+  ateapi.postgres.schema                      ""                                                                                                      (from default)
+  ateapi.postgres.serverCAFile                ""                                                                                                      (from default)
+  ateapi.postgres.storageClass                ""                                                                                                      (from default)
+  atenet.dataplane                            envoy                                                                                                   (from default)
+  atenet.egress.additionalExtprocService      ""                                                                                                      (from default)
+  atenet.egress.credentialProvider            {"name":"k8s.io"}                                                                                       (from ATE_CREDENTIAL_PROVIDER)
+  benchmark.actorMemory                       ""                                                                                                      (from default)
+  benchmark.sandboxClass                      gvisor                                                                                                  (from default)
+  benchmark.workerCount                       1                                                                                                       (from default)
+  clusterSize                                 size0                                                                                                   (from default)
+  context                                     ""                                                                                                      (from KUBECTL_CONTEXT)
+  cordonControlPlane                          true                                                                                                    (from --cordon-control-plane)
+  csi.setup                                   none                                                                                                    (from --setup-csi)
+  demo.anthropicAPIKey                        ""                                                                                                      (from default)
+  demo.counter.storageClass                   standard                                                                                                (from default)
+  demo.counter.withExternalVolume             false                                                                                                   (from default)
+  docker.buildFlags                           ""                                                                                                      (from default)
+  e2e.envoyConcurrency                        0                                                                                                       (from default)
+  fakeDataPlane.enabled                       true                                                                                                    (from --fake-data-plane)
+  gcp.clusterLocation                         us-west1-c                                                                                              (from CLUSTER_LOCATION)
+  gcp.clusterName                             substrate-poc                                                                                           (from CLUSTER_NAME)
+  gcp.projectID                               haiyanmeng-gke-dev                                                                                      (from PROJECT_ID)
+  images.repo                                 ""                                                                                                      (from default)
+  images.tag                                  ""                                                                                                      (from default)
+  ingressAuthMode                             deprecated-insecure                                                                                     (from default)
+  kindCluster.enabled                         false                                                                                                   (from default)
+  kindCluster.name                            kind                                                                                                    (from default)
+  ko.defaultPlatforms                         linux/amd64                                                                                             (from KO_DEFAULTPLATFORMS)
+  ko.dockerRepo                               gcr.io/haiyanmeng-gke-dev/ate-images                                                                    (from KO_DOCKER_REPO)
+  kubeconfig                                  /tmp/smoke-run/kubeconfig                                                                               (from KUBECONFIG)
+  namespace                                   ate-system                                                                                              (from default)
+  otlpEndpoint                                ""                                                                                                      (from default)
+  podcert.workersPerSigner                    0                                                                                                       (from default)
+  preview                                     ""                                                                                                      (from default)
+  record.dir                                  ""                                                                                                      (from default)
+  rolloutTimeout                              1m0s                                                                                                    (from default)
+  storage.bucketName                          snapshot-substrate-poc-haiyanmeng-gke-dev                                                               (from BUCKET_NAME)
+[1;36m[step]: gcloud container clusters get-credentials substrate-poc[0m
+Fetching cluster endpoint and auth data.
+kubeconfig entry generated for substrate-poc.
+  (gcloud get-credentials took 3.156s)
+[1;36m[step]: deploy_ate_system[0m
+  (apply of 1 objects took 0.399s)
+[1;36m[step]: deploy_crds[0m
+[1;36m[step]: images: built from source with ko[0m
+  (ko resolve -f - took 0.115s)
+  (apply of 5 objects took 1.081s)
+[1;36m[step]: ensure_apiserver_prerequisites[0m
+[1;36m[step]: create_jwt_authority_pool_secret[0m
+  created pool secret ate-system/actor-id-jwt-pool
+[1;36m[step]: create_actor_id_ca_pool_secret[0m
+  created pool secret ate-system/actor-id-ca-pool
+[1;36m[step]: create_actor_id_ca_certs_secret[0m
+[1;36m[step]: create_api_server_env_vars[0m
+[1;36m[step]: create_api_config[0m
+ate-api-config apiconfig.textproto:
+  | logging: {
+  |   level: "info"
+  | }
+[1;36m[step]: create_api_authentication_config[0m
+ate-api-authentication authentication.yaml:
+  | actorIdentityJWTProvider: kubernetes
+  | jwtProviders:
+  | - name: kubernetes
+  |   issuer: https://container.googleapis.com/v1/projects/haiyanmeng-gke-dev/locations/us-west1-c/clusters/substrate-poc
+  |   audiences: [api.ate-system.svc]
+[1;36m[step]: create_podcertificate_controller_cas[0m
+  created pool secret podcertificate-controller-system/service-dns-ca-pool
+  created pool secret podcertificate-controller-system/pod-identity-ca-pool
+  created pool secret podcertificate-controller-system/postgres-ca-pool
+2026/10/19 14:34:47 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/benchmarking/isolate/fake-workersync
+2026/10/19 14:34:47 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/podcertcontroller
+2026/10/19 14:34:48 Building go.ate.dev/substrate/cmd/benchmarking/isolate/fake-workersync for linux/amd64
+2026/10/19 14:34:48 Building go.ate.dev/substrate/cmd/podcertcontroller for linux/amd64
+2026/10/19 14:34:54 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/podcertcontroller:latest
+2026/10/19 14:34:55 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/fake-workersync:latest
+2026/10/19 14:34:56 existing manifest: latest@sha256:79e6d2c251b0b22ffb62732eaf945c51e54c19a3e97937cfd444193879ba4e67
+2026/10/19 14:34:56 existing manifest: sha256-79e6d2c251b0b22ffb62732eaf945c51e54c19a3e97937cfd444193879ba4e67.sbom@sha256:623f01bea393ede55268739230bea4b32783ddafeabd5569836a92b5855568c2
+2026/10/19 14:34:56 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/podcertcontroller:sha256-79e6d2c251b0b22ffb62732eaf945c51e54c19a3e97937cfd444193879ba4e67.sbom
+2026/10/19 14:34:56 Published gcr.io/haiyanmeng-gke-dev/ate-images/podcertcontroller@sha256:79e6d2c251b0b22ffb62732eaf945c51e54c19a3e97937cfd444193879ba4e67
+2026/10/19 14:34:57 existing manifest: sha256-38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897.sbom@sha256:83b4c2a85f300e6b00f5d447469ec60ee5f0ccf020a758eaf88a46d03affa6df
+2026/10/19 14:34:57 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/fake-workersync:sha256-38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897.sbom
+2026/10/19 14:34:57 existing manifest: latest@sha256:38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897
+2026/10/19 14:34:57 Published gcr.io/haiyanmeng-gke-dev/ate-images/fake-workersync@sha256:38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897
+  (ko resolve -f - took 12.861s)
+  (apply of 14 objects took 2.730s)
+  (rollout status deployment/podcertificate-controller took 0.115s)
+Waiting for podcertificate ClusterTrustBundles to be ready...
+  (wait for clustertrustbundles took 6.791s)
+[1;36m[step]: setup_csi[0m
+Skipping CSI driver setup.
+[1;36m[step]: deploy_sandboxconfig[0m
+[1;36m[step]: ensure_crds[0m
+  (apply of 2 objects took 0.333s)
+  (apply of 1 objects took 0.159s)
+  (apply of 1 objects took 0.131s)
+  (apply of 11 objects took 1.251s)
+  (rollout status statefulset/postgres took 20.092s)
+[1;36m[step]: setup_bundled_postgres[0m
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 2.01kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+#2 DONE 0.4s
+
+#3 [internal] load metadata for docker.io/envoyproxy/envoy:v1.39.4@sha256:74bd4eb5629708d3fadca1a5e6b85d208f338d7bb54e06b69565905c5294cc01
+#3 DONE 0.4s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 2B done
+#4 DONE 0.0s
+
+#5 [stage-1 1/2] FROM docker.io/envoyproxy/envoy:v1.39.4@sha256:74bd4eb5629708d3fadca1a5e6b85d208f338d7bb54e06b69565905c5294cc01
+#5 DONE 0.0s
+
+#6 [builder 1/5] FROM docker.io/library/rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+#6 DONE 0.0s
+
+#7 [internal] load build context
+#7 transferring context: 750B done
+#7 DONE 0.0s
+
+#8 [builder 5/5] RUN cargo build --release --locked
+#8 CACHED
+
+#9 [builder 2/5] WORKDIR /usr/src/dynamic-modules
+#9 CACHED
+
+#10 [builder 3/5] RUN apt-get update && apt-get install -y --no-install-recommends     clang     libclang-dev     && rm -rf /var/lib/apt/lists/*
+#10 CACHED
+
+#11 [builder 4/5] COPY dynamic-modules/ .
+#11 CACHED
+
+#12 [stage-1 2/2] COPY --from=builder /usr/src/dynamic-modules/target/release/libenvoy_substrate_egress_policy.so /usr/local/lib/libenvoy_substrate_egress_policy.so
+#12 CACHED
+
+#13 exporting to image
+#13 exporting layers done
+#13 writing image sha256:4ea4bf81425487a519991ad08b4252d53862fbc9e650ccde56d51121c5db8de1 done
+#13 naming to gcr.io/haiyanmeng-gke-dev/ate-images/envoy-dataplane:build-1792434930 done
+#13 DONE 0.0s
+
+#14 pushing gcr.io/haiyanmeng-gke-dev/ate-images/envoy-dataplane:build-1792434930 with docker
+#14 pushing layer 2a6f3e5ad58a
+#14 pushing layer 5f70bf18a086
+#14 pushing layer 6880eec352b7
+#14 pushing layer 8990fa79624e
+#14 pushing layer 87483e51c666
+#14 pushing layer 9ab5f05ddc89
+#14 pushing layer ceb5819bab4a
+#14 pushing layer 11e29e3711fb
+#14 pushing layer 7612abfdc3f6
+#14 pushing layer cbaf391e6709
+#14 pushing layer 9ab5f05ddc89 1.2s done
+#14 pushing layer 2a6f3e5ad58a 1.2s done
+#14 pushing layer 5f70bf18a086 1.2s done
+#14 pushing layer 6880eec352b7 1.2s done
+#14 pushing layer 8990fa79624e 1.2s done
+#14 pushing layer 87483e51c666 1.2s done
+#14 pushing layer ceb5819bab4a 1.2s done
+#14 pushing layer 11e29e3711fb 1.2s done
+#14 pushing layer 7612abfdc3f6 1.2s done
+#14 pushing layer cbaf391e6709 1.2s done
+#14 DONE 2.7s
+2026/10/19 14:35:41 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/benchmarking/isolate/fake-workersync
+2026/10/19 14:35:41 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/objectstore-plugin
+2026/10/19 14:35:41 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/benchmarking/isolate/fake-atelet
+2026/10/19 14:35:41 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/ateapi
+2026/10/19 14:35:41 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/ate-idp-server
+2026/10/19 14:35:41 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/atecontroller
+2026/10/19 14:35:41 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/atenet
+2026/10/19 14:35:42 Building go.ate.dev/substrate/cmd/benchmarking/isolate/fake-workersync for linux/amd64
+2026/10/19 14:35:42 Building go.ate.dev/substrate/cmd/benchmarking/isolate/fake-atelet for linux/amd64
+2026/10/19 14:35:42 Building go.ate.dev/substrate/cmd/ateapi for linux/amd64
+2026/10/19 14:35:42 Building go.ate.dev/substrate/cmd/objectstore-plugin for linux/amd64
+2026/10/19 14:35:42 Building go.ate.dev/substrate/cmd/ate-idp-server for linux/amd64
+2026/10/19 14:35:42 Building go.ate.dev/substrate/cmd/atecontroller for linux/amd64
+2026/10/19 14:35:42 Building go.ate.dev/substrate/cmd/atenet for linux/amd64
+2026/10/19 14:35:47 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/ate-idp-server:latest
+2026/10/19 14:35:50 existing manifest: latest@sha256:87dad42125189273ea339b618610acea9b3ed805d9784ee30ca4c4bee5dc1dd6
+2026/10/19 14:35:50 existing manifest: sha256-87dad42125189273ea339b618610acea9b3ed805d9784ee30ca4c4bee5dc1dd6.sbom@sha256:45b65dc5b9bdafa5026e8080547d9ed0861d6f2a12633a643e757b625cbe0874
+2026/10/19 14:35:50 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/ate-idp-server:sha256-87dad42125189273ea339b618610acea9b3ed805d9784ee30ca4c4bee5dc1dd6.sbom
+2026/10/19 14:35:50 Published gcr.io/haiyanmeng-gke-dev/ate-images/ate-idp-server@sha256:87dad42125189273ea339b618610acea9b3ed805d9784ee30ca4c4bee5dc1dd6
+2026/10/19 14:35:52 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/objectstore-plugin:latest
+2026/10/19 14:35:55 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/fake-workersync:latest
+2026/10/19 14:35:55 existing manifest: sha256-c990e46cc2f3a354780df79ed033f245edae7a5052441ec2b110410043dd8e71.sbom@sha256:cb21c1e580be82caeaa647f2b29f64c3a7f0d64d5203841391468be27189ec1f
+2026/10/19 14:35:55 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/objectstore-plugin:sha256-c990e46cc2f3a354780df79ed033f245edae7a5052441ec2b110410043dd8e71.sbom
+2026/10/19 14:35:55 existing manifest: latest@sha256:c990e46cc2f3a354780df79ed033f245edae7a5052441ec2b110410043dd8e71
+2026/10/19 14:35:55 Published gcr.io/haiyanmeng-gke-dev/ate-images/objectstore-plugin@sha256:c990e46cc2f3a354780df79ed033f245edae7a5052441ec2b110410043dd8e71
+2026/10/19 14:35:56 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/atecontroller:latest
+2026/10/19 14:35:57 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/atenet:latest
+2026/10/19 14:35:57 existing manifest: sha256-38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897.sbom@sha256:83b4c2a85f300e6b00f5d447469ec60ee5f0ccf020a758eaf88a46d03affa6df
+2026/10/19 14:35:57 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/fake-workersync:sha256-38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897.sbom
+2026/10/19 14:35:57 existing manifest: latest@sha256:38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897
+2026/10/19 14:35:57 Published gcr.io/haiyanmeng-gke-dev/ate-images/fake-workersync@sha256:38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897
+2026/10/19 14:35:57 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/ateapi:latest
+2026/10/19 14:35:58 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/fake-atelet:latest
+2026/10/19 14:35:58 existing manifest: latest@sha256:4a2dbcdbe852706a9c7947e83052f0ee7676a1f52e531a1d72e52b54a29ff71d
+2026/10/19 14:35:58 existing manifest: sha256-4a2dbcdbe852706a9c7947e83052f0ee7676a1f52e531a1d72e52b54a29ff71d.sbom@sha256:56a6fbe448d7f3e7b9ebf6222ad07dd2bc6685c855feaae593a76ee7d70ccfeb
+2026/10/19 14:35:58 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/atecontroller:sha256-4a2dbcdbe852706a9c7947e83052f0ee7676a1f52e531a1d72e52b54a29ff71d.sbom
+2026/10/19 14:35:58 Published gcr.io/haiyanmeng-gke-dev/ate-images/atecontroller@sha256:4a2dbcdbe852706a9c7947e83052f0ee7676a1f52e531a1d72e52b54a29ff71d
+2026/10/19 14:36:00 existing manifest: sha256-9f3f76e2f5bd2c3112c7d1f04feac9b782c69a017c3c6dc3b48c8c2b719eb643.sbom@sha256:1bd358bc748edf791722c313d0accf257ca2104035f88ef62b57a6d749986a80
+2026/10/19 14:36:00 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/atenet:sha256-9f3f76e2f5bd2c3112c7d1f04feac9b782c69a017c3c6dc3b48c8c2b719eb643.sbom
+2026/10/19 14:36:00 existing manifest: latest@sha256:9f3f76e2f5bd2c3112c7d1f04feac9b782c69a017c3c6dc3b48c8c2b719eb643
+2026/10/19 14:36:00 Published gcr.io/haiyanmeng-gke-dev/ate-images/atenet@sha256:9f3f76e2f5bd2c3112c7d1f04feac9b782c69a017c3c6dc3b48c8c2b719eb643
+2026/10/19 14:36:01 existing manifest: sha256-8a3551e0569802fea1c106619d66435eec60faa9ff52fade724820ca4212b7dc.sbom@sha256:953fea05167f0b80d4117ccf904c8a1cbc42b98d7b093315a242fd95f3d4b9f8
+2026/10/19 14:36:01 existing manifest: latest@sha256:8a3551e0569802fea1c106619d66435eec60faa9ff52fade724820ca4212b7dc
+2026/10/19 14:36:01 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/ateapi:sha256-8a3551e0569802fea1c106619d66435eec60faa9ff52fade724820ca4212b7dc.sbom
+2026/10/19 14:36:01 Published gcr.io/haiyanmeng-gke-dev/ate-images/ateapi@sha256:8a3551e0569802fea1c106619d66435eec60faa9ff52fade724820ca4212b7dc
+2026/10/19 14:36:02 existing manifest: latest@sha256:10aa80059652c61856bc4d179ff6d63f5bcb6e3fc8d6c39596d8c5e3955512ad
+2026/10/19 14:36:02 existing manifest: sha256-10aa80059652c61856bc4d179ff6d63f5bcb6e3fc8d6c39596d8c5e3955512ad.sbom@sha256:ca7770c7901cbc8a829ffb0fa45201d588fb8f81a6fa1a76c1c65494563ca0d6
+2026/10/19 14:36:02 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/fake-atelet:sha256-10aa80059652c61856bc4d179ff6d63f5bcb6e3fc8d6c39596d8c5e3955512ad.sbom
+2026/10/19 14:36:02 Published gcr.io/haiyanmeng-gke-dev/ate-images/fake-atelet@sha256:10aa80059652c61856bc4d179ff6d63f5bcb6e3fc8d6c39596d8c5e3955512ad
+  (ko resolve -f - took 24.435s)
+Warning: system:serviceaccount:ate-system:ate-client is a bootstrap owner, so anyone who can mint a token for it is a global owner of this install. It is the default so the demos, benchmarks and e2e tests work; for a shared or production install, set --ateapi-authz-bootstrap-owners (ATE_API_AUTHZ_BOOTSTRAP_OWNERS) to your operators' own principals. See docs/authorization.md.
+  (apply of 48 objects took 8.121s)
+[1;36m[step]: create_egress_mitm_ca_pool_secret[0m
+  created pool secret ate-system/egress-mitm-ca-pool
+[1;36m[step]: deploy_k8s_credential_provider[0m
+  (apply of 1 objects took 0.158s)
+2026/10/19 14:36:14 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/benchmarking/isolate/fake-workersync
+2026/10/19 14:36:14 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/credential-provider/kubernetes-secrets
+2026/10/19 14:36:15 Building go.ate.dev/substrate/cmd/credential-provider/kubernetes-secrets for linux/amd64
+2026/10/19 14:36:15 Building go.ate.dev/substrate/cmd/benchmarking/isolate/fake-workersync for linux/amd64
+2026/10/19 14:36:22 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/kubernetes-secrets:latest
+2026/10/19 14:36:23 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/fake-workersync:latest
+2026/10/19 14:36:24 existing manifest: sha256-d928bc6e0e97a660e185cbcc0f1d4d80ee96a7bb29f442f15b093dbc07d34e93.sbom@sha256:5087ef9e5921cd7e7b3228e0a7c7fd6e21b5853e05ba9b55a2693f420d8e312c
+2026/10/19 14:36:24 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/kubernetes-secrets:sha256-d928bc6e0e97a660e185cbcc0f1d4d80ee96a7bb29f442f15b093dbc07d34e93.sbom
+2026/10/19 14:36:24 existing manifest: latest@sha256:d928bc6e0e97a660e185cbcc0f1d4d80ee96a7bb29f442f15b093dbc07d34e93
+2026/10/19 14:36:24 Published gcr.io/haiyanmeng-gke-dev/ate-images/kubernetes-secrets@sha256:d928bc6e0e97a660e185cbcc0f1d4d80ee96a7bb29f442f15b093dbc07d34e93
+2026/10/19 14:36:25 existing manifest: latest@sha256:38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897
+2026/10/19 14:36:25 existing manifest: sha256-38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897.sbom@sha256:83b4c2a85f300e6b00f5d447469ec60ee5f0ccf020a758eaf88a46d03affa6df
+2026/10/19 14:36:25 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/fake-workersync:sha256-38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897.sbom
+2026/10/19 14:36:25 Published gcr.io/haiyanmeng-gke-dev/ate-images/fake-workersync@sha256:38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897
+  (ko resolve -f - took 13.415s)
+  (apply of 14 objects took 1.849s)
+2026/10/19 14:36:30 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/benchmarking/isolate/fake-workersync
+2026/10/19 14:36:30 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/atenet
+2026/10/19 14:36:30 Building go.ate.dev/substrate/cmd/benchmarking/isolate/fake-workersync for linux/amd64
+2026/10/19 14:36:30 Building go.ate.dev/substrate/cmd/atenet for linux/amd64
+2026/10/19 14:36:38 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/fake-workersync:latest
+2026/10/19 14:36:40 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/atenet:latest
+2026/10/19 14:36:40 existing manifest: sha256-38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897.sbom@sha256:83b4c2a85f300e6b00f5d447469ec60ee5f0ccf020a758eaf88a46d03affa6df
+2026/10/19 14:36:40 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/fake-workersync:sha256-38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897.sbom
+2026/10/19 14:36:40 existing manifest: latest@sha256:38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897
+2026/10/19 14:36:40 Published gcr.io/haiyanmeng-gke-dev/ate-images/fake-workersync@sha256:38e32c0a7b8c7276b47232504222e2f566cf4fdb4149944046ea3d0e52184897
+2026/10/19 14:36:42 existing manifest: latest@sha256:9f3f76e2f5bd2c3112c7d1f04feac9b782c69a017c3c6dc3b48c8c2b719eb643
+2026/10/19 14:36:42 existing manifest: sha256-9f3f76e2f5bd2c3112c7d1f04feac9b782c69a017c3c6dc3b48c8c2b719eb643.sbom@sha256:1bd358bc748edf791722c313d0accf257ca2104035f88ef62b57a6d749986a80
+2026/10/19 14:36:42 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/atenet:sha256-9f3f76e2f5bd2c3112c7d1f04feac9b782c69a017c3c6dc3b48c8c2b719eb643.sbom
+2026/10/19 14:36:42 Published gcr.io/haiyanmeng-gke-dev/ate-images/atenet@sha256:9f3f76e2f5bd2c3112c7d1f04feac9b782c69a017c3c6dc3b48c8c2b719eb643
+  (ko resolve -f - took 14.596s)
+  (apply of 12 objects took 1.966s)
+[1;36m[step]: Waiting for ATE system components to be ready...[0m
+  (rollout status deployment/ate-api-server took 0.112s)
+  (rollout status deployment/ate-idp-server took 0.113s)
+  (rollout status deployment/ate-controller took 0.111s)
+  (rollout status deployment/atenet-router took 0.114s)
+  (rollout status deployment/atenet-egress took 6.091s)
+  (rollout status daemonset/atelet took 0.111s)
+  (rollout status deployment/k8s-credential-provider took 0.112s)
+  (rollout status deployment/fake-workersync took 0.113s)
+recorded this configuration in /home/haiyanmeng/.cache/ate-setup/installs/gke_haiyanmeng-gke-dev_us-west1-c_substrate-poc.yaml
+  (took 139.8s)
+$ kubectl -n ate-system patch statefulset postgres --type=strategic -p '{"spec": {"template": {"spec": {"containers": [{"name": "postgres", "args": ["-c", "config_file=/etc/postgresql/postgresql.conf", "-c", "shared_preload_libraries=pg_stat_statements"]}, {"name": "postgres-exporter", "image": "quay.io/prometheuscommunity/postgres-exporter:v0.17.1", "args": ["--collector.stat_statements"], "env": [{"name": "DATA_SOURCE_NAME", "value": "host=/var/run/postgresql user=postgres dbname=atepg sslmode=disable"}], "ports": [{"name": "metrics", "containerPort": 9187}], "volumeMounts": [{"name": "socket", "mountPath": "/var/run/postgresql"}], "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}}}]}}}}'
+statefulset.apps/postgres patched
+  (took 1.3s)
+$ kubectl -n ate-system rollout status statefulset/postgres --timeout=600s
+Waiting for 1 pods to be ready...
+Waiting for 1 pods to be ready...
+Waiting for 1 pods to be ready...
+partitioned roll out complete: 1 new pods have been updated...
+  (took 13.5s)
+$ kubectl -n ate-system exec postgres-0 -c postgres -- psql -U postgres -d atepg -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements'
+CREATE EXTENSION
+  (took 1.6s)
+$ kubectl -n ate-system patch configmap ate-api-server-envvars --type merge -p '{"data": {"ATE_API_POSTGRES_POOL_MAX_CONNS": "64"}}'
+configmap/ate-api-server-envvars patched
+  (took 1.3s)
+$ kubectl -n ate-system patch deployment ate-api-server --type=strategic -p '{"spec": {"replicas": 1, "template": {"spec": {"containers": [{"name": "ate-api-server", "resources": {"requests": {"cpu": "2", "memory": "4Gi"}, "limits": {"cpu": "2", "memory": "4Gi"}}}]}}}}'
+deployment.apps/ate-api-server patched
+  (took 1.3s)
+$ kubectl -n ate-system rollout status deployment/ate-api-server --timeout=600s
+Waiting for deployment "ate-api-server" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "ate-api-server" rollout to finish: 1 old replicas are pending termination...
+deployment "ate-api-server" successfully rolled out
+  (took 10.1s)
+$ kubectl -n ate-system get pods -o wide -l 'app in (ate-api-server,postgres)'
+NAME                              READY   STATUS        RESTARTS   AGE   IP           NODE                                                  NOMINATED NODE   READINESS GATES
+ate-api-server-5b64df7c89-z7vmf   2/2     Running       0          11s   10.64.3.49   gke-substrate-poc-substrate-node-pool-6ef2f75c-jfqv   <none>           <none>
+ate-api-server-865c9d4d69-h6w8f   1/2     Terminating   0          77s   10.64.3.46   gke-substrate-poc-substrate-node-pool-6ef2f75c-jfqv   <none>           <none>
+ate-api-server-865c9d4d69-rp5fv   2/2     Terminating   0          77s   10.64.4.54   gke-substrate-poc-substrate-node-pool-6ef2f75c-rl3k   <none>           <none>
+postgres-0                        3/3     Running       0          27s   10.64.5.18   gke-substrate-poc-substrate-node-pool-6ef2f75c-3rpx   <none>           <none>
+  (took 1.2s)
+$ benchmarking/workloads/deploy.sh --deploy --worker-count 200 --sandbox-class gvisor --actor-cpu 10m --fake-atelet-env FAKE_ATELET_DELAY=150ms
+configmap/fake-atelet-tuning created
+Restarting fake-atelet with its new tuning (FAKE_ATELET_DELAY=150ms)...
+daemonset.apps/atelet restarted
+Waiting for daemon set "atelet" rollout to finish: 1 out of 3 new pods have been updated...
+Waiting for daemon set "atelet" rollout to finish: 1 out of 3 new pods have been updated...
+Waiting for daemon set "atelet" rollout to finish: 1 out of 3 new pods have been updated...
+Waiting for daemon set "atelet" rollout to finish: 2 out of 3 new pods have been updated...
+Waiting for daemon set "atelet" rollout to finish: 2 out of 3 new pods have been updated...
+Waiting for daemon set "atelet" rollout to finish: 2 out of 3 new pods have been updated...
+Waiting for daemon set "atelet" rollout to finish: 2 of 3 updated pods are available...
+daemon set "atelet" successfully rolled out
+Deploying workloads (worker_count=200, actor_memory=256Mi, actor_cpu=10m, worker_memory=unset, storage_class=none, otlp_endpoint=http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317)...
+2026/10/19 14:38:02 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/ateworker-gvisor
+2026/10/19 14:38:03 Building go.ate.dev/substrate/cmd/ateworker-gvisor for linux/amd64
+2026/10/19 14:38:06 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/ateworker-gvisor-6ba39372e3cc3b4b39febbff4256f962:latest
+2026/10/19 14:38:08 existing manifest: latest@sha256:4514dae73a446c5f958cfe40ef5ce608699258bcb9c8216badec61ddf18a720d
+2026/10/19 14:38:08 existing manifest: sha256-4514dae73a446c5f958cfe40ef5ce608699258bcb9c8216badec61ddf18a720d.sbom@sha256:ad96962591bb93f226b3aa7503aa919aea84865ad600d209797650f8dc9a3e89
+2026/10/19 14:38:08 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/ateworker-gvisor-6ba39372e3cc3b4b39febbff4256f962:sha256-4514dae73a446c5f958cfe40ef5ce608699258bcb9c8216badec61ddf18a720d.sbom
+2026/10/19 14:38:08 Published gcr.io/haiyanmeng-gke-dev/ate-images/ateworker-gvisor-6ba39372e3cc3b4b39febbff4256f962@sha256:4514dae73a446c5f958cfe40ef5ce608699258bcb9c8216badec61ddf18a720d
+namespace/benchmark-workloads created
+workerpool.ate.dev/benchmark-worker created
+Waiting for worker pool to be ready (timeout: 300s)...
+workerpool.ate.dev/benchmark-worker condition met
+Warning: no --token-file given; acting as the shared identity system:serviceaccount:ate-system:ate-client rather than as yourself. Pass --token-file to act as yourself.
+ATESPACE              NAME    GOLDEN TAG   ERROR   AGE
+benchmark-workloads   sleep                        0s
+2026/10/19 14:38:23 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/benchmarking/glutton
+2026/10/19 14:38:24 Building go.ate.dev/substrate/cmd/benchmarking/glutton for linux/amd64
+2026/10/19 14:38:27 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/glutton-4b3667ae99a537903d62dbe4a02d5524:latest
+2026/10/19 14:38:29 existing manifest: latest@sha256:1fae280ef4d702f3a536d5c98231bfea1167f3dc809f358ccf2fe0d97c8a1078
+2026/10/19 14:38:29 existing manifest: sha256-1fae280ef4d702f3a536d5c98231bfea1167f3dc809f358ccf2fe0d97c8a1078.sbom@sha256:8a4235639cbe7c51e253e38a0df24671ed0f038545c770b9fd1b951c4f59c480
+2026/10/19 14:38:29 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/glutton-4b3667ae99a537903d62dbe4a02d5524:sha256-1fae280ef4d702f3a536d5c98231bfea1167f3dc809f358ccf2fe0d97c8a1078.sbom
+2026/10/19 14:38:29 Published gcr.io/haiyanmeng-gke-dev/ate-images/glutton-4b3667ae99a537903d62dbe4a02d5524@sha256:1fae280ef4d702f3a536d5c98231bfea1167f3dc809f358ccf2fe0d97c8a1078
+Warning: no --token-file given; acting as the shared identity system:serviceaccount:ate-system:ate-client rather than as yourself. Pass --token-file to act as yourself.
+ATESPACE              NAME      GOLDEN TAG   ERROR   AGE
+benchmark-workloads   glutton                        0s
+2026/10/19 14:38:35 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/benchmarking/glutton
+2026/10/19 14:38:36 Building go.ate.dev/substrate/cmd/benchmarking/glutton for linux/amd64
+2026/10/19 14:38:39 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/glutton-4b3667ae99a537903d62dbe4a02d5524:latest
+2026/10/19 14:38:41 existing manifest: sha256-1fae280ef4d702f3a536d5c98231bfea1167f3dc809f358ccf2fe0d97c8a1078.sbom@sha256:8a4235639cbe7c51e253e38a0df24671ed0f038545c770b9fd1b951c4f59c480
+2026/10/19 14:38:41 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/glutton-4b3667ae99a537903d62dbe4a02d5524:sha256-1fae280ef4d702f3a536d5c98231bfea1167f3dc809f358ccf2fe0d97c8a1078.sbom
+2026/10/19 14:38:41 existing manifest: latest@sha256:1fae280ef4d702f3a536d5c98231bfea1167f3dc809f358ccf2fe0d97c8a1078
+2026/10/19 14:38:41 Published gcr.io/haiyanmeng-gke-dev/ate-images/glutton-4b3667ae99a537903d62dbe4a02d5524@sha256:1fae280ef4d702f3a536d5c98231bfea1167f3dc809f358ccf2fe0d97c8a1078
+Warning: no --token-file given; acting as the shared identity system:serviceaccount:ate-system:ate-client rather than as yourself. Pass --token-file to act as yourself.
+ATESPACE              NAME                  GOLDEN TAG   ERROR   AGE
+benchmark-workloads   glutton-durdir-data                        0s
+2026/10/19 14:38:47 Using base gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe for go.ate.dev/substrate/cmd/benchmarking/glutton
+2026/10/19 14:38:47 Building go.ate.dev/substrate/cmd/benchmarking/glutton for linux/amd64
+2026/10/19 14:38:51 Publishing gcr.io/haiyanmeng-gke-dev/ate-images/glutton-4b3667ae99a537903d62dbe4a02d5524:latest
+2026/10/19 14:38:53 existing manifest: latest@sha256:1fae280ef4d702f3a536d5c98231bfea1167f3dc809f358ccf2fe0d97c8a1078
+2026/10/19 14:38:53 existing manifest: sha256-1fae280ef4d702f3a536d5c98231bfea1167f3dc809f358ccf2fe0d97c8a1078.sbom@sha256:8a4235639cbe7c51e253e38a0df24671ed0f038545c770b9fd1b951c4f59c480
+2026/10/19 14:38:53 Published SBOM gcr.io/haiyanmeng-gke-dev/ate-images/glutton-4b3667ae99a537903d62dbe4a02d5524:sha256-1fae280ef4d702f3a536d5c98231bfea1167f3dc809f358ccf2fe0d97c8a1078.sbom
+2026/10/19 14:38:53 Published gcr.io/haiyanmeng-gke-dev/ate-images/glutton-4b3667ae99a537903d62dbe4a02d5524@sha256:1fae280ef4d702f3a536d5c98231bfea1167f3dc809f358ccf2fe0d97c8a1078
+Warning: no --token-file given; acting as the shared identity system:serviceaccount:ate-system:ate-client rather than as yourself. Pass --token-file to act as yourself.
+ATESPACE              NAME                  GOLDEN TAG   ERROR   AGE
+benchmark-workloads   glutton-durdir-full                        0s
+Waiting for the benchmark-workloads/sleep golden snapshot...
+Waiting for the benchmark-workloads/glutton golden snapshot...
+Waiting for the benchmark-workloads/glutton-durdir-data golden snapshot...
+Waiting for the benchmark-workloads/glutton-durdir-full golden snapshot...
+  (took 100.8s)
+Submitting Job runner-ateapi-cold-resume-pause-fake-2cpu-974379e-c2dfce
+namespace/benchmarking unchanged
+serviceaccount/benchmark-runner unchanged
+rolebinding.rbac.authorization.k8s.io/automated-benchmarking-permissions created
+clusterrole.rbac.authorization.k8s.io/benchmark-runner-hardware-discovery unchanged
+clusterrolebinding.rbac.authorization.k8s.io/benchmark-runner-hardware-discovery unchanged
+role.rbac.authorization.k8s.io/benchmark-runner-worker-pods created
+role.rbac.authorization.k8s.io/benchmark-runner-atelet-logs created
+rolebinding.rbac.authorization.k8s.io/benchmark-runner-atelet-logs created
+rolebinding.rbac.authorization.k8s.io/benchmark-runner-worker-pods created
+job.batch/runner-ateapi-cold-resume-pause-fake-2cpu-974379e-c2dfce created
+Job runner-ateapi-cold-resume-pause-fake-2cpu-974379e-c2dfce result: complete
+$ kubectl logs job/runner-ateapi-cold-resume-pause-fake-2cpu-974379e-c2dfce -n benchmarking --tail=500
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             300267     0(0.00%) |   1135     155    1635   1300 |  342.60        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    603810     0(0.00%) |   1342     155    2230   1400 |  656.70        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               301504     0(0.00%) |   1551     157    2230   1800 |  307.50        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             301119     0(0.00%) |   1135     155    1635   1300 |  329.50        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    605623     0(0.00%) |   1343     155    2230   1400 |  637.00        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               302487     0(0.00%) |   1552     157    2230   1800 |  304.60        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             301994     0(0.00%) |   1136     155    1635   1300 |  314.40        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    607481     0(0.00%) |   1344     155    2230   1400 |  619.00        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               302487     0(0.00%) |   1552     157    2230   1800 |  304.60        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             301994     0(0.00%) |   1136     155    1635   1300 |  314.40        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    607481     0(0.00%) |   1344     155    2230   1400 |  619.00        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               303485     0(0.00%) |   1552     157    2230   1800 |  302.10        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             302983     0(0.00%) |   1136     155    1635   1300 |  302.00        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    609468     0(0.00%) |   1345     155    2230   1400 |  604.10        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               304485     0(0.00%) |   1553     157    2230   1800 |  302.00        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             303981     0(0.00%) |   1137     155    1635   1300 |  300.80        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    611466     0(0.00%) |   1345     155    2230   1400 |  602.80        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               304485     0(0.00%) |   1553     157    2230   1800 |  302.00        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             303981     0(0.00%) |   1137     155    1635   1300 |  300.80        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    611466     0(0.00%) |   1345     155    2230   1400 |  602.80        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               305485     0(0.00%) |   1554     157    2230   1800 |  314.20        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             304981     0(0.00%) |   1137     155    1635   1300 |  300.40        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    613466     0(0.00%) |   1346     155    2230   1400 |  614.60        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               306464     0(0.00%) |   1555     157    2230   1800 |  336.20        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             305981     0(0.00%) |   1138     155    1635   1300 |  307.30        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    615445     0(0.00%) |   1347     155    2230   1400 |  643.50        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               306464     0(0.00%) |   1555     157    2230   1800 |  336.20        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             305981     0(0.00%) |   1138     155    1635   1300 |  307.30        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    615445     0(0.00%) |   1347     155    2230   1400 |  643.50        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               307449     0(0.00%) |   1556     157    2230   1800 |  341.60        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             306981     0(0.00%) |   1138     155    1635   1300 |  314.00        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    617430     0(0.00%) |   1347     155    2230   1400 |  655.60        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               308199     0(0.00%) |   1557     157    2230   1800 |  341.40        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             307965     0(0.00%) |   1139     155    1635   1300 |  328.90        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    619164     0(0.00%) |   1348     155    2230   1400 |  670.30        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               308199     0(0.00%) |   1557     157    2230   1800 |  341.40        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             307965     0(0.00%) |   1139     155    1635   1300 |  328.90        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    619164     0(0.00%) |   1348     155    2230   1400 |  670.30        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               309085     0(0.00%) |   1558     157    2230   1800 |  322.10        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             308873     0(0.00%) |   1139     155    1635   1300 |  339.60        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    620958     0(0.00%) |   1348     155    2230   1400 |  661.70        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               310043     0(0.00%) |   1559     157    2230   1800 |  310.60        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             309713     0(0.00%) |   1140     155    1635   1300 |  337.90        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    622756     0(0.00%) |   1349     155    2230   1400 |  648.50        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               310043     0(0.00%) |   1559     157    2230   1800 |  310.60        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             309713     0(0.00%) |   1140     155    1635   1300 |  337.90        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    622756     0(0.00%) |   1349     155    2230   1400 |  648.50        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               311028     0(0.00%) |   1560     157    2230   1800 |  305.10        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             310588     0(0.00%) |   1140     155    1635   1300 |  322.10        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    624616     0(0.00%) |   1350     155    2230   1400 |  627.20        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               312008     0(0.00%) |   1561     157    2230   1800 |  304.20        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             311528     0(0.00%) |   1141     155    1635   1300 |  308.80        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    626536     0(0.00%) |   1351     155    2230   1400 |  613.00        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               312008     0(0.00%) |   1561     157    2230   1800 |  304.20        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             311528     0(0.00%) |   1141     155    1635   1300 |  308.80        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    626536     0(0.00%) |   1351     155    2230   1400 |  613.00        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               313002     0(0.00%) |   1562     157    2230   1800 |  301.80        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             312502     0(0.00%) |   1141     155    1635   1300 |  303.10        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    628504     0(0.00%) |   1351     155    2230   1400 |  604.90        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               314001     0(0.00%) |   1563     157    2230   1800 |  304.60        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             313502     0(0.00%) |   1142     155    1635   1300 |  300.00        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    630503     0(0.00%) |   1352     155    2230   1400 |  604.60        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               314001     0(0.00%) |   1563     157    2230   1800 |  304.60        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             313502     0(0.00%) |   1142     155    1635   1300 |  300.00        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    630503     0(0.00%) |   1352     155    2230   1400 |  604.60        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               314837     0(0.00%) |   1564     157    2230   1800 |  322.60        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             314500     0(0.00%) |   1142     155    1635   1300 |  301.80        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    632337     0(0.00%) |   1353     155    2230   1400 |  624.40        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               315741     0(0.00%) |   1564     157    2230   1800 |  326.00        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             315442     0(0.00%) |   1143     155    1635   1300 |  308.20        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    634183     0(0.00%) |   1354     155    2230   1400 |  634.20        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               315741     0(0.00%) |   1564     157    2230   1800 |  326.00        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             315442     0(0.00%) |   1143     155    1635   1300 |  308.20        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    634183     0(0.00%) |   1354     155    2230   1400 |  634.20        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               316690     0(0.00%) |   1565     157    2230   1800 |  317.40        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             316360     0(0.00%) |   1144     155    1635   1300 |  320.90        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    636050     0(0.00%) |   1354     155    2230   1400 |  638.30        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               317590     0(0.00%) |   1566     157    2230   1800 |  314.00        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             317189     0(0.00%) |   1144     155    1635   1300 |  328.30        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    637779     0(0.00%) |   1355     155    2230   1400 |  642.30        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               317590     0(0.00%) |   1566     157    2230   1800 |  314.00        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             317189     0(0.00%) |   1144     155    1635   1300 |  328.30        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    637779     0(0.00%) |   1355     155    2230   1400 |  642.30        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               318558     0(0.00%) |   1567     157    2230   1800 |  307.90        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             318049     0(0.00%) |   1145     155    1635   1300 |  316.80        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    639607     0(0.00%) |   1356     155    2230   1400 |  624.70        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               319557     0(0.00%) |   1568     157    2230   1800 |  305.70        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             319039     0(0.00%) |   1145     155    1635   1300 |  302.90        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    641596     0(0.00%) |   1356     155    2230   1400 |  608.60        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               319557     0(0.00%) |   1568     157    2230   1800 |  305.70        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             319039     0(0.00%) |   1145     155    1635   1300 |  302.90        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    641596     0(0.00%) |   1356     155    2230   1400 |  608.60        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               320556     0(0.00%) |   1569     157    2230   1800 |  305.80        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             320035     0(0.00%) |   1145     155    1635   1300 |  302.10        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    643591     0(0.00%) |   1357     155    2230   1400 |  607.90        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               321555     0(0.00%) |   1570     157    2230   1800 |  310.90        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             321035     0(0.00%) |   1146     155    1635   1300 |  301.70        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    645590     0(0.00%) |   1358     155    2230   1400 |  612.60        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               321555     0(0.00%) |   1570     157    2230   1800 |  310.90        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             321035     0(0.00%) |   1146     155    1635   1300 |  301.70        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    645590     0(0.00%) |   1358     155    2230   1400 |  612.60        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               322548     0(0.00%) |   1570     157    2230   1800 |  332.40        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             322035     0(0.00%) |   1146     155    1635   1300 |  305.50        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    647583     0(0.00%) |   1358     155    2230   1400 |  637.90        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               323483     0(0.00%) |   1571     157    2230   1800 |  341.10        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             323035     0(0.00%) |   1147     155    1635   1300 |  316.20        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    649518     0(0.00%) |   1359     155    2230   1400 |  657.30        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               323483     0(0.00%) |   1571     157    2230   1800 |  341.10        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             323035     0(0.00%) |   1147     155    1635   1300 |  316.20        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    649518     0(0.00%) |   1359     155    2230   1400 |  657.30        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               324296     0(0.00%) |   1572     157    2230   1800 |  342.60        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             323997     0(0.00%) |   1147     155    1635   1300 |  321.60        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    651293     0(0.00%) |   1359     155    2230   1400 |  664.20        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               325125     0(0.00%) |   1573     157    2230   1800 |  326.20        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             324903     0(0.00%) |   1148     155    1635   1300 |  333.10        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    653028     0(0.00%) |   1360     155    2230   1400 |  659.30        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               325125     0(0.00%) |   1573     157    2230   1800 |  326.20        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             324903     0(0.00%) |   1148     155    1635   1300 |  333.10        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    653028     0(0.00%) |   1360     155    2230   1400 |  659.30        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               326082     0(0.00%) |   1573     157    2230   1800 |  309.00        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             325778     0(0.00%) |   1148     155    1635   1300 |  333.90        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    654860     0(0.00%) |   1361     155    2230   1400 |  642.90        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               327061     0(0.00%) |   1574     157    2230   1800 |  303.20        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             326666     0(0.00%) |   1149     155    1635   1300 |  320.30        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    656727     0(0.00%) |   1361     155    2230   1400 |  623.50        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               327061     0(0.00%) |   1574     157    2230   1800 |  303.20        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             326666     0(0.00%) |   1149     155    1635   1300 |  320.30        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    656727     0(0.00%) |   1361     155    2230   1400 |  623.50        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               328059     0(0.00%) |   1575     157    2230   1800 |  301.90        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             327575     0(0.00%) |   1149     155    1635   1300 |  310.10        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    658634     0(0.00%) |   1362     155    2230   1400 |  612.00        0.00
+[locust] 
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.00        0.00
+[locust] grpc     ResumeActorCold                                                               329051     0(0.00%) |   1576     157    2230   1800 |  302.50        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.00        0.00
+[locust] grpc     SuspendActorAsync                                                             328575     0(0.00%) |   1150     155    1635   1300 |  300.30        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.00        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    660626     0(0.00%) |   1363     155    2230   1400 |  602.80        0.00
+[locust] 
+[locust] [2026-10-19 19:00:21,884] runner-ateapi-cold-resume-pause-fake-2cpu-974379e-c2dfce-nw8zf/INFO/ladder_shape: Ladder complete after 1260s
+[locust] [2026-10-19 19:00:21,884] runner-ateapi-cold-resume-pause-fake-2cpu-974379e-c2dfce-nw8zf/INFO/locust.runners: Shape test stopping
+[boomer] {"time":"2026-10-19T19:00:21.885112469Z","level":"INFO","msg":"Recv quit message from master, all the goroutines are stopped"}
+[boomer] {"time":"2026-10-19T19:00:21.885150354Z","level":"INFO","msg":"shutdown"}
+[boomer] {"time":"2026-10-19T19:00:21.885157302Z","level":"INFO","msg":"boomer exited; suspending+deleting actors"}
+[locust] [2026-10-19 19:00:21,885] runner-ateapi-cold-resume-pause-fake-2cpu-974379e-c2dfce-nw8zf/INFO/locust.runners: Worker 'runner-ateapi-cold-resume-pause-fake-2cpu-974379e-c2dfce-nw8zf_53c7bd41e7b1442cb32e0a0e6d00a4ef' (index 0) quit. 0 workers ready.
+[locust] [2026-10-19 19:00:21,885] runner-ateapi-cold-resume-pause-fake-2cpu-974379e-c2dfce-nw8zf/INFO/locust.runners: The last worker quit, stopping test.
+[locust] [2026-10-19 19:00:22,386] runner-ateapi-cold-resume-pause-fake-2cpu-974379e-c2dfce-nw8zf/INFO/locust.main: --run-time limit reached, shutting down
+[locust] [2026-10-19 19:00:22,887] runner-ateapi-cold-resume-pause-fake-2cpu-974379e-c2dfce-nw8zf/INFO/locust.main: Run time limit set to 1380 seconds
+[locust] [2026-10-19 19:00:23,388] runner-ateapi-cold-resume-pause-fake-2cpu-974379e-c2dfce-nw8zf/INFO/locust.main: Shutting down (exit code 0)
+[locust] Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust] grpc     CreateActor                                                                     1000     0(0.00%) |   1265     874    1528   1300 |    0.79        0.00
+[locust] grpc     ResumeActorCold                                                               329051     0(0.00%) |   1576     157    2230   1800 |  261.36        0.00
+[locust] grpc     ResumeActorWarmup                                                               1000     0(0.00%) |   1895    1636    2189   1900 |    0.79        0.00
+[locust] grpc     SuspendActorAsync                                                             328575     0(0.00%) |   1150     155    1635   1300 |  260.98        0.00
+[locust] grpc     SuspendActorAsyncWarmup                                                         1000     0(0.00%) |    833     640     978    870 |    0.79        0.00
+[locust] --------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+[locust]          Aggregated                                                                    660626     0(0.00%) |   1363     155    2230   1400 |  524.72        0.00
+[locust] 
+[locust] Response time percentiles (approximated)
+[locust] Type     Name                                                                                  50%    66%    75%    80%    90%    95%    98%    99%  99.9% 99.99%   100% # reqs
+[locust] --------|--------------------------------------------------------------------------------|--------|------|------|------|------|------|------|------|------|------|------|------
+[locust] grpc     CreateActor                                                                          1300   1400   1400   1400   1500   1500   1500   1500   1500   1500   1500   1000
+[locust] grpc     ResumeActorCold                                                                      1800   1900   1900   1900   1900   2000   2000   2000   2100   2200   2200 329051
+[locust] grpc     ResumeActorWarmup                                                                    1900   1900   2000   2000   2000   2000   2100   2100   2200   2200   2200   1000
+[locust] grpc     SuspendActorAsync                                                                    1300   1400   1400   1400   1400   1500   1500   1500   1600   1600   1600 328575
+[locust] grpc     SuspendActorAsyncWarmup                                                               870    890    900    910    920    930    940    950    980    980    980   1000
+[locust] --------|--------------------------------------------------------------------------------|--------|------|------|------|------|------|------|------|------|------|------|------
+[locust]          Aggregated                                                                           1400   1800   1800   1900   1900   1900   2000   2000   2100   2100   2200 660626
+[locust] 
+Locust exited with code 0
+Stopping boomer...
+[boomer] {"time":"2026-10-19T19:00:30.465354575Z","level":"WARN","msg":"dynconfig poll failed; keeping the current values","url":"http://127.0.0.1:5560/boomer-config","err":"GET http://127.0.0.1:5560/boomer-config: Get \"http://127.0.0.1:5560/boomer-config\": dial tcp 127.0.0.1:5560: connect: connection refused"}
+Boomer exited with code 0
+Appended trial_summary to /tmp/20261019T183920Z-locust-runner/ateapi_cold_resume_pause_fake_2cpu.jsonl
+[ServerTelemetry] Waiting 69s for the atelet's last export to be scraped...
+[ServerTelemetry] Harvesting Prometheus metrics from http://prometheus.benchmarking.svc.cluster.local:9090 over [1792435160, 1792436434]...
+[ServerTelemetry] Detected steady-state window: [1792435162, 1792436421] (1259s), atelet-exported reads (snapshots, active actors) at [1792435197, 1792436456]
+[ServerTelemetry] Wrote server summary artifact to /tmp/20261019T183920Z-locust-runner/ateapi_cold_resume_pause_fake_2cpu_server_summary.json
+[ServerTelemetry] Appended server_summary row to /tmp/20261019T183920Z-locust-runner/ateapi_cold_resume_pause_fake_2cpu.jsonl
+Appended 7 ladder step rows to /tmp/20261019T183920Z-locust-runner/ateapi_cold_resume_pause_fake_2cpu.jsonl
+Warning: no timing breakdown records in the node logs (3 pods read, 0 failed); check the runner's pods/log access if the run made requests
+Appended 1 phase breakdown rows from 0 records
+Uploaded /tmp/20261019T183920Z-locust-runner/ateapi_cold_resume_pause_fake_2cpu_status.json -> gs://snapshot-substrate-poc-haiyanmeng-gke-dev/benchmark-results/runs/ateapi_cold_resume_pause_fake_2cpu/run_date=2026-10-19/run_ts=1792435160/run_tag=974379e0061543d1f36b5a86a0d92823869075c4/status.json
+Uploaded /tmp/20261019T183920Z-locust-runner/ateapi_cold_resume_pause_fake_2cpu_logs.txt -> gs://snapshot-substrate-poc-haiyanmeng-gke-dev/benchmark-results/runs/ateapi_cold_resume_pause_fake_2cpu/run_date=2026-10-19/run_ts=1792435160/run_tag=974379e0061543d1f36b5a86a0d92823869075c4/logs.txt
+Uploaded /tmp/20261019T183920Z-locust-runner/ateapi_cold_resume_pause_fake_2cpu_traces.txt -> gs://snapshot-substrate-poc-haiyanmeng-gke-dev/benchmark-results/runs/ateapi_cold_resume_pause_fake_2cpu/run_date=2026-10-19/run_ts=1792435160/run_tag=974379e0061543d1f36b5a86a0d92823869075c4/traces.txt
+Uploaded /tmp/20261019T183920Z-locust-runner/ateapi_cold_resume_pause_fake_2cpu.jsonl -> gs://snapshot-substrate-poc-haiyanmeng-gke-dev/benchmark-results/runs/ateapi_cold_resume_pause_fake_2cpu/run_date=2026-10-19/run_ts=1792435160/run_tag=974379e0061543d1f36b5a86a0d92823869075c4/stats.jsonl
+Uploaded /tmp/20261019T183920Z-locust-runner/ateapi_cold_resume_pause_fake_2cpu_stats.csv -> gs://snapshot-substrate-poc-haiyanmeng-gke-dev/benchmark-results/runs/ateapi_cold_resume_pause_fake_2cpu/run_date=2026-10-19/run_ts=1792435160/run_tag=974379e0061543d1f36b5a86a0d92823869075c4/stats.csv
+Uploaded /tmp/20261019T183920Z-locust-runner/ateapi_cold_resume_pause_fake_2cpu_exceptions.csv -> gs://snapshot-substrate-poc-haiyanmeng-gke-dev/benchmark-results/runs/ateapi_cold_resume_pause_fake_2cpu/run_date=2026-10-19/run_ts=1792435160/run_tag=974379e0061543d1f36b5a86a0d92823869075c4/exceptions.csv
+Uploaded /tmp/20261019T183920Z-locust-runner/ateapi_cold_resume_pause_fake_2cpu_failures.csv -> gs://snapshot-substrate-poc-haiyanmeng-gke-dev/benchmark-results/runs/ateapi_cold_resume_pause_fake_2cpu/run_date=2026-10-19/run_ts=1792435160/run_tag=974379e0061543d1f36b5a86a0d92823869075c4/failures.csv
+Uploaded /tmp/20261019T183920Z-locust-runner/ateapi_cold_resume_pause_fake_2cpu_stats_history.csv -> gs://snapshot-substrate-poc-haiyanmeng-gke-dev/benchmark-results/runs/ateapi_cold_resume_pause_fake_2cpu/run_date=2026-10-19/run_ts=1792435160/run_tag=974379e0061543d1f36b5a86a0d92823869075c4/stats_history.csv
+Uploaded /tmp/20261019T183920Z-locust-runner/ateapi_cold_resume_pause_fake_2cpu_server_summary.json -> gs://snapshot-substrate-poc-haiyanmeng-gke-dev/benchmark-results/runs/ateapi_cold_resume_pause_fake_2cpu/run_date=2026-10-19/run_ts=1792435160/run_tag=974379e0061543d1f36b5a86a0d92823869075c4/server_summary.json
+Uploaded /tmp/20261019T183920Z-locust-runner/ateapi_cold_resume_pause_fake_2cpu.jsonl -> gs://snapshot-substrate-poc-haiyanmeng-gke-dev/benchmark-results/runs/ateapi_cold_resume_pause_fake_2cpu/run_date=2026-10-19/run_ts=1792435160/run_tag=974379e0061543d1f36b5a86a0d92823869075c4/ateapi_cold_resume_pause_fake_2cpu.jsonl
+  (took 1.6s)
+$ kubectl delete job runner-ateapi-cold-resume-pause-fake-2cpu-974379e-c2dfce -n benchmarking
+job.batch "runner-ateapi-cold-resume-pause-fake-2cpu-974379e-c2dfce" deleted from benchmarking namespace
+  (took 1.3s)
+=== result: complete; tearing down
+$ benchmarking/workloads/deploy.sh --delete
+Deleting workloads...
+namespace "benchmark-workloads" deleted
+workerpool.ate.dev "benchmark-worker" deleted from benchmark-workloads namespace
+  (took 31.0s)
+$ hack/install-ate.sh --delete-ate-system
+configuration: 9 set, 43 default
+  actorJWT.algorithm                          ES256                                      (from default)
+  actorJWT.issuer                             ""                                         (from default)
+  ateapi.authz.bootstrapOwners                ""                                         (from default)
+  ateapi.authz.enabled                        true                                       (from default)
+  ateapi.expectedJWTIssuer                    ""                                         (from default)
+  ateapi.logLevel                             ""                                         (from default)
+  ateapi.postgres.cloudsql.gsa                ""                                         (from default)
+  ateapi.postgres.cloudsql.iamAuth            ""                                         (from default)
+  ateapi.postgres.cloudsql.instance           ""                                         (from default)
+  ateapi.postgres.cloudsql.ipType             ""                                         (from default)
+  ateapi.postgres.owner.connectionString      ""                                         (from default)
+  ateapi.postgres.owner.role                  substrate_owner                            (from default)
+  ateapi.postgres.poolMaxConns                ""                                         (from default)
+  ateapi.postgres.readWrite.connectionString  ""                                         (from default)
+  ateapi.postgres.readWrite.role              substrate_readwrite                        (from default)
+  ateapi.postgres.schema                      ""                                         (from default)
+  ateapi.postgres.serverCAFile                ""                                         (from default)
+  ateapi.postgres.storageClass                ""                                         (from default)
+  atenet.dataplane                            envoy                                      (from default)
+  atenet.egress.additionalExtprocService      ""                                         (from default)
+  atenet.egress.credentialProvider            {"name":"k8s.io"}                          (from ATE_CREDENTIAL_PROVIDER)
+  benchmark.actorMemory                       ""                                         (from default)
+  benchmark.sandboxClass                      gvisor                                     (from default)
+  benchmark.workerCount                       1                                          (from default)
+  clusterSize                                 size0                                      (from default)
+  context                                     ""                                         (from KUBECTL_CONTEXT)
+  cordonControlPlane                          false                                      (from default)
+  csi.setup                                   none                                       (from default)
+  demo.anthropicAPIKey                        ""                                         (from default)
+  demo.counter.storageClass                   standard                                   (from default)
+  demo.counter.withExternalVolume             false                                      (from default)
+  docker.buildFlags                           ""                                         (from default)
+  e2e.envoyConcurrency                        0                                          (from default)
+  fakeDataPlane.enabled                       false                                      (from default)
+  gcp.clusterLocation                         us-west1-c                                 (from CLUSTER_LOCATION)
+  gcp.clusterName                             substrate-poc                              (from CLUSTER_NAME)
+  gcp.projectID                               haiyanmeng-gke-dev                         (from PROJECT_ID)
+  images.repo                                 ""                                         (from default)
+  images.tag                                  ""                                         (from default)
+  ingressAuthMode                             deprecated-insecure                        (from default)
+  kindCluster.enabled                         false                                      (from default)
+  kindCluster.name                            kind                                       (from default)
+  ko.defaultPlatforms                         linux/amd64                                (from KO_DEFAULTPLATFORMS)
+  ko.dockerRepo                               gcr.io/haiyanmeng-gke-dev/ate-images       (from KO_DOCKER_REPO)
+  kubeconfig                                  /tmp/smoke-run/kubeconfig                  (from KUBECONFIG)
+  namespace                                   ate-system                                 (from default)
+  otlpEndpoint                                ""                                         (from default)
+  podcert.workersPerSigner                    0                                          (from default)
+  preview                                     ""                                         (from default)
+  record.dir                                  ""                                         (from default)
+  rolloutTimeout                              1m0s                                       (from default)
+  storage.bucketName                          snapshot-substrate-poc-haiyanmeng-gke-dev  (from BUCKET_NAME)
+[1;36m[step]: gcloud container clusters get-credentials substrate-poc[0m
+Fetching cluster endpoint and auth data.
+kubeconfig entry generated for substrate-poc.
+  (gcloud get-credentials took 2.430s)
+[1;36m[step]: delete_ate_system[0m
+  (delete of 6 objects took 1.543s)
+  (delete of 54 objects took 9.233s)
+  (delete of 2 objects took 0.357s)
+  (delete of 8 objects took 1.610s)
+  (delete of 3 objects took 0.609s)
+  (delete of 5 objects took 0.977s)
+Deleted ClusterTrustBundle podidentity.podcert.ate.dev:identity:primary-bundle
+Deleted ClusterTrustBundle postgres.podcert.ate.dev:identity:primary-bundle
+Deleted ClusterTrustBundle servicedns.podcert.ate.dev:identity:primary-bundle
+  (took 58.1s)
