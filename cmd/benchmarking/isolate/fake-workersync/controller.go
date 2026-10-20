@@ -30,6 +30,7 @@ import (
 	"github.com/google/uuid"
 	"go.ate.dev/substrate/cmd/benchmarking/isolate/internal/fakeworker"
 	"go.ate.dev/substrate/internal/hardware"
+	"go.ate.dev/substrate/internal/workerpoolsandbox"
 	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"golang.org/x/sync/errgroup"
@@ -71,6 +72,8 @@ type node struct {
 type cluster interface {
 	// Pools returns every WorkerPool.
 	Pools() ([]*atev1alpha1.WorkerPool, error)
+	// SandboxConfigs returns every SandboxConfig.
+	SandboxConfigs() ([]*atev1alpha1.SandboxConfig, error)
 	// Nodes returns the nodes that run a fake-atelet pod, sorted by name.
 	Nodes(ctx context.Context) ([]node, error)
 	// Relays returns the fake-atelet relay address on each node that has one.
@@ -251,6 +254,14 @@ func (c *controller) reconcile(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("while listing fake-atelet pods: %w", err)
 	}
+	listed, err := c.cluster.SandboxConfigs()
+	if err != nil {
+		return fmt.Errorf("while listing SandboxConfigs: %w", err)
+	}
+	configs := make([]atev1alpha1.SandboxConfig, len(listed))
+	for i, sc := range listed {
+		configs[i] = *sc
+	}
 	c.relay.Prune(relays)
 	nodeNames := make([]string, len(nodes))
 	allocatable := map[string]corev1.ResourceList{}
@@ -340,7 +351,7 @@ func (c *controller) reconcile(ctx context.Context) error {
 	_ = g.Wait()
 
 	for _, wp := range pools {
-		if err := c.syncStatus(ctx, wp, onFakeAteletNode, allocatable); err != nil {
+		if err := c.syncStatus(ctx, wp, configs, onFakeAteletNode, allocatable); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -541,10 +552,17 @@ func (c *controller) forget(name string) {
 
 // syncStatus writes the pool's status as the WorkerPool controller does from
 // its Deployment: a replica is a registered Worker, ready once its capacity
-// is reported, and the selector is the one worker pods would carry.
-func (c *controller) syncStatus(ctx context.Context, wp *atev1alpha1.WorkerPool, onFakeAteletNode func(*fakeWorker) bool, allocatable map[string]corev1.ResourceList) error {
+// is reported, and the selector is the one worker pods would carry. It also
+// writes the SandboxConfig each sandbox class resolves to among configs, as
+// ate-controller does, which ate-api-server boots the pool's actors with.
+// ate-controller first claims a config a running pool switches to, so it
+// cannot be deleted under the pool's worker pods; fake Workers run nothing,
+// so the resolved config is written directly.
+func (c *controller) syncStatus(ctx context.Context, wp *atev1alpha1.WorkerPool, configs []atev1alpha1.SandboxConfig, onFakeAteletNode func(*fakeWorker) bool, allocatable map[string]corev1.ResourceList) error {
+	classes, _ := workerpoolsandbox.ResolveClasses(wp, configs)
 	want := atev1alpha1.WorkerPoolStatus{
-		Selector: labels.SelectorFromSet(labels.Set{fakeworker.WorkerPoolLabel: wp.Name}).String(),
+		Selector:       labels.SelectorFromSet(labels.Set{fakeworker.WorkerPoolLabel: wp.Name}).String(),
+		SandboxClasses: classes,
 	}
 	c.mu.Lock()
 	for _, w := range c.workers {

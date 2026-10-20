@@ -135,6 +135,7 @@ func main() {
 
 	factory := ateinformers.NewSharedInformerFactory(ac, 0)
 	poolInformer := factory.Api().V1alpha1().WorkerPools()
+	configInformer := factory.Api().V1alpha1().SandboxConfigs()
 	changed := make(chan struct{}, 1)
 	notify := func(any) {
 		select {
@@ -149,10 +150,19 @@ func main() {
 	}); err != nil {
 		serverboot.Fatal(ctx, "Failed to watch WorkerPools", err)
 	}
+	// A pool's sandbox classes resolve against the SandboxConfigs.
+	if _, err := configInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    notify,
+		UpdateFunc: func(_, obj any) { notify(obj) },
+		DeleteFunc: notify,
+	}); err != nil {
+		serverboot.Fatal(ctx, "Failed to watch SandboxConfigs", err)
+	}
 	cl := &kubeCluster{
 		kc:          kc,
 		ac:          ac,
 		pools:       poolInformer.Lister(),
+		configs:     configInformer.Lister(),
 		ateletNS:    *ateletNS,
 		ateletLabel: *ateletLabel,
 		relayPort:   *relayPort,
@@ -229,6 +239,7 @@ type kubeCluster struct {
 	kc          kubernetes.Interface
 	ac          versioned.Interface
 	pools       atelisters.WorkerPoolLister
+	configs     atelisters.SandboxConfigLister
 	ateletNS    string
 	ateletLabel string
 	relayPort   int
@@ -245,6 +256,10 @@ type kubeCluster struct {
 
 func (k *kubeCluster) Pools() ([]*atev1alpha1.WorkerPool, error) {
 	return k.pools.List(labels.Everything())
+}
+
+func (k *kubeCluster) SandboxConfigs() ([]*atev1alpha1.SandboxConfig, error) {
+	return k.configs.List(labels.Everything())
 }
 
 // remember adds nodes to the set Nodes draws on, as if a fake-atelet pod had

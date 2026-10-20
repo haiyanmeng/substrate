@@ -301,6 +301,7 @@ func (f *fakeRelay) Prune(live map[string]string) {
 type fakeCluster struct {
 	mu       sync.Mutex
 	pools    []*atev1alpha1.WorkerPool
+	configs  []*atev1alpha1.SandboxConfig
 	nodes    []node
 	relays   map[string]string
 	statuses map[string]atev1alpha1.WorkerPoolStatus // by pool name
@@ -311,6 +312,12 @@ func (f *fakeCluster) Pools() ([]*atev1alpha1.WorkerPool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.pools), nil
+}
+
+func (f *fakeCluster) SandboxConfigs() ([]*atev1alpha1.SandboxConfig, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.configs), nil
 }
 
 func (f *fakeCluster) Nodes(context.Context) ([]node, error) { return f.nodes, nil }
@@ -453,8 +460,38 @@ func TestReconcileHonorsReplicasAndLimits(t *testing.T) {
 	if got := rel.runtimes[ctl.uid(name)]; !proto.Equal(got, wantRuntime) {
 		t.Errorf("default runtime %v, want %v: the pool's class on this host, which ate-api-server requires", got, wantRuntime)
 	}
-	if got, want := cl.statuses["bench"], (atev1alpha1.WorkerPoolStatus{Replicas: 3, ReadyReplicas: 3, Selector: "ate.dev/worker-pool=bench"}); !reflect.DeepEqual(got, want) {
+	got := cl.statuses["bench"]
+	got.SandboxClasses = nil // TestReconcileResolvesThePoolsSandboxConfig covers them.
+	if want := (atev1alpha1.WorkerPoolStatus{Replicas: 3, ReadyReplicas: 3, Selector: "ate.dev/worker-pool=bench"}); !reflect.DeepEqual(got, want) {
 		t.Errorf("status = %+v, want %+v", got, want)
+	}
+}
+
+// ate-api-server boots an actor with the SandboxConfig its Worker's pool
+// resolved, which ate-controller writes and fake-workersync writes in its
+// place, through the same workerpoolsandbox resolution.
+func TestReconcileResolvesThePoolsSandboxConfig(t *testing.T) {
+	c, _, _, cl := newTestController(pool("bench", 1, nil))
+	cl.configs = []*atev1alpha1.SandboxConfig{{
+		ObjectMeta: metav1.ObjectMeta{Name: "gvisor-default", Annotations: map[string]string{atev1alpha1.SandboxConfigClassDefaultAnnotation: "true"}},
+		Spec:       atev1alpha1.SandboxConfigSpec{SandboxClass: atev1alpha1.SandboxClassGvisor},
+	}}
+	if err := reconcile(t, c); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	wp := &atev1alpha1.WorkerPool{Spec: cl.pools[0].Spec, Status: cl.statuses["bench"]}
+	if got := wp.ResolvedSandboxConfig(); got != "gvisor-default" {
+		t.Errorf("pool resolved SandboxConfig %q, want gvisor-default", got)
+	}
+
+	// The Resolved condition keeps its transition time while it holds, so an
+	// unchanged pool is not written on every pass.
+	updates := cl.updates
+	if err := reconcile(t, c); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if cl.updates != updates {
+		t.Errorf("an unchanged pool's status was written again (%d updates, want %d)", cl.updates, updates)
 	}
 }
 

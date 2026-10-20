@@ -24,8 +24,9 @@ metadata:
 
 ---
 
-# fake-workersync watches every WorkerPool and writes its status, and reads
-# what each fake-atelet node can allocate.
+# fake-workersync watches every WorkerPool and writes its status, resolving
+# each pool's sandbox classes against the SandboxConfigs, and reads what each
+# fake-atelet node can allocate.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -37,6 +38,9 @@ rules:
 - apiGroups: ["ate.dev"]
   resources: ["workerpools/status"]
   verbs: ["update"]
+- apiGroups: ["ate.dev"]
+  resources: ["sandboxconfigs"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: [""]
   resources: ["nodes"]
   verbs: ["list"]
