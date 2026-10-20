@@ -40,6 +40,7 @@ import (
 
 	"go.ate.dev/substrate/internal/ateattr"
 	"go.ate.dev/substrate/internal/installdefaults"
+	"go.ate.dev/substrate/internal/workerpoolsandbox"
 	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
 )
 
@@ -185,7 +186,7 @@ func (r *WorkerPoolReconciler) reconcileWorkerPool(ctx context.Context, wp *atev
 	}
 	configs := list.Items
 
-	classes, _ := resolveSandboxClasses(wp, configs)
+	classes, _ := workerpoolsandbox.ResolveClasses(wp, configs)
 	if err := protectSandboxConfigs(ctx, r.Client, classes, configs); err != nil {
 		return err
 	}
@@ -303,7 +304,7 @@ func (r *WorkerPoolReconciler) confirmSandboxConfigSwitches(ctx context.Context,
 func (r *WorkerPoolReconciler) recordSandboxConfigEvents(wp *atev1alpha1.WorkerPool, prev, classes []atev1alpha1.WorkerPoolSandboxClassStatus) {
 	for _, class := range classes {
 		if switchesSandboxConfigFrom(prev, class) {
-			if prev := findSandboxClassStatus(prev, class.Name); prev != nil && prev.ConfigRef != nil {
+			if prev := workerpoolsandbox.FindClassStatus(prev, class.Name); prev != nil && prev.ConfigRef != nil {
 				r.Recorder.Eventf(wp, nil, corev1.EventTypeNormal, eventReasonSandboxConfigSwitched, eventActionResolveSandboxConfig,
 					"sandbox class %q switched from SandboxConfig %q to %q", class.Name, prev.ConfigRef.Name, class.ConfigRef.Name)
 			} else {
@@ -315,7 +316,7 @@ func (r *WorkerPoolReconciler) recordSandboxConfigEvents(wp *atev1alpha1.WorkerP
 		if cond == nil || cond.Status == metav1.ConditionTrue {
 			continue
 		}
-		if prev := findSandboxClassStatus(prev, class.Name); prev != nil {
+		if prev := workerpoolsandbox.FindClassStatus(prev, class.Name); prev != nil {
 			p := meta.FindStatusCondition(prev.Conditions, cond.Type)
 			if p != nil && p.Status == cond.Status && p.Reason == cond.Reason && p.Message == cond.Message {
 				continue
