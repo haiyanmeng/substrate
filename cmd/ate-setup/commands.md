@@ -120,6 +120,16 @@ apiserver, the controller, atenet, and atelet. It creates every `create`
 resource below on the way, so those subcommands are only needed to redo one on
 a running cluster.
 
+## Render
+
+| `ate-setup` | `hack/install-ate.sh` |
+|---|---|
+| `render ate-system --output-dir DIR` | (no shell equivalent) |
+
+`render ate-system` writes the manifests `deploy ate-system` would apply to
+`DIR`, one file per apply step, without contacting a cluster. See [Rendering
+the install](../../docs/operator-install.md#rendering-the-install).
+
 ## Publish
 
 | `ate-setup` | `hack/install-ate.sh` |

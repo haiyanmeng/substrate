@@ -213,19 +213,9 @@ func (e *Env) DeployPodCertificateController(ctx context.Context) error {
 	if err := e.EnsurePodCertificateCAs(ctx); err != nil {
 		return err
 	}
-	manifest, err := e.renderResolve(ctx, e.Cfg.Manifest("pod-certificate-controller.yaml"))
+	objs, err := e.podCertificateControllerObjects(ctx)
 	if err != nil {
 		return err
-	}
-	objs, err := kube.DecodeManifestBytes(manifest)
-	if err != nil {
-		return err
-	}
-	if e.Cfg.PodcertWorkersPerSigner > 0 {
-		log.Infof("Setting WORKERS_PER_SIGNER to %d", e.Cfg.PodcertWorkersPerSigner)
-		if err := setPodcertWorkersPerSigner(objs, e.Cfg.PodcertWorkersPerSigner); err != nil {
-			return err
-		}
 	}
 	if err := e.Kube.Apply(ctx, objs); err != nil {
 		return err
@@ -234,6 +224,26 @@ func (e *Env) DeployPodCertificateController(ctx context.Context) error {
 		return err
 	}
 	return e.WaitForPodCertificateTrustBundles(ctx)
+}
+
+// podCertificateControllerObjects renders the podcertificate controller with
+// its images resolved and --podcert-workers-per-signer set.
+func (e *Env) podCertificateControllerObjects(ctx context.Context) ([]*unstructured.Unstructured, error) {
+	manifest, err := e.renderResolve(ctx, e.Cfg.Manifest("pod-certificate-controller.yaml"))
+	if err != nil {
+		return nil, err
+	}
+	objs, err := kube.DecodeManifestBytes(manifest)
+	if err != nil {
+		return nil, err
+	}
+	if e.Cfg.PodcertWorkersPerSigner > 0 {
+		log.Infof("Setting WORKERS_PER_SIGNER to %d", e.Cfg.PodcertWorkersPerSigner)
+		if err := setPodcertWorkersPerSigner(objs, e.Cfg.PodcertWorkersPerSigner); err != nil {
+			return nil, err
+		}
+	}
+	return objs, nil
 }
 
 // setPodcertWorkersPerSigner sets WORKERS_PER_SIGNER on the

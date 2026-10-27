@@ -31,7 +31,7 @@ var deployCmd = &cobra.Command{
 const deployAteSystemPath = "deploy ate-system"
 
 // componentFlag names the repeatable flag that adds kustomize Components to
-// the deploy commands that render manifests.
+// the deploy and render commands that render manifests.
 const componentFlag = "component"
 
 // deployOptions reads the settings deploy ate-system owns.
@@ -197,6 +197,7 @@ func init() {
 		deployAtenetCmd,
 		deployPodCertControllerCmd,
 		deployPostgresCmd,
+		renderAteSystemCmd,
 	} {
 		c.Flags().StringArray(componentFlag, nil,
 			"Directory of a kustomize Component to layer over the rendered manifests (alpha). "+

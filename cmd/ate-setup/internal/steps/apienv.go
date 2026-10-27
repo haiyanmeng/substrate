@@ -131,6 +131,19 @@ func (e *Env) CreateAPIServerEnvVars(ctx context.Context) error {
 			}
 		}
 	}
+	configVars := e.apiServerConfigVars(cloudsql, readWriteRole, ownerRole, poolMaxConns, snapshotLocation)
+	if err := e.Kube.ApplyConfigMap(ctx, e.Namespace(), ConfigMapAPIEnvVars, configVars); err != nil {
+		return err
+	}
+	if err := e.Kube.ApplySecret(ctx, e.Namespace(), SecretAPIEnvVars,
+		buildAPIServerEnvVars(readWriteDSN, ownerDSN, schema)); err != nil {
+		return err
+	}
+	return e.applyPostgresServerCA(ctx)
+}
+
+// apiServerConfigVars is the ate-api-server-envvars ConfigMap payload.
+func (e *Env) apiServerConfigVars(cloudsql cloudSQLSettings, readWriteRole, ownerRole, poolMaxConns, snapshotLocation string) map[string]string {
 	configVars := cloudSQLEnvVars(cloudsql)
 	configVars["ATE_API_POSTGRES_READ_WRITE_ROLE"] = readWriteRole
 	configVars["ATE_API_POSTGRES_OWNER_ROLE"] = ownerRole
@@ -144,14 +157,7 @@ func (e *Env) CreateAPIServerEnvVars(ctx context.Context) error {
 	if snapshotLocation != "" {
 		configVars["ATE_API_SNAPSHOT_LOCATION"] = snapshotLocation
 	}
-	if err := e.Kube.ApplyConfigMap(ctx, e.Namespace(), ConfigMapAPIEnvVars, configVars); err != nil {
-		return err
-	}
-	if err := e.Kube.ApplySecret(ctx, e.Namespace(), SecretAPIEnvVars,
-		buildAPIServerEnvVars(readWriteDSN, ownerDSN, schema)); err != nil {
-		return err
-	}
-	return e.applyPostgresServerCA(ctx)
+	return configVars
 }
 
 // UpdateAPIServerEnvVars is CreateAPIServerEnvVars for an install that is not
@@ -275,17 +281,25 @@ func (e *Env) recordedConnectionStrings(ctx context.Context) (string, string, er
 //
 //	gcloud sql ssl server-ca-certs list --instance=<name> --format="value(cert)"
 func (e *Env) applyPostgresServerCA(ctx context.Context) error {
+	data, err := e.postgresServerCA()
+	if err != nil || data == nil {
+		return err
+	}
+	return e.Kube.ApplySecret(ctx, e.Namespace(), SecretPostgresServerCA, data)
+}
+
+// postgresServerCA is the postgres-server-ca Secret payload, or nil when no
+// server CA file is configured.
+func (e *Env) postgresServerCA() (map[string]string, error) {
 	path := e.Cfg.PostgresServerCAFile
 	if path == "" {
-		return nil
+		return nil, nil
 	}
 	pem, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("reading ATE_API_POSTGRES_SERVER_CA_FILE: %w", err)
+		return nil, fmt.Errorf("reading ATE_API_POSTGRES_SERVER_CA_FILE: %w", err)
 	}
-	return e.Kube.ApplySecret(ctx, e.Namespace(), SecretPostgresServerCA, map[string]string{
-		"server-ca.pem": string(pem),
-	})
+	return map[string]string{"server-ca.pem": string(pem)}, nil
 }
 
 // EnsureEnvVarsSafeStandalone guards `ate-setup create api-server-env-vars` on
@@ -349,6 +363,15 @@ func (e *Env) applyWithAPIServerEnvHash(ctx context.Context, manifest []byte) er
 	if err != nil {
 		return err
 	}
+	if err := e.finishAPIServer(objs, hash); err != nil {
+		return err
+	}
+	return e.Kube.Apply(ctx, objs)
+}
+
+// finishAPIServer stamps the environment digest and sets the bootstrap owners
+// on the ate-api-server Deployment in objs.
+func (e *Env) finishAPIServer(objs []*unstructured.Unstructured, hash string) error {
 	if err := stampAPIServerEnvHash(objs, hash); err != nil {
 		return err
 	}
@@ -358,7 +381,7 @@ func (e *Env) applyWithAPIServerEnvHash(ctx context.Context, manifest []byte) er
 	if msg := sharedBootstrapOwnerWarning(e.Cfg.APIAuthzBootstrapOwners, e.Namespace()); msg != "" {
 		log.Warnf("%s", msg)
 	}
-	return e.Kube.Apply(ctx, objs)
+	return nil
 }
 
 // apiServerAuthzFlag is the ate-api-server flag setAPIServerAuthzArgs owns.

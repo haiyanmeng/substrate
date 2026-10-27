@@ -366,7 +366,8 @@ ate-setup does not check other fields, such as `helmCharts` or
 `transformers`, and does not support them.
 
 The flag works on `deploy ate-system`, `atelet`, `apiserver`, `ate-controller`,
-`atenet`, `podcertificate-controller` and `postgres`. It does not reach CRDs,
+`atenet`, `podcertificate-controller` and `postgres`, and on `render
+ate-system`. It does not reach CRDs,
 the SandboxConfig manifests, or the CSI drivers. It has no environment
 variable or configuration key, and install records do not store it, so pass it
 again when you replay a record.
@@ -379,6 +380,75 @@ resources, or PodDisruptionBudget budgets. ate-setup composes
 under `--cluster-size=size10` and `components/sizing-kind` under `--kind`.
 To size the install differently, pass a Component that patches those fields.
 It applies after the sizing Components, so its values win.
+
+## Rendering the install
+
+`ate-setup render ate-system` writes the manifests `deploy ate-system` would
+apply, without contacting a cluster. It takes the same settings and
+`--component` flags as `deploy`, and requires the same settings.
+
+```bash
+ate-setup render ate-system --output-dir ./rendered \
+  --image-repo REPO --image-tag TAG --component ./my-provider
+```
+
+It writes one file per apply step. Applying them in name order applies the
+objects in the order `deploy` does:
+
+| File | Contents |
+|---|---|
+| `00-namespace.yaml` | The `ate-system` namespace |
+| `10-crds.yaml` | CRDs and RBAC |
+| `20-settings.yaml` | `ate-api-server-envvars`, `ate-api-server-secret-envvars`, `ate-api-config`, `ate-api-authentication`, and `postgres-server-ca` when a server CA file is set |
+| `30-podcertificate-controller.yaml` | The podcertificate controller |
+| `40-sandboxconfig.yaml` | The SandboxConfig admission policy and the default gVisor SandboxConfig |
+| `50-postgres.yaml` | The bundled PostgreSQL, only when no external database is set |
+| `60-control-plane.yaml` | ate-api-server, ate-idp-server, ate-controller, atenet-router, atelet and the rest of the bundle |
+| `70-egress.yaml` | atenet-egress, and the bundled credential provider when selected |
+
+Images are pinned to digests. Without `--image-repo`, render builds and pushes
+them from the checkout, as `deploy` does. The output directory must be empty or
+absent. The files are readable only by you, because `20-settings.yaml` holds
+the PostgreSQL connection strings.
+
+render reads nothing from the cluster, so:
+
+- The service account issuer is `--ateapi-expected-jwt-issuer`, else the one
+  derived from the GKE cluster coordinates. Otherwise it is
+  `https://kubernetes.default.svc.cluster.local` under `--kind` and
+  `https://kubernetes.default.svc` elsewhere. `deploy` would read the
+  cluster's OpenID discovery document instead.
+- Cloud SQL and the PostgreSQL settings come only from the configuration.
+  `deploy` adopts what an existing install recorded.
+- The `ate.dev/env-hash` annotation on ate-api-server is the digest of the
+  rendered settings, so a later `deploy` with the same settings does not roll
+  it.
+
+The output does not include:
+
+- The key pools `deploy` generates: `actor-id-jwt-pool`, `actor-id-ca-pool`,
+  `actor-id-ca-certs`, `egress-mitm-ca-pool`, and the podcertificate signer
+  pools. Create them with the `ate-setup create` commands, or your own tooling,
+  before the workloads start.
+- The identities `deploy` creates in the bundled PostgreSQL once it is
+  running. ate-api-server cannot log in to a bundled PostgreSQL installed from
+  the render alone.
+- The waits between steps. Wait for the CRDs to be Established before the
+  later files, and for the podcertificate controller to publish its
+  ClusterTrustBundles before the workloads.
+- The CSI drivers from `--setup-csi`.
+- The checks `deploy` makes against the cluster, such as the `ate-postgres`
+  node pool under `--cordon-control-plane`.
+
+render deletes and restarts nothing. Over an existing install, `deploy` also
+removes what an earlier install left: fake-workersync, the bundled credential
+provider, and the Cloud SQL proxy sidecar. It restarts atenet-egress, and the
+telemetry consumers after `--otlp-endpoint`, because a ConfigMap change does
+not roll them.
+
+`deploy` keeps an existing `ate-api-config`, `ate-api-authentication` and
+`k8s-credential-provider-namespace-policy`, so operator edits survive.
+Applying the render replaces them.
 
 ## Snapshot storage
 

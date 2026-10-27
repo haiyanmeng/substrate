@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
 	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
 	"go.ate.dev/substrate/internal/localca"
 	"go.ate.dev/substrate/internal/localjwtauthority"
@@ -139,11 +140,7 @@ func (e *Env) CreateAPIConfig(ctx context.Context) error {
 		return err
 	}
 
-	logLevel := e.Cfg.APILogLevel
-	if logLevel == "" {
-		logLevel = defaultAPILogLevel
-	}
-	apiConfig, err := buildAPIConfig(logLevel)
+	apiConfig, err := e.apiConfig()
 	if err != nil {
 		return err
 	}
@@ -154,6 +151,15 @@ func (e *Env) CreateAPIConfig(ctx context.Context) error {
 	return e.Kube.ApplyConfigMap(ctx, e.Namespace(), ConfigMapAPIConfig, map[string]string{
 		"apiconfig.textproto": apiConfig,
 	})
+}
+
+// apiConfig renders apiconfig.textproto at the configured log level.
+func (e *Env) apiConfig() (string, error) {
+	logLevel := e.Cfg.APILogLevel
+	if logLevel == "" {
+		logLevel = defaultAPILogLevel
+	}
+	return buildAPIConfig(logLevel)
 }
 
 // buildAPIConfig renders apiconfig.textproto.
@@ -195,7 +201,18 @@ func (e *Env) CreateAPIAuthenticationConfig(ctx context.Context) error {
 // coordinates on GKE, otherwise read from the cluster's OpenID discovery
 // document, falling back to the in-cluster default.
 func (e *Env) jwtIssuer(ctx context.Context) string {
-	cfg := e.Cfg
+	if issuer := configuredJWTIssuer(e.Cfg); issuer != "" {
+		return issuer
+	}
+	if issuer := e.Kube.OIDCIssuer(ctx); issuer != "" {
+		return issuer
+	}
+	return inClusterIssuer
+}
+
+// configuredJWTIssuer is the issuer the configuration names or derives without
+// a cluster, or "" when it gives none.
+func configuredJWTIssuer(cfg *config.Config) string {
 	if cfg.ExpectedJWTIssuer != "" {
 		return cfg.ExpectedJWTIssuer
 	}
@@ -203,10 +220,7 @@ func (e *Env) jwtIssuer(ctx context.Context) string {
 		return fmt.Sprintf("https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s",
 			cfg.ProjectID, cfg.ClusterLocation, cfg.ClusterName)
 	}
-	if issuer := e.Kube.OIDCIssuer(ctx); issuer != "" {
-		return issuer
-	}
-	return inClusterIssuer
+	return ""
 }
 
 // inClusterIssuer is the default issuer for a cluster that does not publish a
