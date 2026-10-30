@@ -386,6 +386,59 @@ func TestActorResumer_Parking(t *testing.T) {
 		})
 	})
 
+	t.Run("CapacityErrorKeptAcrossLaterTransientRetries", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var calls atomic.Int32
+			mock := &resumerMockClient{
+				resumeFn: func(ctx context.Context, in *ateapi.ResumeActorRequest, opts ...grpc.CallOption) (*ateapi.ResumeActorResponse, error) {
+					switch calls.Add(1) {
+					case 1:
+						return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
+					case 2:
+						return nil, status.Error(codes.ResourceExhausted, "no worker has room for the actor")
+					default:
+						return nil, status.Error(codes.Aborted, "another operation is in progress for this actor")
+					}
+				},
+			}
+
+			cfg := ParkedRequestConfig{Max: 1, Budget: 1500 * time.Millisecond}
+			lot := newParkingLot(cfg, nil)
+			resumer := NewActorResumer(mock, withParking(cfg), withParkingLot(lot))
+
+			leaderErrCh := make(chan error, 1)
+			go func() {
+				_, _, err := resumer.ResumeActor(context.Background(), testActorRef)
+				leaderErrCh <- err
+			}()
+			synctest.Wait()
+
+			// Advance past the second attempt (ResourceExhausted) and third
+			// attempt (Aborted) while the leader holds the only lot slot.
+			time.Sleep(400 * time.Millisecond)
+			synctest.Wait()
+			if got := calls.Load(); got < 3 {
+				t.Fatalf("ResumeActor calls = %d, want at least 3", got)
+			}
+
+			// A joiner shed after the Aborted retry must still see the
+			// ResourceExhausted cause.
+			_, _, shedErr := resumer.ResumeActor(context.Background(), testActorRef)
+			if got := status.Code(shedErr); got != codes.ResourceExhausted {
+				t.Errorf("shed joiner status.Code = %v, want ResourceExhausted (err=%v)", got, shedErr)
+			}
+
+			err := <-leaderErrCh
+			if got := status.Code(err); got != codes.ResourceExhausted {
+				t.Errorf("leader status.Code = %v, want ResourceExhausted (err=%v)", got, err)
+			}
+			var budget *budgetExhaustedError
+			if !errors.As(err, &budget) {
+				t.Errorf("leader error = %T (%v), want *budgetExhaustedError", err, err)
+			}
+		})
+	})
+
 	t.Run("ParksThroughUnavailableBlip", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			var mu sync.Mutex

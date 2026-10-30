@@ -36,8 +36,8 @@ type resumeActorFlight struct {
 	// retryingSignaled guards the single close of retrying; only the flight
 	// goroutine touches it.
 	retryingSignaled bool
-	// lastRetryErr is the latest retryable failure. The flight goroutine
-	// writes it and a caller that is shed reads it.
+	// lastRetryErr is the retryable failure for shed callers and budget expiry.
+	// The flight goroutine writes it and a caller that is shed reads it.
 	lastRetryErr atomic.Pointer[error]
 	done         chan struct{}
 	result       *resumeCallResult
@@ -47,11 +47,15 @@ func newResumeActorFlight() *resumeActorFlight {
 	return &resumeActorFlight{retrying: make(chan struct{}), done: make(chan struct{})}
 }
 
-// signalRetrying records err as the latest retryable failure, then closes
-// retrying. The store comes first, so a caller that sees retrying closed also
-// sees err. It is idempotent; only the flight goroutine calls it.
+// signalRetrying records err for the flight, then closes retrying. Once the
+// flight sees ResourceExhausted, it keeps that error across later Aborted,
+// FailedPrecondition, or Unavailable retries. The store comes first, so a
+// caller that sees retrying closed also sees err. Only the flight goroutine
+// calls it.
 func (f *resumeActorFlight) signalRetrying(err error) {
-	f.lastRetryErr.Store(&err)
+	if status.Code(f.retryErr()) != codes.ResourceExhausted || status.Code(err) == codes.ResourceExhausted {
+		f.lastRetryErr.Store(&err)
+	}
 	if f.retryingSignaled {
 		return
 	}
