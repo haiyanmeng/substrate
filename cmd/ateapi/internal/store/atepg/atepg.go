@@ -447,20 +447,6 @@ func setUpdateMetadata(newMeta, oldMeta *ateapi.ResourceMetadata) {
 	newMeta.DeleteTime = oldMeta.DeleteTime
 }
 
-func mapDeleteError(err error, uid string, version int64, precondition store.DeletePreconditions) error {
-	if errors.Is(err, pgx.ErrNoRows) {
-		return store.ErrNotFound
-	}
-	if err != nil {
-		return fmt.Errorf("reading after a guarded delete matched nothing: %w", err)
-	}
-	if err := precondition.Check(&ateapi.ResourceMetadata{Uid: uid, Version: version}); err != nil {
-		return err
-	}
-	// The row matches the guards now, so it changed between the two statements.
-	return store.ErrVersionConflict
-}
-
 func isUniqueViolation(err error) bool { return pgErrCode(err) == "23505" }
 
 // isForeignKeyViolation matches both the insert/update-side violation

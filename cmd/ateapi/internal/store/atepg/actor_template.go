@@ -222,25 +222,32 @@ func (p *Persistence) ListActorTemplates(ctx context.Context, atespace string, o
 }
 
 func (p *Persistence) DeleteActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef, precondition store.DeletePreconditions) (*ateapi.ActorTemplate, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning actor template delete: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
 	var protoBytes []byte
-	err := p.pool.QueryRow(ctx, `
-		DELETE FROM actor_templates AS t
-		WHERE t.atespace = $1 AND t.name = $2
-		  AND ($3::text = '' OR t.uid = $3::text)
-		  AND ($4::bigint = 0 OR t.version = $4::bigint)
-		RETURNING t.proto`, templateRef.Atespace, templateRef.Name, precondition.UID, precondition.Version).Scan(&protoBytes)
+	err = tx.QueryRow(ctx, `SELECT proto FROM actor_templates WHERE atespace = $1 AND name = $2 FOR UPDATE`, templateRef.Atespace, templateRef.Name).Scan(&protoBytes)
 	if errors.Is(err, pgx.ErrNoRows) {
-		var uid string
-		var version int64
-		err := p.pool.QueryRow(ctx, `SELECT uid, version FROM actor_templates WHERE atespace = $1 AND name = $2`, templateRef.Atespace, templateRef.Name).Scan(&uid, &version)
-		return nil, mapDeleteError(err, uid, version, precondition)
+		return nil, store.ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("deleting actor template %s: %w", templateRef, err)
+		return nil, fmt.Errorf("locking actor template %s: %w", templateRef, err)
 	}
 	out := &ateapi.ActorTemplate{}
 	if err := unmarshalStored(protoBytes, out); err != nil {
-		return nil, fmt.Errorf("unmarshaling deleted actor template: %w", err)
+		return nil, fmt.Errorf("unmarshaling actor template to delete: %w", err)
+	}
+	if err := precondition.Check(out.GetMetadata()); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM actor_templates WHERE atespace = $1 AND name = $2`, templateRef.Atespace, templateRef.Name); err != nil {
+		return nil, fmt.Errorf("deleting actor template %s: %w", templateRef, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing actor template delete %s: %w", templateRef, err)
 	}
 	return out, nil
 }

@@ -97,25 +97,26 @@ func (p *Persistence) UpdateEgressPolicy(ctx context.Context, actorRef resources
 }
 
 func (p *Persistence) DeleteEgressPolicy(ctx context.Context, actorRef resources.ActorRef, precondition store.DeletePreconditions) (*ateapi.EgressPolicy, error) {
-	var version int64
-	var uid string
-	var protoBytes []byte
-	err := p.pool.QueryRow(ctx, `
-		DELETE FROM actor_egress_policies
-		WHERE atespace = $1 AND actor_name = $2
-		  AND ($3::text = '' OR uid = $3::text)
-		  AND ($4::bigint = 0 OR version = $4::bigint)
-		RETURNING uid, version, proto`, actorRef.Atespace, actorRef.Name, precondition.UID, precondition.Version).Scan(&uid, &version, &protoBytes)
-	if errors.Is(err, pgx.ErrNoRows) {
-		err := p.pool.QueryRow(ctx, `SELECT uid, version FROM actor_egress_policies WHERE atespace = $1 AND actor_name = $2`, actorRef.Atespace, actorRef.Name).Scan(&uid, &version)
-		return nil, mapDeleteError(err, uid, version, precondition)
-	}
+	tx, err := p.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("deleting egress policy for %s: %w", actorRef, err)
+		return nil, fmt.Errorf("beginning egress policy delete for %s: %w", actorRef, err)
 	}
-	deleted, err := unmarshalEgressPolicy(uid, version, protoBytes)
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	deleted, err := getEgressPolicyRow(ctx, tx, `
+		SELECT uid, version, proto FROM actor_egress_policies
+		WHERE atespace = $1 AND actor_name = $2 FOR UPDATE`, actorRef.Atespace, actorRef.Name)
 	if err != nil {
 		return nil, err
+	}
+	if err := precondition.Check(deleted.GetMetadata()); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM actor_egress_policies WHERE atespace = $1 AND actor_name = $2`, actorRef.Atespace, actorRef.Name); err != nil {
+		return nil, fmt.Errorf("deleting egress policy for %s: %w", actorRef, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing egress policy delete for %s: %w", actorRef, err)
 	}
 	deleted.Metadata.DeleteTime = timestamppb.Now()
 	return deleted, nil

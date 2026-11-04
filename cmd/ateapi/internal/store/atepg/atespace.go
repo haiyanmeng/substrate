@@ -126,21 +126,23 @@ func (p *Persistence) DeleteAtespace(ctx context.Context, name string, precondit
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
 
 	var protoBytes []byte
-	err = tx.QueryRow(ctx, `
-		DELETE FROM atespaces
-		WHERE name = $1
-		  AND ($2::text = '' OR uid = $2::text)
-		  AND ($3::bigint = 0 OR version = $3::bigint)
-		RETURNING proto`, name, precondition.UID, precondition.Version).Scan(&protoBytes)
+	err = tx.QueryRow(ctx, `SELECT proto FROM atespaces WHERE name = $1 FOR UPDATE`, name).Scan(&protoBytes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
 	if err != nil {
+		return nil, fmt.Errorf("locking atespace %q: %w", name, err)
+	}
+	out := &ateapi.Atespace{}
+	if err := unmarshalStored(protoBytes, out); err != nil {
+		return nil, fmt.Errorf("unmarshaling atespace to delete: %w", err)
+	}
+	if err := precondition.Check(out.GetMetadata()); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM atespaces WHERE name = $1`, name); err != nil {
 		if isForeignKeyViolation(err) {
 			return nil, store.ErrFailedPrecondition
-		}
-		if errors.Is(err, pgx.ErrNoRows) {
-			var uid string
-			var version int64
-			err := tx.QueryRow(ctx, `SELECT uid, version FROM atespaces WHERE name = $1`, name).Scan(&uid, &version)
-			return nil, mapDeleteError(err, uid, version, precondition)
 		}
 		return nil, fmt.Errorf("deleting atespace %q: %w", name, err)
 	}
@@ -149,10 +151,6 @@ func (p *Persistence) DeleteAtespace(ctx context.Context, name string, precondit
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("committing atespace delete %q: %w", name, err)
-	}
-	out := &ateapi.Atespace{}
-	if err := unmarshalStored(protoBytes, out); err != nil {
-		return nil, fmt.Errorf("unmarshaling deleted atespace: %w", err)
 	}
 	out.Metadata.DeleteTime = timestamppb.Now()
 	return out, nil

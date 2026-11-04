@@ -202,25 +202,17 @@ func (p *Persistence) DeleteAtespaceAccessPolicy(ctx context.Context, name strin
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
 
-	var version int64
-	var uid string
-	var protoBytes []byte
-	err = tx.QueryRow(ctx, `
-		DELETE FROM atespace_access_policies
-		WHERE atespace_name = $1
-		  AND ($2::text = '' OR uid = $2::text)
-		  AND ($3::bigint = 0 OR version = $3::bigint)
-		RETURNING uid, version, proto`, name, precondition.UID, precondition.Version).Scan(&uid, &version, &protoBytes)
-	if errors.Is(err, pgx.ErrNoRows) {
-		err := tx.QueryRow(ctx, `SELECT uid, version FROM atespace_access_policies WHERE atespace_name = $1`, name).Scan(&uid, &version)
-		return nil, mapDeleteError(err, uid, version, precondition)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("deleting access policy for %s: %w", name, err)
-	}
-	deleted, err := unmarshalAccessPolicy(uid, version, protoBytes)
+	deleted, err := getAccessPolicyRow(ctx, tx, `
+		SELECT uid, version, proto FROM atespace_access_policies
+		WHERE atespace_name = $1 FOR UPDATE`, name)
 	if err != nil {
 		return nil, err
+	}
+	if err := precondition.Check(deleted.GetMetadata()); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM atespace_access_policies WHERE atespace_name = $1`, name); err != nil {
+		return nil, fmt.Errorf("deleting access policy for %s: %w", name, err)
 	}
 	if err := p.policyManager.DeleteAtespacePolicies(ctx, tx, name); err != nil {
 		return nil, fmt.Errorf("deleting authorization tuples for %s: %w", name, err)

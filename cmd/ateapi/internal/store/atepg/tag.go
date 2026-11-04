@@ -299,25 +299,32 @@ func (p *Persistence) updateTag(ctx context.Context, tagRef resources.TagRef, pr
 
 func (p *Persistence) DeleteTag(ctx context.Context, tagRef resources.TagRef, precondition store.DeletePreconditions) (*ateapi.Tag, error) {
 	atespace, name := tagRef.Atespace, tagRef.Name
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning tag delete: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
 	var protoBytes []byte
-	err := p.pool.QueryRow(ctx, `
-		DELETE FROM tags
-		WHERE atespace = $1 AND name = $2
-		  AND ($3::text = '' OR uid = $3::text)
-		  AND ($4::bigint = 0 OR version = $4::bigint)
-		RETURNING proto`, atespace, name, precondition.UID, precondition.Version).Scan(&protoBytes)
+	err = tx.QueryRow(ctx, `SELECT proto FROM tags WHERE atespace = $1 AND name = $2 FOR UPDATE`, atespace, name).Scan(&protoBytes)
 	if errors.Is(err, pgx.ErrNoRows) {
-		var uid string
-		var version int64
-		err := p.pool.QueryRow(ctx, `SELECT uid, version FROM tags WHERE atespace = $1 AND name = $2`, atespace, name).Scan(&uid, &version)
-		return nil, mapDeleteError(err, uid, version, precondition)
+		return nil, store.ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("deleting tag %s/%s: %w", atespace, name, err)
+		return nil, fmt.Errorf("locking tag %s/%s: %w", atespace, name, err)
 	}
 	tag := &ateapi.Tag{}
 	if err := unmarshalStored(protoBytes, tag); err != nil {
-		return nil, fmt.Errorf("unmarshaling deleted tag: %w", err)
+		return nil, fmt.Errorf("unmarshaling tag to delete: %w", err)
+	}
+	if err := precondition.Check(tag.GetMetadata()); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM tags WHERE atespace = $1 AND name = $2`, atespace, name); err != nil {
+		return nil, fmt.Errorf("deleting tag %s/%s: %w", atespace, name, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing tag delete %s/%s: %w", atespace, name, err)
 	}
 	return tag, nil
 }
