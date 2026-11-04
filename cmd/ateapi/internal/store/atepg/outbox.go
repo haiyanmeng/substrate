@@ -373,9 +373,16 @@ func (p *Persistence) dropExpiredWorkerOutboxPartitions(ctx context.Context, q q
 	return nil
 }
 
-// dropWorkerOutboxPartition records the trim mark and drops the
-// partition on the caller's (elected, single) retention transaction.
+// dropWorkerOutboxPartition locks the outbox, records the trim mark, and drops
+// the partition on the caller's (elected, single) retention transaction.
 func (p *Persistence) dropWorkerOutboxPartition(ctx context.Context, q querier, name string) error {
+	// Lock before reading the mark so it covers rows from writers that have not
+	// committed yet. Writers insert through the parent, so locking it blocks
+	// them. Locking the partition first would invert the parent-then-partition
+	// order that queries and DROP TABLE use, and could deadlock.
+	if _, err := q.Exec(ctx, `LOCK TABLE ONLY worker_outbox IN ACCESS EXCLUSIVE MODE`); err != nil {
+		return fmt.Errorf("locking outbox for partition %s drop: %w", name, err)
+	}
 	ident := pgx.Identifier{name}.Sanitize()
 	// The mark is the partition's greatest xid.
 	if _, err := q.Exec(ctx, fmt.Sprintf(`

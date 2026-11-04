@@ -299,6 +299,65 @@ func TestWorkerOutboxPartitionRetention(t *testing.T) {
 	}
 }
 
+// TestWorkerOutboxPartitionRetention_CoversUncommittedWriter verifies that a
+// partition drop waiting on an uncommitted writer records that writer's xid in
+// the trim mark, so lagging watchers detect the loss of its row.
+func TestWorkerOutboxPartitionRetention_CoversUncommittedWriter(t *testing.T) {
+	s := setupPostgresPersistence(t)
+	ctx := t.Context()
+
+	stale := time.Now().UTC().Add(-2 * time.Hour)
+	if err := s.createWorkerOutboxPartitions(ctx, stale); err != nil {
+		t.Fatalf("creating stale partition failed: %v", err)
+	}
+	wTx, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin writer failed: %v", err)
+	}
+	defer wTx.Rollback(ctx) //nolint:errcheck // no-op once committed
+	var wPID uint32
+	var wXid string
+	if err := wTx.QueryRow(ctx, `INSERT INTO worker_outbox (created_at, payload) VALUES ($1, $2) RETURNING pg_backend_pid(), xid::text`,
+		stale, []byte{byte(store.WorkerEventUpdated)}).Scan(&wPID, &wXid); err != nil {
+		t.Fatalf("writer insert failed: %v", err)
+	}
+
+	dropped := make(chan error, 1)
+	go func() { dropped <- s.dropExpiredOutboxRetention(ctx, time.Now().UTC()) }()
+
+	// Wait until retention blocks on the writer's locks.
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(10 * time.Second)
+	for blocked := false; !blocked; {
+		select {
+		case err := <-dropped:
+			t.Fatalf("retention finished while the writer was uncommitted: %v", err)
+		case <-deadline:
+			t.Fatal("timed out waiting for retention to block on the writer")
+		case <-ticker.C:
+		}
+		if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid)))`, wPID).Scan(&blocked); err != nil {
+			t.Fatalf("checking lock waits failed: %v", err)
+		}
+	}
+
+	if err := wTx.Commit(ctx); err != nil {
+		t.Fatalf("committing writer failed: %v", err)
+	}
+	if err := <-dropped; err != nil {
+		t.Fatalf("dropExpiredOutboxRetention failed: %v", err)
+	}
+	var covered bool
+	if err := s.pool.QueryRow(ctx, `SELECT COALESCE((SELECT xid FROM worker_outbox_trim) >= $1::xid8, false)`, wXid).Scan(&covered); err != nil {
+		t.Fatalf("reading trim mark failed: %v", err)
+	}
+	if !covered {
+		t.Errorf("trim mark does not cover the dropped writer's xid %s", wXid)
+	}
+}
+
 // TestOutboxMaintenance_SingleMaintainer verifies the retention
 // election: while another replica holds the advisory lock, a pass skips
 // retention cleanly (no error, nothing dropped); once released, the next
