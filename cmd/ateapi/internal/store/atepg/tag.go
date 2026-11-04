@@ -233,16 +233,22 @@ func (p *Persistence) MarkTagForDeletion(ctx context.Context, tagRef resources.T
 
 func (p *Persistence) updateTag(ctx context.Context, tagRef resources.TagRef, precondition store.DeletePreconditions, mutate func(*ateapi.Tag) error, markForDeletion bool) (*ateapi.Tag, error) {
 	atespace, name := tagRef.Atespace, tagRef.Name
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning tag update: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
 	var currentUID string
 	var currentVersion int64
 	var currentBytes []byte
-	if err := p.pool.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 			SELECT uid, version, proto FROM tags
-			WHERE atespace = $1 AND name = $2`, atespace, name).Scan(&currentUID, &currentVersion, &currentBytes); err != nil {
+			WHERE atespace = $1 AND name = $2 FOR UPDATE`, atespace, name).Scan(&currentUID, &currentVersion, &currentBytes); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, store.ErrNotFound
 		}
-		return nil, fmt.Errorf("getting tag %s/%s for update: %w", atespace, name, err)
+		return nil, fmt.Errorf("locking tag %s/%s for update: %w", atespace, name, err)
 	}
 
 	dbTag := &ateapi.Tag{}
@@ -280,19 +286,19 @@ func (p *Persistence) updateTag(ctx context.Context, tagRef resources.TagRef, pr
 	if err != nil {
 		return nil, fmt.Errorf("marshaling tag: %w", err)
 	}
-	commandTag, err := p.pool.Exec(ctx, `
+	commandTag, err := tx.Exec(ctx, `
 			UPDATE tags
 			SET version = $1, proto = $2
-			WHERE atespace = $3 AND name = $4 AND uid = $5 AND version = $6`,
-		dbTag.GetMetadata().GetVersion(), updatedBytes, atespace, name, currentUID, currentVersion)
+			WHERE atespace = $3 AND name = $4`,
+		dbTag.GetMetadata().GetVersion(), updatedBytes, atespace, name)
 	if err != nil {
 		return nil, fmt.Errorf("updating tag %s/%s: %w", atespace, name, err)
 	}
-	if commandTag.RowsAffected() == 0 {
-		return nil, store.ErrVersionConflict
-	}
 	if commandTag.RowsAffected() != 1 {
 		return nil, fmt.Errorf("updating tag %s/%s affected %d rows, want 1", atespace, name, commandTag.RowsAffected())
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing tag update %s/%s: %w", atespace, name, err)
 	}
 	return dbTag, nil
 }

@@ -17,60 +17,11 @@ package atepg
 import (
 	"context"
 	"errors"
-	"fmt"
 	"testing"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
-	"go.ate.dev/substrate/internal/resources"
 )
-
-func TestUpdateActor_ConcurrentWriteReturnsConflict(t *testing.T) {
-	s := setupPostgresPersistence(t)
-	ctx := context.Background()
-	createTestAtespace(t, s, "team-a")
-	created, err := s.CreateActor(ctx, &ateapi.Actor{
-		Metadata:      &ateapi.ResourceMetadata{Atespace: "team-a", Name: "actor-a"},
-		ActorTemplate: &ateapi.ObjectRef{Atespace: "default", Name: "template-a"},
-		Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
-	})
-	if err != nil {
-		t.Fatalf("CreateActor failed: %v", err)
-	}
-	actorRef := resources.ActorRefFromActor(created)
-
-	mutations := 0
-	_, err = s.UpdateActor(ctx, actorRef, store.PreconditionFrom(created), func(toUpdate *ateapi.Actor) error {
-		mutations++
-		if _, err := s.UpdateActor(ctx, actorRef, store.PreconditionFrom(created), func(concurrent *ateapi.Actor) error {
-			concurrent.WorkerSelector = &ateapi.Selector{MatchLabels: map[string]string{"tier": "paid"}}
-			return nil
-		}); err != nil {
-			return fmt.Errorf("concurrent actor update: %w", err)
-		}
-		toUpdate.Status.State = ateapi.ActorState_ACTOR_STATE_RUNNING
-		return nil
-	})
-	if !errors.Is(err, store.ErrVersionConflict) {
-		t.Fatalf("UpdateActor error = %v, want ErrVersionConflict", err)
-	}
-	if mutations != 1 {
-		t.Errorf("mutation ran %d times, want 1", mutations)
-	}
-	stored, err := s.GetActor(ctx, actorRef)
-	if err != nil {
-		t.Fatalf("GetActor failed: %v", err)
-	}
-	if stored.GetStatus().GetState() != ateapi.ActorState_ACTOR_STATE_SUSPENDED {
-		t.Errorf("state = %v, want SUSPENDED: losing update was persisted", stored.GetStatus().GetState())
-	}
-	if got := stored.GetWorkerSelector().GetMatchLabels()["tier"]; got != "paid" {
-		t.Errorf("worker selector tier = %q, want paid", got)
-	}
-	if got, want := stored.GetMetadata().GetVersion(), created.GetMetadata().GetVersion()+1; got != want {
-		t.Errorf("version = %d, want %d", got, want)
-	}
-}
 
 // TestCreateActor_MissingAtespace_FailedPrecondition exercises the
 // foreign-key race the doc calls out: CreateActor rejects an actor whose

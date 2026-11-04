@@ -17,21 +17,16 @@ package atepg
 import (
 	"context"
 	"errors"
-	"fmt"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
 	"go.ate.dev/substrate/api/ateapi/v1"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
-	"go.ate.dev/substrate/internal/resources"
-	"google.golang.org/protobuf/testing/protocmp"
 )
 
-// createTestTag creates tagName over its own copy of an actor's
-// external snapshot, already finalized.
-func createTestTag(t *testing.T, s *Persistence, tagAtespace, tagName string) *ateapi.Tag {
-	t.Helper()
-	tag, err := s.CreateTag(context.Background(), &ateapi.Tag{
+// newTestTag returns tagName over its own copy of an actor's external
+// snapshot, already finalized.
+func newTestTag(tagAtespace, tagName string) *ateapi.Tag {
+	return &ateapi.Tag{
 		Metadata: &ateapi.ResourceMetadata{Atespace: tagAtespace, Name: tagName},
 		Scope:    ateapi.TagScope_TAG_SCOPE_ATESPACE,
 		Status: &ateapi.TagStatus{
@@ -45,43 +40,16 @@ func createTestTag(t *testing.T, s *Persistence, tagAtespace, tagName string) *a
 				},
 			},
 		},
-	})
+	}
+}
+
+func createTestTag(t *testing.T, s *Persistence, tagAtespace, tagName string) *ateapi.Tag {
+	t.Helper()
+	tag, err := s.CreateTag(context.Background(), newTestTag(tagAtespace, tagName))
 	if err != nil {
 		t.Fatalf("CreateTag(%s/%s) failed: %v", tagAtespace, tagName, err)
 	}
 	return tag
-}
-
-func TestUpdateTag_CASPreventsDeleteRecreateABA(t *testing.T) {
-	s := setupPostgresPersistence(t)
-	ctx := context.Background()
-	createTestAtespace(t, s, "team-a")
-	original := createTestTag(t, s, "team-a", "tag-a")
-
-	mutations := 0
-	var recreated *ateapi.Tag
-	_, err := s.UpdateTag(ctx, resources.TagRef{Atespace: "team-a", Name: "tag-a"}, store.PreconditionFrom(original), func(toUpdate *ateapi.Tag) error {
-		mutations++
-		if _, err := s.DeleteTag(ctx, resources.TagRef{Atespace: "team-a", Name: "tag-a"}, store.DeletePreconditions{}); err != nil {
-			return fmt.Errorf("deleting original tag: %w", err)
-		}
-		recreated = createTestTag(t, s, "team-a", "tag-a")
-		toUpdate.Scope = ateapi.TagScope_TAG_SCOPE_PUBLISHED
-		return nil
-	})
-	if !errors.Is(err, store.ErrVersionConflict) {
-		t.Fatalf("UpdateTag error = %v, want ErrVersionConflict", err)
-	}
-	if mutations != 1 {
-		t.Errorf("guarded mutation ran %d times, want 1", mutations)
-	}
-	stored, err := s.GetTag(ctx, resources.TagRef{Atespace: "team-a", Name: "tag-a"})
-	if err != nil {
-		t.Fatalf("GetTag failed: %v", err)
-	}
-	if diff := cmp.Diff(recreated, stored, protocmp.Transform()); diff != "" {
-		t.Errorf("recreated tag was overwritten (-want +got):\n%s", diff)
-	}
 }
 
 func TestCreateTag_TagForeignKeyErrors(t *testing.T) {

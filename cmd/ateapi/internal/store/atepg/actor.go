@@ -83,27 +83,44 @@ func (p *Persistence) UpdateActor(ctx context.Context, actorRef resources.ActorR
 	if err := precondition.Validate(); err != nil {
 		return nil, err
 	}
-	return updateActor(ctx, p.pool, actorRef, store.DeletePreconditions(precondition), mutate, false)
+	return p.updateActorTx(ctx, actorRef, store.DeletePreconditions(precondition), mutate, false)
 }
 
 func (p *Persistence) MarkActorForDeletion(ctx context.Context, actorRef resources.ActorRef, precondition store.DeletePreconditions, mutate func(*ateapi.Actor) error) (*ateapi.Actor, error) {
-	return updateActor(ctx, p.pool, actorRef, precondition, mutate, true)
+	return p.updateActorTx(ctx, actorRef, precondition, mutate, true)
 }
 
-// updateActor applies mutate to the stored actor through q, which is the pool
-// or a transaction the write must commit with.
-func updateActor(ctx context.Context, q querier, actorRef resources.ActorRef, precondition store.DeletePreconditions, mutate func(*ateapi.Actor) error, markForDeletion bool) (*ateapi.Actor, error) {
+// updateActorTx runs updateActor in a transaction of its own.
+func (p *Persistence) updateActorTx(ctx context.Context, actorRef resources.ActorRef, precondition store.DeletePreconditions, mutate func(*ateapi.Actor) error, markForDeletion bool) (*ateapi.Actor, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning actor update: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+	updated, err := updateActor(ctx, tx, actorRef, precondition, mutate, markForDeletion)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing actor update %s: %w", actorRef, err)
+	}
+	return updated, nil
+}
+
+// updateActor applies mutate to the stored actor, holding its row lock until
+// tx ends. Callers that also lock a Worker lock it first.
+func updateActor(ctx context.Context, tx pgx.Tx, actorRef resources.ActorRef, precondition store.DeletePreconditions, mutate func(*ateapi.Actor) error, markForDeletion bool) (*ateapi.Actor, error) {
 	atespace, name := actorRef.Atespace, actorRef.Name
 	var currentUID string
 	var currentVersion int64
 	var currentBytes []byte
-	if err := q.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 			SELECT uid, version, proto FROM actors
-			WHERE atespace = $1 AND name = $2`, atespace, name).Scan(&currentUID, &currentVersion, &currentBytes); err != nil {
+			WHERE atespace = $1 AND name = $2 FOR UPDATE`, atespace, name).Scan(&currentUID, &currentVersion, &currentBytes); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, store.ErrNotFound
 		}
-		return nil, fmt.Errorf("getting actor %s/%s for update: %w", atespace, name, err)
+		return nil, fmt.Errorf("locking actor %s/%s for update: %w", atespace, name, err)
 	}
 
 	dbActor := &ateapi.Actor{}
@@ -136,16 +153,13 @@ func updateActor(ctx context.Context, q querier, actorRef resources.ActorRef, pr
 	if err != nil {
 		return nil, fmt.Errorf("marshaling actor: %w", err)
 	}
-	commandTag, err := q.Exec(ctx, `
+	commandTag, err := tx.Exec(ctx, `
 			UPDATE actors
 			SET version = $1, proto = $2
-			WHERE atespace = $3 AND name = $4 AND uid = $5 AND version = $6`,
-		dbActor.GetMetadata().GetVersion(), updatedBytes, atespace, name, currentUID, currentVersion)
+			WHERE atespace = $3 AND name = $4`,
+		dbActor.GetMetadata().GetVersion(), updatedBytes, atespace, name)
 	if err != nil {
 		return nil, fmt.Errorf("updating actor %s/%s: %w", atespace, name, err)
-	}
-	if commandTag.RowsAffected() == 0 {
-		return nil, store.ErrVersionConflict
 	}
 	if commandTag.RowsAffected() != 1 {
 		return nil, fmt.Errorf("updating actor %s/%s affected %d rows, want 1", atespace, name, commandTag.RowsAffected())

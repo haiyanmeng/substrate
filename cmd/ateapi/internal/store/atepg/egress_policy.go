@@ -59,14 +59,18 @@ func (p *Persistence) UpdateEgressPolicy(ctx context.Context, actorRef resources
 	if err := precondition.Validate(); err != nil {
 		return nil, err
 	}
-	dbPolicy, err := getEgressPolicyRow(ctx, p.pool, `
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("beginning egress policy update for %s: %w", actorRef, err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	dbPolicy, err := getEgressPolicyRow(ctx, tx, `
 		SELECT uid, version, proto FROM actor_egress_policies
-		WHERE atespace = $1 AND actor_name = $2`, actorRef.Atespace, actorRef.Name)
+		WHERE atespace = $1 AND actor_name = $2 FOR UPDATE`, actorRef.Atespace, actorRef.Name)
 	if err != nil {
 		return nil, err
 	}
-	currentUID := dbPolicy.GetMetadata().GetUid()
-	currentVersion := dbPolicy.GetMetadata().GetVersion()
 	if err := precondition.Check(dbPolicy.GetMetadata()); err != nil {
 		return nil, err
 	}
@@ -80,18 +84,18 @@ func (p *Persistence) UpdateEgressPolicy(ctx context.Context, actorRef resources
 	if err != nil {
 		return nil, fmt.Errorf("marshaling updated egress policy: %w", err)
 	}
-	commandTag, err := p.pool.Exec(ctx, `
+	commandTag, err := tx.Exec(ctx, `
 		UPDATE actor_egress_policies SET version = $1, proto = $2
-		WHERE atespace = $3 AND actor_name = $4 AND uid = $5 AND version = $6`,
-		dbPolicy.GetMetadata().GetVersion(), protoBytes, actorRef.Atespace, actorRef.Name, currentUID, currentVersion)
+		WHERE atespace = $3 AND actor_name = $4`,
+		dbPolicy.GetMetadata().GetVersion(), protoBytes, actorRef.Atespace, actorRef.Name)
 	if err != nil {
 		return nil, fmt.Errorf("updating egress policy for %s: %w", actorRef, err)
 	}
-	if commandTag.RowsAffected() == 0 {
-		return nil, store.ErrVersionConflict
-	}
 	if commandTag.RowsAffected() != 1 {
 		return nil, fmt.Errorf("updating egress policy for %s affected %d rows, want 1", actorRef, commandTag.RowsAffected())
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("committing egress policy update for %s: %w", actorRef, err)
 	}
 	return dbPolicy, nil
 }

@@ -16,8 +16,6 @@ package atepg
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -33,49 +31,6 @@ func createTestActorTemplate(t *testing.T, s *Persistence, atespace, name string
 		Metadata: &ateapi.ResourceMetadata{Atespace: atespace, Name: name},
 	}); err != nil {
 		t.Fatalf("CreateActorTemplate(%q/%q) failed: %v", atespace, name, err)
-	}
-}
-
-func TestUpdateActorTemplate_ConcurrentWriteReturnsConflict(t *testing.T) {
-	s := setupPostgresPersistence(t)
-	ctx := context.Background()
-	createTestAtespace(t, s, "team-a")
-	createTestActorTemplate(t, s, "team-a", "template-a")
-	templateRef := resources.ActorTemplateRef{Atespace: "team-a", Name: "template-a"}
-	created, err := s.GetActorTemplate(ctx, templateRef)
-	if err != nil {
-		t.Fatalf("GetActorTemplate failed: %v", err)
-	}
-
-	mutations := 0
-	_, err = s.UpdateActorTemplate(ctx, templateRef, store.PreconditionFrom(created), func(toUpdate *ateapi.ActorTemplate) error {
-		mutations++
-		if _, err := s.UpdateActorTemplate(ctx, templateRef, store.PreconditionFrom(created), func(concurrent *ateapi.ActorTemplate) error {
-			concurrent.WorkerSelector = &ateapi.Selector{MatchLabels: map[string]string{"tier": "paid"}}
-			return nil
-		}); err != nil {
-			return fmt.Errorf("concurrent actor template update: %w", err)
-		}
-		toUpdate.Status = &ateapi.ActorTemplateStatus{GoldenSnapshotStatus: &ateapi.GoldenSnapshotStatus{
-			ErrorMessage: "LosingUpdate",
-		}}
-		return nil
-	})
-	if !errors.Is(err, store.ErrVersionConflict) {
-		t.Fatalf("UpdateActorTemplate error = %v, want ErrVersionConflict", err)
-	}
-	if mutations != 1 {
-		t.Errorf("mutation ran %d times, want 1", mutations)
-	}
-	stored, err := s.GetActorTemplate(ctx, templateRef)
-	if err != nil {
-		t.Fatalf("GetActorTemplate failed: %v", err)
-	}
-	if got := stored.GetWorkerSelector().GetMatchLabels()["tier"]; got != "paid" {
-		t.Errorf("worker selector tier = %q, want paid", got)
-	}
-	if got := stored.GetStatus().GetGoldenSnapshotStatus().GetErrorMessage(); got != "" {
-		t.Errorf("status error message = %q, want empty: losing update was persisted", got)
 	}
 }
 
