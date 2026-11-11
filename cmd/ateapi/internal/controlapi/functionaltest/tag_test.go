@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -121,7 +122,7 @@ func TestCreateTag_ReusedTagName(t *testing.T) {
 			SourceActor: &ateapi.ObjectRef{Atespace: testAtespace, Name: "actor-b"},
 		},
 	})
-	assertGrpcError(t, err, codes.AlreadyExists, fmt.Sprintf("Tag %s/%s already exists; delete it and create it again to retry", testAtespace, tagName))
+	assertGrpcError(t, err, codes.AlreadyExists, fmt.Sprintf("Tag %s/%s already exists", testAtespace, tagName))
 
 	// The row still contains actor A's tag
 	stored, err := tc.client.GetTag(context.Background(), &ateapi.GetTagRequest{
@@ -149,6 +150,44 @@ func TestCreateTag_ReusedTagName(t *testing.T) {
 		},
 	}); err != nil {
 		t.Fatalf("CreateTag under a free name failed: %v", err)
+	}
+}
+
+// TestCreateTag_RetryAfterFailedCopy verifies that retrying a CreateTag whose
+// copy failed returns a COMPLETED tag.
+func TestCreateTag_RetryAfterFailedCopy(t *testing.T) {
+	ns := namespaceForTest("ns-tag-retry")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	workerName := createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
+	suspendActorForTest(t, tc, workerName, "actor-a")
+
+	ctx := context.Background()
+	req := &ateapi.CreateTagRequest{Tag: &ateapi.Tag{
+		Metadata:    &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "retried"},
+		Scope:       ateapi.TagScope_TAG_SCOPE_ATESPACE,
+		SourceActor: &ateapi.ObjectRef{Atespace: testAtespace, Name: "actor-a"},
+	}}
+
+	tc.objectStore.OnCopy = func(_, srcObject, _, _ string) error {
+		if strings.HasSuffix(srcObject, "memory.zst") {
+			return errors.New("injected copy failure")
+		}
+		return nil
+	}
+	if _, err := tc.client.CreateTag(ctx, req); err == nil {
+		t.Fatal("CreateTag with a failing copy succeeded, want an error")
+	}
+	tc.objectStore.OnCopy = nil
+
+	tag, err := tc.client.CreateTag(ctx, req)
+	if err != nil {
+		t.Fatalf("retried CreateTag failed: %v", err)
+	}
+	if got := tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetState(); got != ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED {
+		t.Errorf("retried tag snapshot state = %v, want COMPLETED", got)
 	}
 }
 

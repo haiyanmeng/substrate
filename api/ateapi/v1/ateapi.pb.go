@@ -2506,8 +2506,15 @@ type TagStatus struct {
 	// +k8s:required
 	// +k8s:format=k8s-uuid
 	ActorTemplateUid string `protobuf:"bytes,2,opt,name=actor_template_uid,json=actorTemplateUid,proto3" json:"actor_template_uid,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// UID of source_actor when the tag was created. A retried create replaces
+	// a pending tag only if this matches the actor's UID. Unset on tags created
+	// by older releases.
+	//
+	// +k8s:optional
+	// +k8s:format=k8s-uuid
+	SourceActorUid string `protobuf:"bytes,3,opt,name=source_actor_uid,json=sourceActorUid,proto3" json:"source_actor_uid,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *TagStatus) Reset() {
@@ -2550,6 +2557,13 @@ func (x *TagStatus) GetSnapshot() *Snapshot {
 func (x *TagStatus) GetActorTemplateUid() string {
 	if x != nil {
 		return x.ActorTemplateUid
+	}
+	return ""
+}
+
+func (x *TagStatus) GetSourceActorUid() string {
+	if x != nil {
+		return x.SourceActorUid
 	}
 	return ""
 }
@@ -6072,8 +6086,11 @@ func (x *ListTagsResponse) GetNextPageToken() string {
 //
 // The tag is given its own copy of that snapshot, so it survives the Actor
 // being suspended again or deleted.
-// To retry a create that failed or timed out, delete the tag first,
-// which collects whatever that attempt stranded, and create it again.
+// To retry a create that failed or timed out, send the same request again.
+// A tag an earlier create from the same Actor left unfinished is deleted,
+// collecting whatever that attempt stranded, and created again under a new
+// uid. A tag whose status.source_actor_uid is unset or names another Actor is
+// AlreadyExists; delete it first.
 //
 // +k8s:customValidation # metadata.atespace must match source_actor.atespace
 type CreateTagRequest struct {
@@ -10115,10 +10132,11 @@ const file_api_ateapi_v1_ateapi_proto_rawDesc = "" +
 	"\fworker_epoch\x18\b \x01(\x03R\vworkerEpoch\x12Q\n" +
 	"\x0fsandbox_runtime\x18\t \x01(\v2(.substrate.ateapi.v1.ActorSandboxRuntimeR\x0esandboxRuntime\x12(\n" +
 	"\x10worker_spiffe_id\x18\n" +
-	" \x01(\tR\x0eworkerSpiffeId\"t\n" +
+	" \x01(\tR\x0eworkerSpiffeId\"\x9e\x01\n" +
 	"\tTagStatus\x129\n" +
 	"\bsnapshot\x18\x01 \x01(\v2\x1d.substrate.ateapi.v1.SnapshotR\bsnapshot\x12,\n" +
-	"\x12actor_template_uid\x18\x02 \x01(\tR\x10actorTemplateUid\"\x86\x02\n" +
+	"\x12actor_template_uid\x18\x02 \x01(\tR\x10actorTemplateUid\x12(\n" +
+	"\x10source_actor_uid\x18\x03 \x01(\tR\x0esourceActorUid\"\x86\x02\n" +
 	"\x03Tag\x12A\n" +
 	"\bmetadata\x18\x01 \x01(\v2%.substrate.ateapi.v1.ResourceMetadataR\bmetadata\x126\n" +
 	"\x06status\x18\x02 \x01(\v2\x1e.substrate.ateapi.v1.TagStatusR\x06status\x123\n" +

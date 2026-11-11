@@ -4035,6 +4035,7 @@ func TestSuspendActor(t *testing.T) {
 		Status: &ateapi.TagStatus{
 			Snapshot:         wantTagSnap,
 			ActorTemplateUid: tmpl.GetMetadata().GetUid(),
+			SourceActorUid:   sourceActor.GetMetadata().GetUid(),
 		},
 	}
 	stored, err := tc.client.GetTag(context.Background(), &ateapi.GetTagRequest{Tag: tagRef})

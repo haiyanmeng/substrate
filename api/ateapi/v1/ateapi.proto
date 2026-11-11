@@ -1076,6 +1076,14 @@ message TagStatus {
   // +k8s:required
   // +k8s:format=k8s-uuid
   string actor_template_uid = 2;
+
+  // UID of source_actor when the tag was created. A retried create replaces
+  // a pending tag only if this matches the actor's UID. Unset on tags created
+  // by older releases.
+  //
+  // +k8s:optional
+  // +k8s:format=k8s-uuid
+  string source_actor_uid = 3;
 }
 
 // Tag is an Atespace-owned, stable name for one external snapshot. The
@@ -2039,8 +2047,11 @@ message ListTagsResponse {
 //
 // The tag is given its own copy of that snapshot, so it survives the Actor
 // being suspended again or deleted.
-// To retry a create that failed or timed out, delete the tag first,
-// which collects whatever that attempt stranded, and create it again.
+// To retry a create that failed or timed out, send the same request again.
+// A tag an earlier create from the same Actor left unfinished is deleted,
+// collecting whatever that attempt stranded, and created again under a new
+// uid. A tag whose status.source_actor_uid is unset or names another Actor is
+// AlreadyExists; delete it first.
 //
 // +k8s:customValidation # metadata.atespace must match source_actor.atespace
 message CreateTagRequest {

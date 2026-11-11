@@ -342,8 +342,20 @@ func TestTagActorSnapshot_PromotesLocalSnapshot(t *testing.T) {
 		// nodeLost clears the local snapshot's locality, as when its node
 		// was lost before the upload finished.
 		nodeLost bool
-		// nameTaken seeds a tag under the name the create asks for.
+		// nameTaken seeds a tag from another actor under the name the create
+		// asks for.
 		nameTaken bool
+		// nameUnfinished seeds a pending tag from this actor under the name,
+		// as a create that died leaves.
+		nameUnfinished bool
+		// reusedName records another actor's UID on the seeded tag, as a
+		// deleted actor of the same name leaves.
+		reusedName bool
+		// noSourceUID records no source actor UID on the seeded tag, as an
+		// older release leaves.
+		noSourceUID bool
+		// nameFinished seeds a COMPLETED tag from this actor under the name.
+		nameFinished bool
 		// badLocation points the template at a storage location with an
 		// atespaces segment.
 		badLocation bool
@@ -383,6 +395,23 @@ func TestTagActorSnapshot_PromotesLocalSnapshot(t *testing.T) {
 			wantCode:  codes.AlreadyExists,
 		},
 		{
+			name:         "the name is held by a finished tag from this actor",
+			nameFinished: true,
+			wantCode:     codes.AlreadyExists,
+		},
+		{
+			name:           "the name is held by an unfinished tag from a deleted actor of the same name",
+			nameUnfinished: true,
+			reusedName:     true,
+			wantCode:       codes.AlreadyExists,
+		},
+		{
+			name:           "the name is held by an unfinished tag that records no source actor UID",
+			nameUnfinished: true,
+			noSourceUID:    true,
+			wantCode:       codes.AlreadyExists,
+		},
+		{
 			name:        "the template's storage location has an atespaces segment",
 			badLocation: true,
 			wantCode:    codes.FailedPrecondition,
@@ -398,6 +427,13 @@ func TestTagActorSnapshot_PromotesLocalSnapshot(t *testing.T) {
 			promoteErr:  apierror.Unavailable("plugin: object store restarting"),
 			wantPromote: true,
 			wantCode:    codes.Unavailable,
+		},
+		{
+			name:           "a failed promote leaves the tag an earlier create left unfinished",
+			nameUnfinished: true,
+			promoteErr:     apierror.Unavailable("plugin: object store restarting"),
+			wantPromote:    true,
+			wantCode:       codes.Unavailable,
 		},
 		{
 			name:        "the snapshot conflicts with atelet's newer state",
@@ -509,16 +545,39 @@ func TestTagActorSnapshot_PromotesLocalSnapshot(t *testing.T) {
 			})
 			tagRef := resources.TagRef{Atespace: "team-a", Name: "v1"}
 			var takenBy *ateapi.Tag
-			if tt.nameTaken {
+			if tt.nameTaken || tt.nameUnfinished || tt.nameFinished {
+				source := &ateapi.ObjectRef{Atespace: "team-a", Name: "actor-2"}
+				const otherUID = "7c0e1a4e-3b9f-4c55-9a43-2f6d0d1e8b21"
+				sourceUID := otherUID
+				if tt.nameUnfinished || tt.nameFinished {
+					source = actorRef.ToObjectRef()
+					sourceUID = actor.GetMetadata().GetUid()
+				}
+				if tt.reusedName {
+					sourceUID = otherUID
+				}
+				if tt.noSourceUID {
+					sourceUID = ""
+				}
 				var err error
 				takenBy, err = persistence.CreateTag(ctx, &ateapi.Tag{
 					Metadata:    &ateapi.ResourceMetadata{Atespace: tagRef.Atespace, Name: tagRef.Name},
 					Scope:       ateapi.TagScope_TAG_SCOPE_ATESPACE,
-					SourceActor: actorRef.ToObjectRef(),
-					Status:      &ateapi.TagStatus{ActorTemplateUid: tmplUID},
+					SourceActor: source,
+					Status:      &ateapi.TagStatus{ActorTemplateUid: tmplUID, SourceActorUid: sourceUID},
 				})
 				if err != nil {
 					t.Fatalf("CreateTag: %v", err)
+				}
+				if tt.nameFinished {
+					uri := mustTagSnapshotURI(t, template, tagRef.Atespace, takenBy.GetMetadata().GetUid())
+					takenBy, err = persistence.UpdateTag(ctx, tagRef, store.PreconditionFrom(takenBy), func(toUpdate *ateapi.Tag) error {
+						toUpdate.Status.Snapshot = newDurableSnapshot(1, ateapi.SnapshotOwner_SNAPSHOT_OWNER_TAG, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", uri.Name(), uri.String(), ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED)
+						return nil
+					})
+					if err != nil {
+						t.Fatalf("UpdateTag: %v", err)
+					}
 				}
 			}
 			if tt.badLocation {
@@ -611,10 +670,11 @@ func TestTagActorSnapshot_PromotesLocalSnapshot(t *testing.T) {
 }
 
 // TestTagActorSnapshot_RecreateAfterCopyFailure verifies what a create that
-// dies mid-copy leaves behind, and how a client gets past it. The row survives
-// as a pending tag naming the prefix the copy was writing into, so the objects
-// it stranded are reachable; the name it holds is taken until the tag is
-// deleted, and only then does a create under that name run again.
+// dies mid-copy leaves behind, and that retrying the same request gets past
+// it. The row survives as a pending tag naming the prefix the copy was writing
+// into. A retry whose delete of that tag fails leaves it marked for deletion.
+// The next retry finishes the delete, collecting the partial copy, and creates
+// the tag again under a new uid and prefix.
 func TestTagActorSnapshot_RecreateAfterCopyFailure(t *testing.T) {
 	ctx := context.Background()
 	persistence := newTestPersistence(t)
@@ -650,48 +710,44 @@ func TestTagActorSnapshot_RecreateAfterCopyFailure(t *testing.T) {
 		t.Errorf("the stranded partial copy mismatch (-want +got):\n%s", diff)
 	}
 
-	// Creating under the same name again is refused, even for the actor the
-	// pending row was reserved for, and leaves that row exactly as it was.
-	_, err = w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
-	if code := apierror.Code(err); code != codes.AlreadyExists {
-		t.Fatalf("TagActorSnapshot over the pending tag = %v (code %v), want code AlreadyExists", err, code)
+	// A retry marks the pending tag for deletion, then fails to collect it.
+	objects.OnDelete = func(string, string) error { return errObjectStore }
+	if _, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1")); !isObjectStoreErr(err) {
+		t.Fatalf("TagActorSnapshot with a failing delete = %v, want an error wrapping %v", err, errObjectStore)
 	}
-	stillPending, err := persistence.GetTag(ctx, tagRef)
+	objects.OnDelete = nil
+	deleting, err := persistence.GetTag(ctx, tagRef)
 	if err != nil {
-		t.Fatalf("GetTag after the refused create: %v", err)
+		t.Fatalf("GetTag after the failed replace: %v", err)
 	}
-	if got := mustReservedTagSnapshotURI(t, stillPending).String(); got != stranded {
-		t.Errorf("in-progress snapshot uri after the refused create = %q, want the prefix the row already named, %q", got, stranded)
-	}
-	if diff := cmp.Diff([]string{"manifest.json"}, objects.Snapshot(t, strandedURI)); diff != "" {
-		t.Errorf("the stranded partial copy after the refused create mismatch (-want +got):\n%s", diff)
+	if deleting.GetMetadata().GetUid() != pending.GetMetadata().GetUid() || deleting.GetMetadata().GetDeleteTime() == nil {
+		t.Fatalf("tag after the failed replace = uid %q, delete_time %v; want the pending tag %q marked for deletion",
+			deleting.GetMetadata().GetUid(), deleting.GetMetadata().GetDeleteTime(), pending.GetMetadata().GetUid())
 	}
 
-	// Deleting the tag collects the partial copy and frees the name.
-	if _, err := w.DeleteTag(ctx, tagRef, store.DeletePreconditions{}); err != nil {
-		t.Fatalf("DeleteTag on the pending tag: %v", err)
-	}
-	if got := objects.Snapshot(t, strandedURI); len(got) != 0 {
-		t.Errorf("the stranded prefix after the delete = %v, want collected", got)
-	}
-
-	// The create now runs from scratch, into a prefix of its own.
+	// The next retry finishes the delete and creates the tag again.
 	tag, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
 	if err != nil {
-		t.Fatalf("TagActorSnapshot after the delete: %v", err)
+		t.Fatalf("TagActorSnapshot over the tag being deleted: %v", err)
+	}
+	if got := objects.Snapshot(t, strandedURI); len(got) != 0 {
+		t.Errorf("the stranded prefix after the retry = %v, want collected", got)
+	}
+	if tag.GetMetadata().GetUid() == pending.GetMetadata().GetUid() {
+		t.Errorf("the retried tag kept uid %q, want a new one", tag.GetMetadata().GetUid())
 	}
 	recreated := tagDurableSnapshotURI(tag, ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED)
 	if recreated == "" || recreated == stranded {
-		t.Fatalf("snapshot uri after the delete = %q, want a fresh prefix rather than the stranded %q", recreated, stranded)
+		t.Fatalf("snapshot uri after the retry = %q, want a fresh prefix rather than the stranded %q", recreated, stranded)
 	}
 	if want := mustTagSnapshotURI(t, template, "team-a", tag.GetMetadata().GetUid()).String(); recreated != want {
 		t.Errorf("recreated tag snapshot uri = %q, want UID-based URI %q", recreated, want)
 	}
 	if diff := cmp.Diff([]string{"manifest.json", "memory.zst"}, objects.Snapshot(t, mustParseSnapshotURI(t, recreated))); diff != "" {
-		t.Errorf("the tag's external snapshot after the delete mismatch (-want +got):\n%s", diff)
+		t.Errorf("the tag's external snapshot after the retry mismatch (-want +got):\n%s", diff)
 	}
 
-	// A create over the finished tag is refused the same way.
+	// A create over the finished tag is still refused.
 	_, err = w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
 	if code := apierror.Code(err); code != codes.AlreadyExists {
 		t.Errorf("TagActorSnapshot over the finished tag = %v (code %v), want code AlreadyExists", err, code)
@@ -715,8 +771,8 @@ func (s *recordTagErrorStore) UpdateTag(ctx context.Context, tagRef resources.Ta
 // TestTagActorSnapshot_RecreateAfterRecordFailure verifies what a create that
 // dies after reserving the name, before recording the snapshot, leaves behind:
 // a tag with no snapshot and nothing in object storage, since nothing is
-// copied until the snapshot's URI is recorded. Deleting that tag frees the
-// name without touching object storage, and the create then runs again.
+// copied until the snapshot's URI is recorded. Retrying the same request
+// replaces that tag without touching its prefix in object storage.
 func TestTagActorSnapshot_RecreateAfterRecordFailure(t *testing.T) {
 	ctx := context.Background()
 	persistence := newTestPersistence(t)
@@ -744,22 +800,22 @@ func TestTagActorSnapshot_RecreateAfterRecordFailure(t *testing.T) {
 		t.Errorf("the reserved tag's prefix holds %v, want nothing copied before the snapshot is recorded", got)
 	}
 
-	// The delete has nothing to collect, so it must not reach object storage.
+	// The reserved tag has nothing to collect, so replacing it must not list
+	// its prefix. The retry still lists the source actor's prefix to copy it.
+	reservedUID := reserved.GetMetadata().GetUid()
 	objects.OnList = func(_, prefix string) error {
-		t.Errorf("DeleteTag listed %q for a tag that records no snapshot", prefix)
+		if strings.Contains(prefix, reservedUID) {
+			t.Errorf("the retry listed %q for a tag that records no snapshot", prefix)
+		}
 		return nil
 	}
-	if _, err := w.DeleteTag(ctx, tagRef, store.DeletePreconditions{}); err != nil {
-		t.Fatalf("DeleteTag on the reserved tag: %v", err)
-	}
-	objects.OnList = nil
-	if _, err := persistence.GetTag(ctx, tagRef); !errors.Is(err, store.ErrNotFound) {
-		t.Errorf("GetTag after the delete = %v, want ErrNotFound", err)
-	}
-
 	tag, err := w.TagActorSnapshot(ctx, tagToCreate(actorRef, "v1"))
+	objects.OnList = nil
 	if err != nil {
-		t.Fatalf("TagActorSnapshot after the delete: %v", err)
+		t.Fatalf("TagActorSnapshot over the reserved tag: %v", err)
+	}
+	if tag.GetMetadata().GetUid() == reservedUID {
+		t.Errorf("the retried tag kept uid %q, want a new one", reservedUID)
 	}
 	if got, want := tagDurableSnapshotURI(tag, ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED), mustTagSnapshotURI(t, template, "team-a", tag.GetMetadata().GetUid()).String(); got != want {
 		t.Errorf("recreated tag snapshot uri = %q, want UID-based URI %q", got, want)

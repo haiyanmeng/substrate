@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
@@ -35,24 +36,26 @@ import (
 // The tag is given its own copy of that snapshot, so suspending the actor again
 // or deleting the actor does not garbage collect the tag's snapshot.
 //
-// The tag is built in 6 phases:
-//  1. Check that the name is free and the storage location is usable.
+// The tag is built in 7 phases:
+//  1. Check that the name is free, or held by a tag an earlier create from
+//     this actor, matched by UID, left unfinished, and that the storage
+//     location is usable.
 //  2. Make the actor's latest snapshot durable, if it is not uploaded yet: an
 //     asynchronously suspended actor's snapshot may still be uploading.
-//  3. Reserve the tag's name; the store assigns its UID.
-//  4. Record the snapshot's URI, under the tag's UID, before anything is
+//  3. Delete the unfinished tag phase 1 found, if any.
+//  4. Reserve the tag's name; the store assigns its UID.
+//  5. Record the snapshot's URI, under the tag's UID, before anything is
 //     copied there.
-//  5. Copy the snapshot to that URI.
-//  6. Finalize: mark the tag's snapshot COMPLETED.
+//  6. Copy the snapshot to that URI.
+//  7. Finalize: mark the tag's snapshot COMPLETED.
 //
 // The tag captures whichever snapshot the actor holds when the workflow runs.
 // An actor keeps no snapshot history, so a suspend that lands first moves what
 // gets tagged; that race is inherent to naming an actor rather than a snapshot.
 //
-// Not idempotent: the name is taken as soon as phase 3 lands, so a create that
-// dies after it leaves a pending tag and every later create under that name is
-// AlreadyExists. To retry, delete the tag, which collects whatever the failed
-// attempt stranded, and create it again.
+// A create that dies after phase 4 leaves a pending tag. The next create from
+// the same actor deletes it in phase 3, collecting whatever it stranded, so
+// retrying the same request converges. The new tag gets a new UID.
 func (w *ActorWorkflow) TagActorSnapshot(ctx context.Context, tag *ateapi.Tag) (*ateapi.Tag, error) {
 	ctx = preview.ContextWithOptIn(ctx)
 	actorRef := resources.ActorRefFromObjectRef(tag.GetSourceActor())
@@ -79,7 +82,8 @@ func (w *ActorWorkflow) TagActorSnapshot(ctx context.Context, tag *ateapi.Tag) (
 		return nil, err
 	}
 	// Runs before the upload, so a create that cannot succeed fails fast.
-	if err := w.checkTagCreatable(leaseCtx, tagRef, actorTemplate); err != nil {
+	unfinished, err := w.checkTagCreatable(leaseCtx, tagRef, actor, actorTemplate)
+	if err != nil {
 		return nil, err
 	}
 	// Runs before the name is taken, so a failed upload leaves no pending tag.
@@ -90,6 +94,13 @@ func (w *ActorWorkflow) TagActorSnapshot(ctx context.Context, tag *ateapi.Tag) (
 	snapshot, err := sourceSnapshotForTag(actorRef, actor)
 	if err != nil {
 		return nil, err
+	}
+	// Runs once the source snapshot is ready, so a create that fails before
+	// this point leaves the unfinished tag as it was.
+	if unfinished != nil {
+		if err := w.deleteUnfinishedTag(leaseCtx, unfinished); err != nil {
+			return nil, err
+		}
 	}
 
 	reserved, err := w.ensureTagReserved(leaseCtx, tagRef, actor, snapshot, tag)
@@ -135,7 +146,13 @@ func (w *ActorWorkflow) DeleteTag(ctx context.Context, tagRef resources.TagRef, 
 		return nil, err
 	}
 	defer lease.Close()
+	return w.deleteTagLocked(ctx, tagRef, precondition)
+}
 
+// deleteTagLocked runs the phases of DeleteTag. The caller holds the tag
+// lease. deleteUnfinishedTag also calls it to delete a tag an earlier create
+// left unfinished, so every step a tag delete needs belongs here.
+func (w *ActorWorkflow) deleteTagLocked(ctx context.Context, tagRef resources.TagRef, precondition store.DeletePreconditions) (*ateapi.Tag, error) {
 	tag, err := w.ensureTagMarkedForDeletion(ctx, tagRef, precondition)
 	if err != nil {
 		return nil, err
@@ -258,25 +275,59 @@ func (w *ActorWorkflow) loadActorForTag(ctx context.Context, actorRef resources.
 // uploaded: a name already taken, or a storage location the copy cannot use.
 // The tag lease is held, so no other create or delete of the name races the
 // lookup.
-func (w *ActorWorkflow) checkTagCreatable(ctx context.Context, tagRef resources.TagRef, actorTemplate *ateapi.ActorTemplate) (err error) {
+//
+// A pending tag was left by a create that died, since a running create would
+// hold the lease. If its source is actor, checkTagCreatable returns it for
+// deleteUnfinishedTag. Otherwise it returns nil.
+func (w *ActorWorkflow) checkTagCreatable(ctx context.Context, tagRef resources.TagRef, actor *ateapi.Actor, actorTemplate *ateapi.ActorTemplate) (_ *ateapi.Tag, err error) {
 	ctx, done := stepSpan(ctx, "CheckTagCreatable")
 	defer func() { err = done(err) }()
 
-	_, err = w.store.GetTag(ctx, tagRef)
+	existing, err := w.store.GetTag(ctx, tagRef)
 	switch {
 	case err == nil:
-		return apierror.AlreadyExists("Tag %s already exists; delete it and create it again to retry", tagRef)
-	case !errors.Is(err, store.ErrNotFound):
-		return fmt.Errorf("while getting tag %s: %w", tagRef, err)
+		if !abandonedBy(existing, actor) {
+			return nil, apierror.AlreadyExists("Tag %s already exists", tagRef)
+		}
+	case errors.Is(err, store.ErrNotFound):
+	default:
+		return nil, fmt.Errorf("while getting tag %s: %w", tagRef, err)
 	}
 	location, err := w.snapshotLocation(actorTemplate)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := resources.ValidateSnapshotLocation(location); err != nil {
-		return apierror.FailedPrecondition("invalid storage location for tag %s: %w", tagRef, err)
+		return nil, apierror.FailedPrecondition("invalid storage location for tag %s: %w", tagRef, err)
+	}
+	return existing, nil
+}
+
+// deleteUnfinishedTag deletes tag, which an earlier create left unfinished, so
+// that this create can take its name. The caller holds the tag lease.
+func (w *ActorWorkflow) deleteUnfinishedTag(ctx context.Context, tag *ateapi.Tag) error {
+	tagRef := resources.TagRefFromTag(tag)
+	slog.InfoContext(ctx, "Deleting a tag an earlier create left unfinished",
+		slog.Any("tag", tagRef),
+		slog.String("uid", tag.GetMetadata().GetUid()))
+	if _, err := w.deleteTagLocked(ctx, tagRef, store.DeletePreconditions{
+		UID:     tag.GetMetadata().GetUid(),
+		Version: tag.GetMetadata().GetVersion(),
+	}); err != nil {
+		return fmt.Errorf("while deleting unfinished tag %s: %w", tagRef, err)
 	}
 	return nil
+}
+
+// abandonedBy reports whether tag records actor's UID as its source and its
+// snapshot is not COMPLETED. That includes a pending tag whose delete by an
+// earlier retry failed partway. The UID keeps an actor that reuses a deleted
+// actor's name off that actor's tags. A tag from an older release records no
+// UID and is never abandoned.
+func abandonedBy(tag *ateapi.Tag, actor *ateapi.Actor) bool {
+	uid := tag.GetStatus().GetSourceActorUid()
+	return uid != "" && uid == actor.GetMetadata().GetUid() &&
+		tagDurableSnapshotURI(tag, ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED) == ""
 }
 
 // ensureTagSourceSnapshotDurable makes the actor's latest snapshot durable when
@@ -406,11 +457,11 @@ func sourceSnapshotForTag(actorRef resources.ActorRef, actor *ateapi.Actor) (*at
 // create, and the UID keys the prefix the snapshot is copied to, so the
 // snapshot is recorded by the next step.
 //
-// A name already taken is AlreadyExists, whether the tag holding it is finished
-// or was left pending by a create that died. Resuming a pending row would mean
-// deciding whether the objects under it still belong to the snapshot being
-// tagged, and the row may not even be this actor's; deleting the tag collects
-// them and frees the name, so a retry is a delete followed by a create.
+// The tag lease is held, and the name was free or deleteUnfinishedTag freed
+// it, so the name is taken here only if the store changed outside the lease.
+// The create does not resume an unfinished tag, because the objects under its
+// prefix may not belong to the snapshot being tagged. deleteUnfinishedTag
+// deletes such a tag instead, and the new tag copies into a new prefix.
 func (w *ActorWorkflow) ensureTagReserved(ctx context.Context, tagRef resources.TagRef, actor *ateapi.Actor, snapshot *ateapi.Snapshot, tag *ateapi.Tag) (_ *ateapi.Tag, err error) {
 	ctx, done := stepSpan(ctx, "ReserveTag")
 	defer func() { err = done(err) }()
@@ -426,6 +477,7 @@ func (w *ActorWorkflow) ensureTagReserved(ctx context.Context, tagRef resources.
 			// memory under the new one's identity, past the data-only downgrade a resume of
 			// the actor itself would take.
 			ActorTemplateUid: snapshot.GetActorTemplateUid(),
+			SourceActorUid:   actor.GetMetadata().GetUid(),
 		},
 	}
 
@@ -436,7 +488,7 @@ func (w *ActorWorkflow) ensureTagReserved(ctx context.Context, tagRef resources.
 	case errors.Is(err, store.ErrFailedPrecondition):
 		return nil, apierror.FailedPrecondition("Atespace %s not found", tagRef.Atespace)
 	case errors.Is(err, store.ErrAlreadyExists):
-		return nil, apierror.AlreadyExists("Tag %s already exists; delete it and create it again to retry", tagRef)
+		return nil, apierror.AlreadyExists("Tag %s already exists", tagRef)
 	}
 	return nil, fmt.Errorf("while reserving tag %s: %w", tagRef, err)
 }
