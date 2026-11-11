@@ -224,15 +224,11 @@ func (w *ActorWorkflow) ensureWorkerReleased(ctx context.Context, actorRef resou
 		return actor, nil
 	}
 
-	// Read again for the version the earlier steps left.
-	latestActor, err := w.store.GetActor(ctx, actorRef)
-	if err != nil {
-		return nil, err
-	}
-	// The uid is the deleted Actor's. A delete that lost its lease can re-read
-	// an Actor recreated under the same name, and must not release it.
-	precondition := store.Precondition{UID: actor.GetMetadata().GetUid(), Version: latestActor.GetMetadata().GetVersion()}
-	updatedActor, err := w.store.UpdateActorAndRelease(ctx, actorRef, precondition, func(dbActor *ateapi.Actor) error {
+	// No earlier step writes the Actor, so actor holds its current version
+	// while the lease is held. If another writer took over after this delete
+	// lost its lease, or the Actor was recreated under the same name, the
+	// write fails with Aborted.
+	updatedActor, err := w.store.UpdateActorAndRelease(ctx, actorRef, store.PreconditionFrom(actor), func(dbActor *ateapi.Actor) error {
 		clearLocalSnapshots(dbActor.Status)
 		dbActor.Status.AssignedNode = ""
 		dbActor.Status.WorkerAssignment = nil
@@ -377,8 +373,7 @@ func (w *ActorWorkflow) finalizeDeleted(ctx context.Context, actor *ateapi.Actor
 
 	actorRef := resources.ActorRefFromActor(actor)
 	// Only the uid guards the delete. The mark already committed this
-	// incarnation to deletion, and a later write such as an UpdateActor RPC,
-	// which takes no actor lease, must not block removing the row.
+	// incarnation to deletion, so the row goes whatever its version.
 	precondition := store.DeletePreconditions{UID: actor.GetMetadata().GetUid()}
 	deleted, err := w.store.DeleteActor(ctx, actorRef, precondition)
 	if err != nil {
