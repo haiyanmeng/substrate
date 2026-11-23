@@ -746,10 +746,13 @@ func TestResumeActorWorkflow_RejectedAndIdempotentPaths(t *testing.T) {
 	tests := []struct {
 		name      string
 		seedState ateapi.ActorState
+		policy    ateapi.ResumePolicy
 		// wantErr true means ResumeActor must fail with FailedPrecondition.
 		wantErr bool
 		// wantState is the stored state after the call.
 		wantState ateapi.ActorState
+		// wantLease is whether the call takes the actor lease.
+		wantLease bool
 	}{
 		{
 			// The resume edge only exists from SUSPENDED and RESUMING; a
@@ -759,6 +762,7 @@ func TestResumeActorWorkflow_RejectedAndIdempotentPaths(t *testing.T) {
 			seedState: ateapi.ActorState_ACTOR_STATE_CRASHED,
 			wantErr:   true,
 			wantState: ateapi.ActorState_ACTOR_STATE_CRASHED,
+			wantLease: true,
 		},
 		{
 			// Resuming a RUNNING actor succeeds idempotently: every step
@@ -767,15 +771,41 @@ func TestResumeActorWorkflow_RejectedAndIdempotentPaths(t *testing.T) {
 			seedState: ateapi.ActorState_ACTOR_STATE_RUNNING,
 			wantState: ateapi.ActorState_ACTOR_STATE_RUNNING,
 		},
+		{
+			name:      "running with resume_policy allow succeeds",
+			seedState: ateapi.ActorState_ACTOR_STATE_RUNNING,
+			policy:    ateapi.ResumePolicy_RESUME_POLICY_ALLOW,
+			wantState: ateapi.ActorState_ACTOR_STATE_RUNNING,
+		},
+		{
+			// The router resumes per request, so a deny refuses new
+			// ingress to a running actor without stopping it.
+			name:      "running with resume_policy deny rejected",
+			seedState: ateapi.ActorState_ACTOR_STATE_RUNNING,
+			policy:    ateapi.ResumePolicy_RESUME_POLICY_DENY,
+			wantErr:   true,
+			wantState: ateapi.ActorState_ACTOR_STATE_RUNNING,
+		},
+		{
+			// Refused before the lease, so routed requests to a denied
+			// actor do not write lease rows.
+			name:      "suspended with resume_policy deny rejected",
+			seedState: ateapi.ActorState_ACTOR_STATE_SUSPENDED,
+			policy:    ateapi.ResumePolicy_RESUME_POLICY_DENY,
+			wantErr:   true,
+			wantState: ateapi.ActorState_ACTOR_STATE_SUSPENDED,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			st, cleanup := storetest.SetupTestStore(t)
+			persistence, cleanup := storetest.SetupTestStore(t)
 			defer cleanup()
+			st := &leaseCountingStore{Interface: persistence}
 			w := newTestActorWorkflow(t, st, "ns", "tmpl1")
 
 			seedWorkflowActor(t, ctx, st, resources.ActorRef{Atespace: "team-a", Name: "id1"}, "ns", "tmpl1", tc.seedState, func(a *ateapi.Actor) {
+				a.ResumePolicy = tc.policy
 				a.Status.WorkerAssignment = &ateapi.WorkerAssignment{
 					Worker:          &ateapi.ObjectRef{Name: "uid"},
 					WorkerNamespace: "wns",
@@ -816,7 +846,135 @@ func TestResumeActorWorkflow_RejectedAndIdempotentPaths(t *testing.T) {
 			if got.GetStatus().GetState() != tc.wantState {
 				t.Errorf("stored state = %v, want %v", got.GetStatus().GetState(), tc.wantState)
 			}
+			if gotLease := st.acquireCalls > 0; gotLease != tc.wantLease {
+				t.Errorf("took actor lease = %v, want %v", gotLease, tc.wantLease)
+			}
 		})
+	}
+}
+
+// TestResumeActor_DenyRefusesInterruptedResume denies an actor whose resume
+// was interrupted in RESUMING. The next ResumeActor fails without finishing
+// the resume.
+func TestResumeActor_DenyRefusesInterruptedResume(t *testing.T) {
+	ctx := context.Background()
+	st := newTestPersistence(t)
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
+
+	storetest.MustCreateAtespace(t, ctx, st, "ns")
+	if _, err := st.CreateActorTemplate(ctx, &ateapi.ActorTemplate{
+		Metadata:       &ateapi.ResourceMetadata{Atespace: "ns", Name: "tmpl1"},
+		SnapshotConfig: &ateapi.SnapshotConfig{StorageLocation: testStorageLocation},
+	}); err != nil {
+		t.Fatalf("create template: %v", err)
+	}
+	seedRuntimeWorker(t, ctx, st, "pod-1", "node-1", testSandboxRuntime())
+	snap := newPausedSnapshot(t, 1, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", "pause-snap-1", "node-1")
+	seedWorkflowActor(t, ctx, st, actorRef, "ns", "tmpl1", ateapi.ActorState_ACTOR_STATE_SUSPENDED, func(a *ateapi.Actor) {
+		a.Status.AssignedNode = "node-1"
+		a.Status.LastAssignedGeneration = 1
+		a.Status.Snapshots = []*ateapi.Snapshot{proto.CloneOf(snap)}
+	})
+	w, atelet := newDetachTestWorkflow(t, ctx, st)
+
+	atelet.restoreErr = apierror.Unavailable("atelet restarting")
+	if _, _, err := w.ResumeActor(ctx, actorRef); apierror.Code(err) != codes.Unavailable {
+		t.Fatalf("first ResumeActor() = %v, want Unavailable", err)
+	}
+	interrupted, err := st.GetActor(ctx, actorRef)
+	if err != nil {
+		t.Fatalf("GetActor: %v", err)
+	}
+	if got := interrupted.GetStatus().GetState(); got != ateapi.ActorState_ACTOR_STATE_RESUMING {
+		t.Fatalf("state after interrupted resume = %v, want RESUMING", got)
+	}
+	if _, err := st.UpdateActor(ctx, actorRef, store.PreconditionFrom(interrupted), func(a *ateapi.Actor) error {
+		a.ResumePolicy = ateapi.ResumePolicy_RESUME_POLICY_DENY
+		return nil
+	}); err != nil {
+		t.Fatalf("UpdateActor: %v", err)
+	}
+	atelet.mu.Lock()
+	atelet.restoreErr = nil
+	atelet.restore = nil
+	atelet.mu.Unlock()
+
+	if _, _, err := w.ResumeActor(ctx, actorRef); apierror.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("ResumeActor() after deny = %v, want FailedPrecondition", err)
+	}
+	if restore, run := atelet.requests(); restore != nil || run != nil {
+		t.Errorf("atelet requests after deny = (restore=%v, run=%v), want none", restore, run)
+	}
+	got, err := st.GetActor(ctx, actorRef)
+	if err != nil {
+		t.Fatalf("GetActor: %v", err)
+	}
+	if state := got.GetStatus().GetState(); state != ateapi.ActorState_ACTOR_STATE_RESUMING {
+		t.Errorf("stored state = %v, want RESUMING", state)
+	}
+}
+
+// denyBeforeBindStore sets RESUME_POLICY_DENY on the actor before the first
+// bind, standing in for an UpdateActor by the replica that took over the
+// lease of a stalled resume.
+type denyBeforeBindStore struct {
+	store.Interface
+	t    *testing.T
+	once sync.Once
+}
+
+func (s *denyBeforeBindStore) BindActorToWorker(ctx context.Context, workerName string, assignment *ateapi.ActorAssignment, admit func(*ateapi.Worker) error, actorRef resources.ActorRef, precondition store.Precondition, mutate func(*ateapi.Actor) error) (*ateapi.Actor, error) {
+	s.once.Do(func() {
+		if _, err := s.Interface.UpdateActor(ctx, actorRef, precondition, func(a *ateapi.Actor) error {
+			a.ResumePolicy = ateapi.ResumePolicy_RESUME_POLICY_DENY
+			return nil
+		}); err != nil {
+			s.t.Errorf("UpdateActor before bind: %v", err)
+		}
+	})
+	return s.Interface.BindActorToWorker(ctx, workerName, assignment, admit, actorRef, precondition, mutate)
+}
+
+// TestResumeActor_DenyBeforeBindAfterLostLease denies an actor after its
+// resume read it under the lease but before the bind. The bind fails the
+// version check, and its retry on the fresh actor must not start it.
+func TestResumeActor_DenyBeforeBindAfterLostLease(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	st := &denyBeforeBindStore{Interface: persistence, t: t}
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
+
+	storetest.MustCreateAtespace(t, ctx, st, "ns")
+	if _, err := st.CreateActorTemplate(ctx, &ateapi.ActorTemplate{
+		Metadata:       &ateapi.ResourceMetadata{Atespace: "ns", Name: "tmpl1"},
+		SnapshotConfig: &ateapi.SnapshotConfig{StorageLocation: testStorageLocation},
+	}); err != nil {
+		t.Fatalf("create template: %v", err)
+	}
+	seedRuntimeWorker(t, ctx, st, "pod-1", "node-1", testSandboxRuntime())
+	snap := newPausedSnapshot(t, 1, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", "pause-snap-1", "node-1")
+	seedWorkflowActor(t, ctx, st, actorRef, "ns", "tmpl1", ateapi.ActorState_ACTOR_STATE_SUSPENDED, func(a *ateapi.Actor) {
+		a.Status.AssignedNode = "node-1"
+		a.Status.LastAssignedGeneration = 1
+		a.Status.Snapshots = []*ateapi.Snapshot{proto.CloneOf(snap)}
+	})
+	w, atelet := newDetachTestWorkflow(t, ctx, st)
+
+	if _, _, err := w.ResumeActor(ctx, actorRef); apierror.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("ResumeActor() = %v, want FailedPrecondition", err)
+	}
+	if restore, run := atelet.requests(); restore != nil || run != nil {
+		t.Errorf("atelet requests = (restore=%v, run=%v), want none", restore, run)
+	}
+	got, err := persistence.GetActor(ctx, actorRef)
+	if err != nil {
+		t.Fatalf("GetActor: %v", err)
+	}
+	if state := got.GetStatus().GetState(); state != ateapi.ActorState_ACTOR_STATE_SUSPENDED {
+		t.Errorf("stored state = %v, want SUSPENDED", state)
+	}
+	if got.GetStatus().GetWorkerAssignment() != nil {
+		t.Errorf("stored worker assignment = %v, want none", got.GetStatus().GetWorkerAssignment())
 	}
 }
 
@@ -847,10 +1005,14 @@ func TestResumeActor_MetricSkipsAlreadyRunningNoop(t *testing.T) {
 	tests := []struct {
 		name       string
 		seedState  ateapi.ActorState
+		policy     ateapi.ResumePolicy
+		wantErr    bool
 		wantRecord bool
 	}{
 		{name: "already running no-op is skipped", seedState: ateapi.ActorState_ACTOR_STATE_RUNNING, wantRecord: false},
-		{name: "failed resume is recorded", seedState: ateapi.ActorState_ACTOR_STATE_CRASHED, wantRecord: true},
+		{name: "failed resume is recorded", seedState: ateapi.ActorState_ACTOR_STATE_CRASHED, wantErr: true, wantRecord: true},
+		{name: "running actor refused by resume_policy is skipped", seedState: ateapi.ActorState_ACTOR_STATE_RUNNING, policy: ateapi.ResumePolicy_RESUME_POLICY_DENY, wantErr: true, wantRecord: false},
+		{name: "suspended actor refused by resume_policy is skipped", seedState: ateapi.ActorState_ACTOR_STATE_SUSPENDED, policy: ateapi.ResumePolicy_RESUME_POLICY_DENY, wantErr: true, wantRecord: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -862,6 +1024,7 @@ func TestResumeActor_MetricSkipsAlreadyRunningNoop(t *testing.T) {
 			w.instruments = inst
 
 			seedWorkflowActor(t, ctx, st, resources.ActorRef{Atespace: "team-a", Name: "id1"}, "ns", "tmpl1", tt.seedState, func(a *ateapi.Actor) {
+				a.ResumePolicy = tt.policy
 				a.Status.WorkerAssignment = &ateapi.WorkerAssignment{
 					Worker:          &ateapi.ObjectRef{Name: "uid"},
 					WorkerNamespace: "wns",
@@ -872,10 +1035,10 @@ func TestResumeActor_MetricSkipsAlreadyRunningNoop(t *testing.T) {
 			})
 
 			_, _, err := w.ResumeActor(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"})
-			if tt.wantRecord && err == nil {
+			if tt.wantErr && err == nil {
 				t.Fatal("expected resume to fail, got nil error")
 			}
-			if !tt.wantRecord && err != nil {
+			if !tt.wantErr && err != nil {
 				t.Fatalf("ResumeActor failed: %v", err)
 			}
 

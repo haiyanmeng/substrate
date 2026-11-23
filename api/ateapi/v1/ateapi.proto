@@ -580,6 +580,34 @@ message Actor {
   //
   // +k8s:optional
   ActorStatus status = 5;
+
+  // resume_policy controls whether ResumeActor may run this Actor. If
+  // unspecified, the Actor may be resumed.
+  //
+  // With `RESUME_POLICY_DENY`, ResumeActor fails with `FAILED_PRECONDITION`
+  // in any state. The router calls ResumeActor for each request, so new
+  // ingress to a running Actor is refused, but the Actor keeps running until
+  // it is suspended. ResumeActor also refuses to finish a resume that was
+  // interrupted in `ACTOR_STATE_RESUMING`. SuspendActor cannot stop such an
+  // Actor, so it can only be deleted, or allowed and resumed.
+  //
+  // +k8s:optional
+  // +k8s:minimum=1
+  // +k8s:maximum=2 # keep this in sync with the ResumePolicy enum
+  ResumePolicy resume_policy = 6;
+}
+
+// ResumePolicy controls whether an Actor may be resumed.
+enum ResumePolicy {
+  // Not set. Treated as `RESUME_POLICY_ALLOW`.
+  RESUME_POLICY_UNSPECIFIED = 0;
+
+  // The Actor may be resumed.
+  RESUME_POLICY_ALLOW = 1;
+
+  // ResumeActor refuses to resume the Actor.
+  RESUME_POLICY_DENY = 2;
+  // Keep this in sync with Actor.resume_policy's maximum.
 }
 
 // EgressPolicy is an egress policy resource nested under an Actor. An Actor has

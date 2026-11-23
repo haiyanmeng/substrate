@@ -51,20 +51,23 @@ type restoreTelemetry struct {
 // ResumeActor executes the workflow to resume a suspended actor. Idempotent:
 // a re-entered workflow fast-forwards past the steps a previous attempt
 // completed, deriving progress from the persisted actor alone.
+//
+// It fails with FailedPrecondition for an actor with RESUME_POLICY_DENY, in
+// any state.
 func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.ActorRef) (_ *ateapi.Actor, resumed bool, err error) {
 	ctx = preview.ContextWithOptIn(ctx)
 	start := time.Now()
 	var actor *ateapi.Actor
 	var actorTemplate *ateapi.ActorTemplate
 	var tele restoreTelemetry
-	var wasRunning bool
+	var wasRunning, denied bool
 
 	// Recorded before the lease so lease contention still counts as an attempt.
-	// Clean already-running no-ops are skipped: the router resumes per routed
-	// request, and recording those would sample at router QPS and bury
-	// cold-resume latency.
+	// Clean already-running no-ops and resume_policy refusals are skipped: the
+	// router resumes per routed request, and recording those would sample at
+	// router QPS and bury cold-resume latency.
 	defer func() {
-		if err == nil && wasRunning {
+		if (err == nil && wasRunning) || denied {
 			return
 		}
 		w.instruments.recordLifecycleOp(ctx, ateattr.OperationResume, start, err,
@@ -79,6 +82,10 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	if err != nil {
 		return nil, false, err
 	}
+	if err = checkResumePolicy(actorRef, actor); err != nil {
+		denied = true
+		return nil, false, err
+	}
 	if wasRunning = actor.GetStatus().GetState() == ateapi.ActorState_ACTOR_STATE_RUNNING; wasRunning {
 		return actor, false, nil
 	}
@@ -91,6 +98,12 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 
 	actor, actorTemplate, err = w.loadActorForResume(leaseCtx, actorRef)
 	if err != nil {
+		return nil, false, err
+	}
+	// Check again: UpdateActor may have set RESUME_POLICY_DENY before this
+	// resume took the lease.
+	if err = checkResumePolicy(actorRef, actor); err != nil {
+		denied = true
 		return nil, false, err
 	}
 	if wasRunning = actor.GetStatus().GetState() == ateapi.ActorState_ACTOR_STATE_RUNNING; wasRunning {
@@ -132,6 +145,15 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, actorRef resources.Acto
 	return actor, true, nil
 }
 
+// checkResumePolicy fails with FailedPrecondition when actor's resume_policy
+// is RESUME_POLICY_DENY.
+func checkResumePolicy(actorRef resources.ActorRef, actor *ateapi.Actor) error {
+	if actor.GetResumePolicy() == ateapi.ResumePolicy_RESUME_POLICY_DENY {
+		return apierror.FailedPrecondition("Actor %s has resume_policy %s", actorRef, ateapi.ResumePolicy_RESUME_POLICY_DENY)
+	}
+	return nil
+}
+
 // loadActorForResume fetches the current actor record and its template.
 func (w *ActorWorkflow) loadActorForResume(ctx context.Context, actorRef resources.ActorRef) (_ *ateapi.Actor, _ *ateapi.ActorTemplate, err error) {
 	ctx, done := stepSpan(ctx, "LoadActorForResume")
@@ -149,6 +171,11 @@ func (w *ActorWorkflow) loadActorForResume(ctx context.Context, actorRef resourc
 	// for. Short-circuit immediately to avoid an unnecessary template read on
 	// the hot resume path.
 	if actor.GetStatus().GetState() == ateapi.ActorState_ACTOR_STATE_RUNNING {
+		return actor, nil, nil
+	}
+	// The caller refuses a denied actor. Short-circuit immediately to avoid an
+	// unnecessary template read on the hot resume path.
+	if checkResumePolicy(actorRef, actor) != nil {
 		return actor, nil, nil
 	}
 
@@ -489,6 +516,11 @@ func (w *ActorWorkflow) assignWorkerAttempt(ctx context.Context, actorRef resour
 	// changed since it was read fails the precondition and leaves no
 	// assignment behind.
 	storedActor, err := w.store.BindActorToWorker(ctx, assignedWorker.GetMetadata().GetName(), assignment, admit, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapi.Actor) error {
+		// Checked on the version the bind overwrites, so a resume that lost its
+		// lease cannot start a denied actor.
+		if err := checkResumePolicy(actorRef, toUpdate); err != nil {
+			return err
+		}
 		newAssignment := workerAssignmentFrom(bound, snapRuntime)
 		toUpdate.Status.State = ateapi.ActorState_ACTOR_STATE_RESUMING
 		toUpdate.Status.WorkerAssignment = newAssignment

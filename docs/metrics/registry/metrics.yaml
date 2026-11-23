@@ -919,10 +919,11 @@ groups:
     stability: development
     brief: The time of one actor lifecycle operation in ateapi, and whether the operation failed.
     note: >
-      ateapi does not record a resume of an actor that is already in operation.
-      Thus this histogram counts the true activations and not the traffic of the
-      router. The set of labels changes with the operation. Each attribute
-      below gives the condition for its key.
+      ateapi does not record a resume of an actor that is already in operation,
+      or a resume refused by the actor's resume_policy. Thus this histogram
+      counts the true activations and not the traffic of the router. The set of
+      labels changes with the operation. Each attribute below gives the
+      condition for its key.
     annotations:
       substrate:
         emitted_by: [ateapi]
